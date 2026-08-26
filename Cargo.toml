@@ -1,0 +1,72 @@
+[package]
+name = "woodland"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Recursive Arkade woodcutting protocol"
+homepage = "https://woodland.sh"
+repository = "https://github.com/stutxo/the-dark-forest"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
+[lib]
+name = "woodland"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "woodland-operator"
+path = "src/bin/woodland-operator.rs"
+required-features = ["woodland-app"]
+
+[[bin]]
+name = "woodland-keygen"
+path = "src/bin/woodland-keygen.rs"
+required-features = ["keygen"]
+
+[features]
+default = []
+woodland-app = []
+# Add local-only fault probes and destructive browser-test hooks.
+regtest-e2e = ["woodland-app"]
+keygen = ["dep:bip39", "woodland-app"]
+fuzzing = []
+
+[dependencies]
+anyhow = "1"
+bip39 = { version = "2.2.2", optional = true }
+ark-core = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
+ark-script = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
+ark-rest = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
+base64 = "0.22"
+bitcoin = { version = "0.32.7", features = ["rand", "serde", "base64"] }
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"
+futures = "0.3"
+rand = "0.8"
+musig = { package = "secp256k1", version = "0.32.0-beta.2", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["AbortSignal", "Window", "Storage", "Headers", "Request", "RequestCache", "RequestInit", "Response"] }
+
+# Native operator runtime; browser renewal uses the same REST/SSE batch module
+# through reqwest's WASM transport.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"

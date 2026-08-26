@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Functional test profile
+        type: choice
+        options:
+          - smoke
+          - full
+        default: smoke
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - run: cargo check --locked --all-targets --features regtest-e2e
+      - run: cargo check --locked --features keygen --bin woodland-keygen
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2.86.4
+        with:
+          tool: cargo-audit
+          fallback: none
+      - run: cargo audit
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.5
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          add-job-id-key: false
+          cache-on-failure: true
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --all-targets --features regtest-e2e
+      - run: cargo clippy --locked --all-targets --features regtest-e2e -- -D warnings
+      - run: cargo check --locked --all-targets --features woodland-app
+      - run: cargo clippy --locked --all-targets --features woodland-app -- -D warnings
+      - run: cargo test --locked --features keygen --bin woodland-keygen
+      - run: cargo clippy --locked --features keygen --bin woodland-keygen -- -D warnings
+      - run: CC_wasm32_unknown_unknown=clang cargo check --locked --lib --target wasm32-unknown-unknown --features regtest-e2e
+      - run: CC_wasm32_unknown_unknown=clang cargo clippy --locked --lib --target wasm32-unknown-unknown --features regtest-e2e -- -D warnings
+      - run: CC_wasm32_unknown_unknown=clang cargo check --locked --lib --target wasm32-unknown-unknown --features woodland-app
+      - run: CC_wasm32_unknown_unknown=clang cargo clippy --locked --lib --target wasm32-unknown-unknown --features woodland-app -- -D warnings
+      - run: bash -n scripts/*.sh
+      - name: Check JavaScript
+        run: |
+          for file in scripts/*.mjs regtest/*.mjs regtest/lib/*.mjs regtest/lib/setup/*.mjs web/*.js; do
+            node --check "$file"
+          done
+      - name: Validate regtest Compose files
+        env:
+          EMULATOR_SECRET_KEY: 1111111111111111111111111111111111111111111111111111111111111111
+        run: docker compose --env-file .env.regtest -f regtest/docker/compose.base.yml -f regtest/docker/compose.ark.yml config --quiet
+
+  fuzz:
+    if: github.event_name == 'schedule'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2.86.4
+        with:
+          tool: cargo-fuzz
+          fallback: none
+      - run: cargo fuzz run asset_packet -- -max_total_time=60
+        working-directory: fuzz
+      - run: cargo fuzz run batch_sse -- -max_total_time=60
+        working-directory: fuzz
+
+  regtest:
+    name: Regtest (${{ github.event_name == 'schedule' && 'full' || inputs.profile || 'smoke' }})
+    needs: [test, msrv, audit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      EMULATOR_SECRET_KEY: 1111111111111111111111111111111111111111111111111111111111111111
+      WOODLAND_CI_PROFILE: ${{ github.event_name == 'schedule' && 'full' || inputs.profile || 'smoke' }}
+      WOODLAND_E2E_ARTIFACT_DIR: regtest/_build/ci-artifacts
+      WOODLAND_E2E_JUNIT: regtest/_build/ci-artifacts/e2e-junit.xml
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          add-job-id-key: false
+          cache-on-failure: true
+      - uses: taiki-e/install-action@v2.86.4
+        with:
+          tool: wasm-pack@0.15.0
+          fallback: none
+      - name: Cache stock arkd images
+        id: arkd-images
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/woodland-arkd-images.tar.zst
+          key: arkd-images-stock-${{ runner.os }}-${{ hashFiles('scripts/regtest.sh') }}
+      - name: Load stock arkd images
+        if: steps.arkd-images.outputs.cache-hit == 'true'
+        run: zstd --decompress --stdout "$RUNNER_TEMP/woodland-arkd-images.tar.zst" | docker load
+      - name: Build stock arkd images
+        if: steps.arkd-images.outputs.cache-hit != 'true'
+        run: ./scripts/regtest.sh build-images
+      - name: Archive stock arkd images
+        if: steps.arkd-images.outputs.cache-hit != 'true'
+        run: docker save arkd-local:8b34e35-forest-v1-stock arkd-wallet-local:8b34e35-forest-v1-stock | zstd --threads=0 --fast=3 > "$RUNNER_TEMP/woodland-arkd-images.tar.zst"
+      - name: Run functional profile
+        timeout-minutes: 12
+        run: |
+          set -o pipefail
+          ./scripts/test-regtest.sh "$WOODLAND_CI_PROFILE" \
+            2>&1 | tee "$RUNNER_TEMP/regtest-$WOODLAND_CI_PROFILE.log"
+      - name: Upload functional test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regtest-${{ env.WOODLAND_CI_PROFILE }}-junit
+          path: ${{ env.WOODLAND_E2E_JUNIT }}
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Collect failure diagnostics
+        if: failure() || cancelled()
+        run: |
+          mkdir -p "$WOODLAND_E2E_ARTIFACT_DIR"
+          docker compose --env-file .env.regtest \
+            -f regtest/docker/compose.base.yml \
+            -f regtest/docker/compose.ark.yml \
+            --profile base --profile ark --profile emulator \
+            logs --no-color --timestamps \
+            > "$WOODLAND_E2E_ARTIFACT_DIR/compose.log" 2>&1 || true
+          docker ps -a --no-trunc \
+            --filter label=com.docker.compose.project=arkade-regtest \
+            > "$WOODLAND_E2E_ARTIFACT_DIR/containers.txt" || true
+          docker image ls --digests \
+            > "$WOODLAND_E2E_ARTIFACT_DIR/images.txt" || true
+      - name: Upload failure diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regtest-${{ env.WOODLAND_CI_PROFILE }}-failure
+          path: |
+            ${{ runner.temp }}/regtest-*.log
+            regtest/_build/ci-artifacts/
+            regtest/_build/woodland-world*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  pages-build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: regtest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      WOODLAND_WORLD_MANIFEST: ${{ vars.WOODLAND_PAGES_MANIFEST || 'mutinynet/woodland-world.json' }}
+      WOODLAND_WASM_FEATURES: woodland-app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pages
+      - uses: taiki-e/install-action@v2.86.4
+        with:
+          tool: wasm-pack@0.15.0
+          fallback: none
+      - uses: actions/configure-pages@v6
+      - run: ./scripts/build-web.sh
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+          include-hidden-files: true
+
+  pages-deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: pages-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,0 +1,99 @@
+name: arkade-regtest
+
+services:
+  arkd-wallet:
+    image: ${ARKD_WALLET_IMAGE:-ghcr.io/arkade-os/arkd-wallet:v0.9.9-rc.1}
+    container_name: arkd-wallet
+    profiles: ["ark"]
+    restart: unless-stopped
+    depends_on:
+      bitcoin:
+        condition: service_started
+      nbxplorer:
+        condition: service_healthy
+    environment:
+      - ARKD_WALLET_LOG_LEVEL=5
+      - ARKD_WALLET_NBXPLORER_URL=http://nbxplorer:32838
+      - ARKD_WALLET_NETWORK=regtest
+      - ARKD_WALLET_SIGNER_KEY=${ARKD_WALLET_SIGNER_KEY:-afcd3fa10f82a05fddc9574fdb13b3991b568e89cc39a72ba4401df8abef35f0}
+    ports:
+      - '127.0.0.1:${ARKD_WALLET_PORT:-6060}:6060'
+    volumes:
+      - ark_wallet_datadir:/app/data
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: arkd-redis
+    profiles: ["ark"]
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    volumes:
+      - redis_datadir:/data
+
+  arkd:
+    image: ${ARKD_IMAGE:-ghcr.io/arkade-os/arkd:v0.9.9-rc.1}
+    container_name: arkd
+    profiles: ["ark"]
+    restart: unless-stopped
+    depends_on:
+      arkd-wallet:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    environment:
+      - ARKD_NO_TLS=true
+      - ARKD_NO_MACAROONS=true
+      - ARKD_WALLET_ADDR=arkd-wallet:6060
+      - ARKD_ESPLORA_URL=http://mempool_web/api
+      - ARKD_VTXO_MIN_AMOUNT=1
+      - ARKD_DB_TYPE=sqlite
+      - ARKD_EVENT_DB_TYPE=badger
+      - ARKD_UNLOCKER_TYPE=env
+      - ARKD_UNLOCKER_PASSWORD=${ARKD_PASSWORD:-secret}
+      - ARKD_VTXO_TREE_EXPIRY=${ARKD_VTXO_TREE_EXPIRY:-1024}
+      - ARKD_UNILATERAL_EXIT_DELAY=${ARKD_UNILATERAL_EXIT_DELAY:-512}
+      - ARKD_PUBLIC_UNILATERAL_EXIT_DELAY=${ARKD_PUBLIC_UNILATERAL_EXIT_DELAY:-512}
+      - ARKD_BOARDING_EXIT_DELAY=${ARKD_BOARDING_EXIT_DELAY:-2048}
+      - ARKD_CHECKPOINT_EXIT_DELAY=${ARKD_CHECKPOINT_EXIT_DELAY:-1024}
+      - ARKD_LIVE_STORE_TYPE=${ARKD_LIVE_STORE_TYPE:-redis}
+      - ARKD_REDIS_URL=${ARKD_REDIS_URL:-redis://redis:6379/0}
+      - ARKD_REDIS_NUM_OF_RETRIES=${ARKD_REDIS_NUM_OF_RETRIES:-10}
+      - ARKD_LOG_LEVEL=${ARKD_LOG_LEVEL:-4}
+      - ARKD_SESSION_DURATION=${ARKD_SESSION_DURATION:-30}
+      - ARKD_ROUND_MIN_PARTICIPANTS_COUNT=${ARKD_ROUND_MIN_PARTICIPANTS_COUNT:-1}
+      - ARK_OFFCHAIN_INPUT_FEE=${ARK_OFFCHAIN_INPUT_FEE:-amount * 0.01}
+      - ARK_ONCHAIN_INPUT_FEE=${ARK_ONCHAIN_INPUT_FEE:-amount * 0.01}
+      - ARK_OFFCHAIN_OUTPUT_FEE=${ARK_OFFCHAIN_OUTPUT_FEE:-0.0}
+      - ARK_ONCHAIN_OUTPUT_FEE=${ARK_ONCHAIN_OUTPUT_FEE:-250.0}
+    ports:
+      - '127.0.0.1:${ARKD_PORT:-7070}:7070'
+      - '127.0.0.1:${ARKD_ADMIN_PORT:-7071}:7071'
+    volumes:
+      - ark_datadir:/app/data
+
+  emulator:
+    image: ${EMULATOR_IMAGE:-ghcr.io/arkade-os/emulator@sha256:fe19d903de135ec679b7053a3b948fae4677e1ca5e3a7511e4056a514a267475}
+    container_name: emulator
+    profiles: ["emulator"]
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:${EMULATOR_PORT:-7073}:7073'
+    environment:
+      EMULATOR_NO_TLS: 'true'
+      EMULATOR_SECRET_KEY: ${EMULATOR_SECRET_KEY}
+      EMULATOR_PORT: '7073'
+      EMULATOR_LOG_LEVEL: ${EMULATOR_LOG_LEVEL:-4}
+      EMULATOR_ARKD_URL: ${EMULATOR_ARKD_URL:-arkd:7070}
+    volumes:
+      - type: tmpfs
+        target: /app/data
+
+volumes:
+  ark_wallet_datadir:
+  ark_datadir:
+  redis_datadir:

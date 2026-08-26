@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <!-- WOODLAND_CSP -->
+  <title>woodland.sh</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; background: #0d120c; color: #dfe9da; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0d120c; }
+    main { width: min(980px, calc(100% - 24px)); margin: 20px auto 40px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    h1, h2, p { margin: 0; }
+    h1 { color: #b9e879; font-size: 1.25rem; }
+    h2 { margin-bottom: 10px; font-size: 1rem; }
+    button { min-height: 36px; padding: 0 12px; border: 1px solid #3a4934; border-radius: 4px; color: #e4eddf; background: #1a2317; cursor: pointer; }
+    button:hover:not(:disabled) { border-color: #b9e879; }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    #status, .muted { color: #8e9b88; font-size: .78rem; }
+    .map-scroll { overflow: auto; padding: 10px; border: 1px solid #222d1f; background: #090c08; }
+    #map { --map-width: 45; display: grid; grid-template-columns: repeat(var(--map-width), 1.2rem); grid-auto-rows: 1.2rem; width: max-content; min-width: 100%; color: #4c6246; font-size: .72rem; }
+    .map-cell { display: grid; width: 1.2rem; height: 1.2rem; place-items: center; border-radius: 2px; line-height: 1; cursor: pointer; }
+    .map-cell.tree { color: #dff5d5; font-size: 1rem; }
+    .map-cell.stump { color: #b58654; font-weight: 700; }
+    .map-cell.player { color: #f2d475; font-weight: 700; }
+    .map-cell:hover { background: #243020; }
+    .map-cell.target { outline: 1px solid #b9e879; background: #1b2618; }
+    .map-cell.locked { outline: 2px solid #f2d475; outline-offset: -1px; background: #28331f; box-shadow: 0 0 8px rgb(242 212 117 / 55%); animation: tree-lock-pulse 1.1s ease-in-out infinite alternate; }
+    .map-cell.chop-flash { animation: tree-chop-flash .34s ease-out; }
+    .map-cell.log-flash { animation: tree-log-flash .8s ease-out; }
+    @keyframes tree-lock-pulse {
+      from { box-shadow: 0 0 3px rgb(242 212 117 / 35%); }
+      to { box-shadow: 0 0 11px rgb(242 212 117 / 80%); }
+    }
+    @keyframes tree-chop-flash {
+      0%, 100% { color: inherit; background: transparent; transform: translateX(0) scale(1); }
+      30% { color: #fff; background: #607d4d; transform: translateX(-2px) scale(1.2); }
+      55% { transform: translateX(2px) scale(1.12); }
+    }
+    @keyframes tree-log-flash {
+      0%, 100% { color: inherit; background: transparent; box-shadow: none; transform: scale(1); }
+      25% { color: #1a210f; background: #d9f58f; box-shadow: 0 0 12px #b9e879; transform: scale(1.45); }
+      55% { color: #fff7bf; background: #6f8f43; box-shadow: 0 0 8px #d9f58f; transform: scale(1.22); }
+    }
+    .map-help { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; color: #8e9b88; font-size: .72rem; }
+    #onboarding, details { margin-top: 14px; padding: 12px; border: 1px solid #2b3527; }
+    #dashboard { margin-top: 14px; }
+    #onboarding > * + * { margin-top: 8px; }
+    .address, .funding-instruction { display: block; overflow-wrap: anywhere; color: #8e9b88; font-size: .72rem; }
+    .address-row { display: flex; align-items: center; gap: 8px; }
+    .address-row .address { min-width: 0; flex: 1; }
+    #copy-address { flex: 0 0 auto; }
+    .funding-instruction { padding: 9px; border: 1px solid #222d1f; color: #b9e879; background: #090c08; }
+    .dashboard-grid { display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch; gap: 12px; }
+    #dashboard.player-active .dashboard-grid { grid-template-columns: minmax(300px, 1fr) 262px 300px; }
+    .action-box, .bag, .stats-box { min-width: 0; border: 1px solid #3a4934; background: #11170f; }
+    .action-box { display: flex; min-height: 150px; flex-direction: column; }
+    .bag { width: 262px; }
+    .stats-box { width: 300px; }
+    .action-box > h2, .bag > h2, .stats-box > h2 { margin: 0; padding: 12px; border-bottom: 1px solid #2b3527; }
+    .action-status { min-height: 38px; padding: 9px 12px; border-bottom: 1px solid #2b3527; overflow-wrap: anywhere; }
+    #log { min-height: 80px; max-height: 260px; flex: 1; margin: 0; padding: 10px 12px; overflow: auto; color: #9fab98; font: .72rem/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+    .bag-slots { display: grid; grid-template-columns: repeat(3, 72px); grid-template-rows: repeat(3, 72px); justify-content: center; gap: 8px; padding: 14px; }
+    .bag-slot { position: relative; display: grid; width: 72px; height: 72px; place-items: center; border: 1px solid #506047; background: #090c08; }
+    .bag-slot.empty-slot { border-color: #283125; background: #0c100b; }
+    .bag-item { font-size: 1.75rem; line-height: 1; }
+    .bag-slot.empty .bag-item { opacity: .35; }
+    .bag-count { position: absolute; right: 5px; bottom: 3px; color: #fff; }
+    .stats-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: #2b3527; }
+    .stat { min-height: 66px; padding: 8px 10px; background: #11170f; }
+    .stat > span:first-child { display: block; color: #8e9b88; font-size: .72rem; }
+    .stat strong { display: block; margin-top: 4px; color: #dfe9da; }
+    .stats-actions { padding: 8px 10px; text-align: right; }
+    @media (max-width: 950px) {
+      #dashboard.player-active .dashboard-grid { grid-template-columns: minmax(0, 1fr) 262px; }
+      .stats-box { grid-column: 1 / -1; width: min(100%, 600px); justify-self: end; }
+    }
+    details { color: #8e9b88; font-size: .76rem; }
+    details button { margin: 10px 6px 0 0; }
+    .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-top: 12px; }
+    .detail-grid div { overflow-wrap: anywhere; }
+    .detail-grid dt { color: #8e9b88; }
+    .detail-grid dd { margin: 3px 0 0; color: #dfe9da; }
+    .error { color: #ff9f8d !important; }
+    [hidden] { display: none !important; }
+    @media (prefers-reduced-motion: reduce) { .map-cell.chop-flash, .map-cell.log-flash, .map-cell.locked { animation-duration: .01ms; } }
+    @media (max-width: 680px) {
+      header, .map-help, .address-row { align-items: stretch; flex-direction: column; }
+      #dashboard.player-active .dashboard-grid { grid-template-columns: 1fr; }
+      .bag, .stats-box { width: 100%; }
+      .stats-box { grid-column: auto; max-width: none; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>woodland.sh</h1>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+
+    <section id="game">
+      <div class="map-scroll"><div id="map" role="img" aria-label="Woodland map"></div></div>
+      <div class="map-help"><span>@ player · tree · + stump</span><span id="map-hint">Entering the woodland...</span></div>
+    </section>
+
+    <section id="onboarding">
+      <h2>Create player</h2>
+      <div class="address-row">
+        <div id="address" class="address">Connecting...</div>
+        <button id="copy-address" type="button" disabled>Copy address</button>
+      </div>
+      <p id="funding-instruction" class="funding-instruction">Waiting for wallet...</p>
+      <button id="activate" type="button">Create player</button>
+      <span id="onboarding-note" class="muted">Checking wallet...</span>
+    </section>
+
+    <section id="dashboard">
+      <div class="dashboard-grid">
+        <section class="action-box" aria-label="Player actions">
+          <h2>Actions</h2>
+          <div id="status" class="action-status" role="status" aria-live="polite">Loading...</div>
+          <pre id="log" aria-live="polite"></pre>
+        </section>
+        <div id="bag-panel" class="bag" hidden>
+          <h2>Bag</h2>
+          <div class="bag-slots" aria-label="Inventory">
+            <div id="log-slot" class="bag-slot empty" aria-label="0 LOG in inventory">
+              <span class="bag-item" aria-hidden="true">🪵</span>
+              <strong class="bag-count">×<span id="player-logs">0</span></strong>
+            </div>
+            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+          </div>
+        </div>
+        <aside id="stats-panel" class="stats-box" aria-label="Player stats" hidden>
+          <h2>Stats</h2>
+          <div class="stats-grid">
+            <div class="stat">
+              <span>Level</span>
+              <strong id="level-number">1</strong>
+            </div>
+            <div class="stat">
+              <span>XP</span>
+              <strong id="xp-number">0 XP</strong>
+              <div id="xp-next" class="muted">83 XP to level 2</div>
+            </div>
+            <div class="stat">
+              <span>LOG drop chance</span>
+              <strong id="log-chance">10%</strong>
+            </div>
+            <div class="stat">
+              <span>Wallet</span>
+              <strong id="wallet-sats">0 sats</strong>
+            </div>
+            <div class="stat">
+              <span>Session expires</span>
+              <strong id="player-session">-</strong>
+            </div>
+            <div class="stat">
+              <span>Player status</span>
+              <strong id="player-state">Inactive</strong>
+            </div>
+          </div>
+          <div class="stats-actions"><button id="renew-player" type="button" disabled>Renew player</button></div>
+        </aside>
+      </div>
+    </section>
+
+    <details>
+      <summary>Details</summary>
+      <button id="reset-profile" type="button" hidden>Forget saved PLAYER</button>
+      <button id="reset" type="button">New test wallet</button>
+      <dl id="details" class="detail-grid" hidden>
+        <div><dt>Tree</dt><dd id="tree-id"></dd></div>
+        <div><dt>Health</dt><dd id="tree-health"></dd></div>
+        <div><dt>Tree LOG reserve</dt><dd id="tree-reserve"></dd></div>
+        <div><dt>Tree XP fuel</dt><dd id="tree-fuel"></dd></div>
+        <div><dt>Forest</dt><dd id="forest-health"></dd></div>
+        <div><dt>Respawning</dt><dd id="regrow-ready"></dd></div>
+        <div><dt>Season fuel</dt><dd id="xp-backing"></dd></div>
+        <div><dt>Emulator</dt><dd id="emulator"></dd></div>
+        <div><dt>PLAYER_ID</dt><dd id="player-asset"></dd></div>
+        <div><dt>TREE asset</dt><dd id="tree-asset"></dd></div>
+        <div><dt>LOG asset</dt><dd id="log-asset"></dd></div>
+        <div><dt>XP_FUEL asset</dt><dd id="xp-fuel-asset"></dd></div>
+        <div><dt>Tree value</dt><dd id="tree-value"></dd></div>
+        <div><dt>Tree VTXO</dt><dd id="tree-outpoint"></dd></div>
+        <div><dt>Last swing</dt><dd id="last-chop">None</dd></div>
+      </dl>
+    </details>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

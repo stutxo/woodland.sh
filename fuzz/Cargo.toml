@@ -1,0 +1,26 @@
+[package]
+name = "woodland-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+woodland = { path = "..", features = ["regtest-e2e", "fuzzing"] }
+
+[[bin]]
+name = "asset_packet"
+path = "fuzz_targets/asset_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "batch_sse"
+path = "fuzz_targets/batch_sse.rs"
+test = false
+doc = false
+bench = false
