@@ -193,6 +193,7 @@ Docker Compose, Firefox, and `geckodriver` for browser tests.
 Open `http://127.0.0.1:8000/`. The app and social API use that same origin.
 Deposit the displayed 330 sats from any Arkade wallet, press **Refresh**, then
 **Create player**. Click an empty tile to walk or a tree to approach and chop.
+Map movement remains locked until player activation succeeds.
 
 The map is always a bounded camera viewport. The player is a separate fixed
 overlay at its center; every movement step translates the map layer underneath.

@@ -120,6 +120,7 @@ async function main() {
             target: globalThis.__WOODLAND_E2E_CAMERA || null,
             trail: globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [],
             playerGlyph: playerCell.textContent,
+            playerHidden: playerCell.hidden,
             clientWidth: viewport.clientWidth,
             clientHeight: viewport.clientHeight,
             playerCenterX: playerBounds.left + playerBounds.width / 2 - viewportBounds.left,
@@ -393,15 +394,13 @@ async function main() {
     console.log(`player wallet ready: ${initial.state.address}`);
     await clickMapCell(4, 17);
     await waitFor(
-      'inactive mouse movement',
+      'inactive movement is blocked',
       inspect,
-      (value) => !value.state?.playerActive && value.player?.x === 4 && value.player?.y === 17,
-    );
-    await clickMapCell(3, 17);
-    await waitFor(
-      'inactive mouse return',
-      inspect,
-      (value) => !value.state?.playerActive && value.player?.x === 3 && value.player?.y === 17,
+      (value) => !value.state?.playerActive
+        && value.player?.x === initial.player.x
+        && value.player?.y === initial.player.y
+        && value.camera?.playerHidden === true
+        && value.status === 'Create a player before moving.',
     );
 
     execFileSync(

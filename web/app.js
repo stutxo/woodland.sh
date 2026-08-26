@@ -384,6 +384,10 @@ function cancelWalking() {
 }
 
 async function walkTo(targets, treeId = null) {
+  if (!state?.playerActive) {
+    status.textContent = 'Create a player before moving.';
+    return false;
+  }
   const path = findWalkPath(targets);
   if (path == null) {
     status.textContent = 'That tile is unreachable.';
@@ -415,6 +419,10 @@ async function handleMapClick(event) {
   if (!(event.target instanceof Element)) return;
   const cell = event.target.closest('.map-cell');
   if (!cell || !state) return;
+  if (!state.playerActive) {
+    status.textContent = 'Create a player before moving.';
+    return;
+  }
   if (chopping) {
     attemptChop();
     return;
@@ -488,7 +496,7 @@ function flashTree(treeId, type, duration, renderNow = true) {
   }, duration);
 }
 function followPlayerCamera() {
-  if (!state) {
+  if (!state?.playerActive) {
     cameraPlayer.hidden = true;
     map.style.transform = '';
     return;
@@ -543,6 +551,7 @@ function renderMap() {
     playersByPosition.set(key, present);
   }
   const cells = document.createDocumentFragment();
+  map.classList.toggle('movement-disabled', !state?.playerActive);
   map.style.setProperty('--map-width', width);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
