@@ -76,15 +76,36 @@ pub fn derive_player_identity(owner: XOnlyPublicKey, genesis_txid: Txid) -> Play
     }
 }
 
-/// BIP340 consent proof for publishing one PLAYER_ID in one leaderboard service.
-pub fn leaderboard_registration_message(
+/// BIP340 consent proof for publishing one PLAYER_ID to one game server.
+pub fn server_registration_message(
     genesis_txid: Txid,
     owner: XOnlyPublicKey,
     player_asset: AssetId,
-    leaderboard_url: &str,
+    server_url: &str,
 ) -> Message {
     let preimage = format!(
-        "woodland.sh/LeaderboardRegistration/v1\nworld={genesis_txid}\nowner={owner}\nplayerAsset={player_asset}\nleaderboard={leaderboard_url}\n"
+        "woodland.sh/ServerRegistration/v1\nworld={genesis_txid}\nowner={owner}\nplayerAsset={player_asset}\nserver={server_url}\n"
+    );
+    Message::from_digest(sha256::Hash::hash(preimage.as_bytes()).to_byte_array())
+}
+
+pub const SERVER_ACTION_LOCATION: &str = "location";
+pub const SERVER_ACTION_CHAT: &str = "chat";
+pub const SERVER_ACTION_DELEGATION: &str = "delegation";
+
+/// BIP340 proof for one time-ordered action accepted by one social server.
+pub fn server_action_message(
+    genesis_txid: Txid,
+    owner: XOnlyPublicKey,
+    player_asset: AssetId,
+    server_url: &str,
+    action: &str,
+    timestamp_ms: u64,
+    payload: &str,
+) -> Message {
+    let payload_hash = sha256::Hash::hash(payload.as_bytes());
+    let preimage = format!(
+        "woodland.sh/ServerAction/v1\nworld={genesis_txid}\nowner={owner}\nplayerAsset={player_asset}\nserver={server_url}\naction={action}\ntimestampMs={timestamp_ms}\npayloadHash={payload_hash}\n"
     );
     Message::from_digest(sha256::Hash::hash(preimage.as_bytes()).to_byte_array())
 }

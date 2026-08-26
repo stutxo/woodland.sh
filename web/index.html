@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <!-- WOODLAND_CSP -->
-  <!-- WOODLAND_LEADERBOARD -->
+  <!-- WOODLAND_SERVER -->
   <title>woodland.sh</title>
   <style>
     :root { color-scheme: dark; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; background: #0d120c; color: #dfe9da; }
@@ -28,6 +28,7 @@
     .map-cell.player { color: #f2d475; font-weight: 700; }
     .map-cell:hover { background: #243020; }
     .map-cell.target { outline: 1px solid #b9e879; background: #1b2618; }
+    .map-cell.remote-player { color: #78c9e8; font-weight: 700; }
     .map-cell.locked { outline: 2px solid #f2d475; outline-offset: -1px; background: #28331f; box-shadow: 0 0 8px rgb(242 212 117 / 55%); animation: tree-lock-pulse 1.1s ease-in-out infinite alternate; }
     .map-cell.chop-flash { animation: tree-chop-flash .34s ease-out; }
     .map-cell.log-flash { animation: tree-log-flash .8s ease-out; }
@@ -81,6 +82,7 @@
     .leaderboard { margin-top: 12px; border: 1px solid #3a4934; background: #11170f; }
     .leaderboard-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px; }
     .leaderboard-head h2 { margin: 0; }
+    .server-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
     .leaderboard-scroll { overflow-x: auto; }
     .leaderboard table { width: 100%; border-collapse: collapse; font-size: .78rem; }
     .leaderboard th, .leaderboard td { padding: 8px 10px; border-top: 1px solid #2b3727; text-align: left; white-space: nowrap; }
@@ -88,6 +90,15 @@
     .leaderboard .rank { width: 3rem; text-align: right; }
     .leaderboard .score { width: 5rem; text-align: right; }
     .leaderboard-note { padding: 8px 10px 10px; color: #8e9b88; font-size: .72rem; }
+    .chat { border-top: 1px solid #2b3727; }
+    .chat h3 { margin: 0; padding: 10px; font-size: .86rem; }
+    #chat-status { padding: 0 10px 6px; }
+    .chat-messages { min-height: 54px; max-height: 180px; padding: 0 10px 8px; overflow-y: auto; font-size: .76rem; }
+    .chat-message { padding: 3px 0; overflow-wrap: anywhere; }
+    .chat-player { margin-right: 8px; color: #78c9e8; }
+    .chat-compose { display: flex; gap: 8px; padding: 8px 10px 10px; border-top: 1px solid #202a1d; }
+    .chat-compose input { min-width: 0; flex: 1; border: 1px solid #3a4934; border-radius: 4px; padding: 0 10px; color: #dfe9da; background: #090c08; font: inherit; }
+    .chat-compose input:disabled { opacity: .4; }
     details { color: #8e9b88; font-size: .76rem; }
     details button { margin: 10px 6px 0 0; }
     .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-top: 12px; }
@@ -114,7 +125,7 @@
 
     <section id="game">
       <div class="map-scroll"><div id="map" role="img" aria-label="Woodland map"></div></div>
-      <div class="map-help"><span>@ player · tree · + stump</span><span id="map-hint">Entering the woodland...</span></div>
+      <div class="map-help"><span>@ you · &amp; player · tree · + stump</span><span id="map-hint">Entering the woodland...</span></div>
     </section>
 
     <section id="onboarding">
@@ -192,7 +203,10 @@
           <h2>Leaderboard</h2>
           <span id="leaderboard-status" class="muted">Loading verified players...</span>
         </div>
-        <button id="join-leaderboard" type="button" hidden>Join leaderboard</button>
+        <div class="server-actions">
+          <button id="delegate-renewal" type="button" hidden>Delegate renewals</button>
+          <button id="join-leaderboard" type="button" hidden>Join server</button>
+        </div>
       </div>
       <div class="leaderboard-scroll">
         <table>
@@ -200,7 +214,16 @@
           <tbody id="leaderboard-rows"><tr><td colspan="5">No verified players yet.</td></tr></tbody>
         </table>
       </div>
-      <p class="leaderboard-note">Joining signs consent to durably publish your public owner key, PLAYER_ID, XP, LOG, outpoint, and expiry. Scores are independently verified from Arkade state; clearing this browser does not remove the server record.</p>
+      <p class="leaderboard-note">Joining signs durable consent to publish your public player identity, verified inventory, claimed map location, and chat. Location is social state, not covenant-enforced movement. Renewal delegation is a separate signed choice.</p>
+      <div class="chat">
+        <h3>Chat</h3>
+        <div id="chat-status" class="muted"></div>
+        <div id="chat-messages" class="chat-messages" aria-live="polite">Join the server to chat.</div>
+        <form id="chat-form" class="chat-compose">
+          <input id="chat-input" maxlength="280" autocomplete="off" placeholder="Message the woodland" aria-label="Chat message" disabled>
+          <button id="send-chat" type="submit" disabled>Send</button>
+        </form>
+      </div>
     </section>
 
     <details>

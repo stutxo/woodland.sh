@@ -60,9 +60,40 @@ struct PlayerProfile {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LeaderboardRegistration {
+struct ServerRegistration {
     owner: String,
     player_asset: String,
+    signature: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerLocationUpdate {
+    owner: String,
+    player_asset: String,
+    timestamp_ms: f64,
+    x: u16,
+    y: u16,
+    signature: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerChatMessage {
+    owner: String,
+    player_asset: String,
+    timestamp_ms: f64,
+    message: String,
+    signature: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerDelegation {
+    owner: String,
+    player_asset: String,
+    timestamp_ms: f64,
+    enabled: bool,
     signature: String,
 }
 
@@ -347,27 +378,111 @@ impl WoodlandApp {
         serde_json::to_string(&self.profile).expect("player profile serialization cannot fail")
     }
 
-    #[wasm_bindgen(js_name = leaderboardRegistration)]
-    pub fn leaderboard_registration(&self, leaderboard_url: String) -> Result<JsValue, JsValue> {
-        if leaderboard_url.is_empty() {
-            return Err(JsValue::from_str("leaderboard URL is empty"));
+    #[wasm_bindgen(js_name = serverRegistration)]
+    pub fn server_registration(&self, server_url: String) -> Result<JsValue, JsValue> {
+        if server_url.is_empty() {
+            return Err(JsValue::from_str("server URL is empty"));
         }
         let player_asset = self.require_player_asset().map_err(js_err)?;
         let owner = self.keys.owner_pk();
-        let message = player::leaderboard_registration_message(
+        let message = player::server_registration_message(
             self.world.genesis_txid,
             owner,
             player_asset,
-            &leaderboard_url,
+            &server_url,
         );
         let signature = self
             .keys
             .secp
             .sign_schnorr_no_aux_rand(&message, &self.keys.keypair);
-        serde_wasm_bindgen::to_value(&LeaderboardRegistration {
+        serde_wasm_bindgen::to_value(&ServerRegistration {
             owner: owner.to_string(),
             player_asset: player_asset.to_string(),
             signature: signature.to_string(),
+        })
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = serverLocation)]
+    pub fn server_location(
+        &self,
+        server_url: String,
+        x: u16,
+        y: u16,
+        timestamp_ms: f64,
+    ) -> Result<JsValue, JsValue> {
+        if x >= self.world.manifest.map_width || y >= self.world.manifest.map_height {
+            return Err(JsValue::from_str(
+                "player location is outside the world map",
+            ));
+        }
+        let payload = format!("x={x}\ny={y}\n");
+        let (owner, player_asset, signature) = self
+            .sign_server_action(
+                &server_url,
+                player::SERVER_ACTION_LOCATION,
+                timestamp_ms,
+                &payload,
+            )
+            .map_err(js_err)?;
+        serde_wasm_bindgen::to_value(&ServerLocationUpdate {
+            owner,
+            player_asset,
+            timestamp_ms,
+            x,
+            y,
+            signature,
+        })
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = serverChat)]
+    pub fn server_chat(
+        &self,
+        server_url: String,
+        message: String,
+        timestamp_ms: f64,
+    ) -> Result<JsValue, JsValue> {
+        let (owner, player_asset, signature) = self
+            .sign_server_action(
+                &server_url,
+                player::SERVER_ACTION_CHAT,
+                timestamp_ms,
+                &message,
+            )
+            .map_err(js_err)?;
+        serde_wasm_bindgen::to_value(&ServerChatMessage {
+            owner,
+            player_asset,
+            timestamp_ms,
+            message,
+            signature,
+        })
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = serverDelegation)]
+    pub fn server_delegation(
+        &self,
+        server_url: String,
+        enabled: bool,
+        timestamp_ms: f64,
+    ) -> Result<JsValue, JsValue> {
+        let payload = format!("enabled={enabled}\n");
+        let (owner, player_asset, signature) = self
+            .sign_server_action(
+                &server_url,
+                player::SERVER_ACTION_DELEGATION,
+                timestamp_ms,
+                &payload,
+            )
+            .map_err(js_err)?;
+        serde_wasm_bindgen::to_value(&ServerDelegation {
+            owner,
+            player_asset,
+            timestamp_ms,
+            enabled,
+            signature,
         })
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -473,6 +588,46 @@ impl WoodlandApp {
 }
 
 impl WoodlandApp {
+    fn sign_server_action(
+        &self,
+        server_url: &str,
+        action: &str,
+        timestamp_ms: f64,
+        payload: &str,
+    ) -> Result<(String, String, String)> {
+        if server_url.is_empty() {
+            return Err(anyhow!("server URL is empty"));
+        }
+        if !timestamp_ms.is_finite()
+            || timestamp_ms < 0.0
+            || timestamp_ms.fract() != 0.0
+            || timestamp_ms > 9_007_199_254_740_991.0
+        {
+            return Err(anyhow!("server action timestamp is invalid"));
+        }
+        let timestamp_ms = timestamp_ms as u64;
+        let player_asset = self.require_player_asset()?;
+        let owner = self.keys.owner_pk();
+        let message = player::server_action_message(
+            self.world.genesis_txid,
+            owner,
+            player_asset,
+            server_url,
+            action,
+            timestamp_ms,
+            payload,
+        );
+        let signature = self
+            .keys
+            .secp
+            .sign_schnorr_no_aux_rand(&message, &self.keys.keypair);
+        Ok((
+            owner.to_string(),
+            player_asset.to_string(),
+            signature.to_string(),
+        ))
+    }
+
     fn snapshot(&self) -> HarnessSnapshot {
         let now = crate::arkade::now_unix();
         let player_xp = self

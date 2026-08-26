@@ -63,14 +63,15 @@ Security-sensitive areas include:
   permissions, or role/path confusion in `woodland-keygen`.
 - Browser signing-key or PLAYER_ID-profile disclosure, unsafe persistence, or
   direct-service origin policy failures.
-- Leaderboard consent-signature replay across origins, unverified score
-  publication, registry corruption, or CORS exposure beyond the configured
-  frontend origin.
-- Unauthorized regrowth or renewal, expiry-policy bypass, and exploitable
-  gameplay races caused by outpoint rotation.
+- Server registration or action-signature replay across origins, forged
+  leaderboard state, location/chat injection, registry corruption, or CORS
+  exposure beyond the configured frontend origin.
+- Unauthorized delegation, rollover-key mismatch or disclosure, unsafe
+  watchtower renewal, expiry-policy bypass, and exploitable races caused by
+  outpoint rotation.
 
-Public deterministic randomness, frontend-only movement and adjacency, Sybil
-creation, Arkade or emulator availability, leaderboard availability and
+Public deterministic randomness, non-covenant map location and adjacency, chat
+content and moderation, Sybil creation, Arkade/emulator/server availability,
 request-rate abuse, public identity aggregation, the maintenance-controlled
 regrowth clock, signer retirement without rotation, NUMS-exit recovery limits,
 and the reference browser's localStorage custody are known boundaries documented

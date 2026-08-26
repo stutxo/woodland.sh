@@ -26,29 +26,29 @@ if (manifest.network === 'bitcoin' && (arkade.protocol !== 'https:' || emulator.
   throw new Error('mainnet web bundles require HTTPS service URLs');
 }
 
-const leaderboardValue = (process.env.WOODLAND_LEADERBOARD_URL || '').trim();
-const leaderboard = leaderboardValue ? new URL(leaderboardValue) : null;
+const serverValue = (process.env.WOODLAND_SERVER_URL || '').trim();
+const server = serverValue ? new URL(serverValue) : null;
 if (
-  leaderboard
+  server
   && (
-    !['http:', 'https:'].includes(leaderboard.protocol)
-    || !leaderboard.hostname
-    || leaderboard.pathname !== '/'
-    || leaderboard.username
-    || leaderboard.password
-    || leaderboard.search
-    || leaderboard.hash
-    || (manifest.network === 'bitcoin' && leaderboard.protocol !== 'https:')
+    !['http:', 'https:'].includes(server.protocol)
+    || !server.hostname
+    || server.pathname !== '/'
+    || server.username
+    || server.password
+    || server.search
+    || server.hash
+    || (manifest.network === 'bitcoin' && server.protocol !== 'https:')
   )
 ) {
-  throw new Error('WOODLAND_LEADERBOARD_URL must be a canonical HTTPS origin on mainnet');
+  throw new Error('WOODLAND_SERVER_URL must be a canonical HTTPS origin on mainnet');
 }
 
 const contentSecurityPolicy = [
   "default-src 'self'",
   "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
-  `connect-src 'self' ${arkade.origin} ${emulator.origin}${leaderboard ? ` ${leaderboard.origin}` : ''}`,
+  `connect-src 'self' ${arkade.origin} ${emulator.origin}${server ? ` ${server.origin}` : ''}`,
   "img-src 'self' data:",
   "object-src 'none'",
   "base-uri 'none'",
@@ -56,9 +56,9 @@ const contentSecurityPolicy = [
 ].join('; ');
 const htmlAttribute = (value) => value.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
 const cspMarker = '  <!-- WOODLAND_CSP -->';
-const leaderboardMarker = '  <!-- WOODLAND_LEADERBOARD -->';
+const serverMarker = '  <!-- WOODLAND_SERVER -->';
 const indexTemplate = await readFile(path.join(ROOT, 'web/index.html'), 'utf8');
-if (!indexTemplate.includes(cspMarker) || !indexTemplate.includes(leaderboardMarker)) {
+if (!indexTemplate.includes(cspMarker) || !indexTemplate.includes(serverMarker)) {
   throw new Error('web/index.html is missing a web configuration marker');
 }
 const index = indexTemplate
@@ -67,8 +67,8 @@ const index = indexTemplate
     `  <meta http-equiv="Content-Security-Policy" content="${htmlAttribute(contentSecurityPolicy)}">`,
   )
   .replace(
-    leaderboardMarker,
-    `  <meta name="woodland-leaderboard" content="${htmlAttribute(leaderboard?.origin || '')}">`,
+    serverMarker,
+    `  <meta name="woodland-server" content="${htmlAttribute(server?.origin || '')}">`,
   );
 
 await mkdir(outputPath, { recursive: true });

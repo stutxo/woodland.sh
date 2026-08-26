@@ -2,7 +2,6 @@
 
 use crate::arkade::{ArkadeRest, EmulatorParams, EmulatorRest, ServerParams, VtxoRecord};
 use crate::keys::Keys;
-use crate::player;
 use crate::tree;
 use crate::txbuild;
 use crate::world::{
@@ -1739,75 +1738,33 @@ async fn renew_player(
 ) -> Result<()> {
     let manifest = read_manifest(path)?;
     let world = manifest.validate(&rollover_keys.secp, &services.params, &services.emulator)?;
-    require_rollover_key(rollover_keys, &world)?;
-    let contract = player::build_player_contract(
-        &rollover_keys.secp,
+    let renewed = crate::watchtower::renew_player(
+        rollover_keys,
+        crate::watchtower::WatchtowerServices {
+            arkade_url: &services.arkade_url,
+            rest: &services.rest,
+            emulator_rest: &services.emulator_rest,
+            params: &services.params,
+            emulator: &services.emulator,
+        },
+        &world,
         owner,
-        services.params.signer_pk,
-        services.emulator.signer_pk,
-        world.rollover_signer,
-        services.params.unilateral_exit_delay,
-        services.params.network,
-        world.tree_asset,
-        world.log_asset,
-        world.xp_asset,
-        services.params.dust_sats,
-        &world.contract.vtxo.script_pubkey(),
-    )?;
-    let script = contract.vtxo.script_pubkey().to_hex_string();
-    let records = services.rest.get_vtxos(&script, "spendableOnly").await?;
-    let candidates = records
-        .into_iter()
-        .filter(|record| {
-            player::validate_player_state_record(record, &contract, player_asset).is_ok()
-        })
-        .collect::<Vec<_>>();
-    let record = match candidates.as_slice() {
-        [record] => record.clone(),
-        [] => return Err(anyhow!("no live player state for this owner and PLAYER_ID")),
-        _ => return Err(anyhow!("PLAYER_ID has multiple live player states")),
-    };
-    require_rollover_due(&record)?;
-    let previous_tx = services
-        .rest
-        .get_virtual_txs(&[record.outpoint.txid])
-        .await?
-        .remove(&record.outpoint.txid)
-        .ok_or_else(|| anyhow!("indexer omitted the player's creating transaction"))?;
-    let previous_state = player::player_state_from_tx(&previous_tx)?
-        .ok_or_else(|| anyhow!("player creating transaction has no state packets"))?;
-    let xp = previous_state.xp;
-    let old_expires_at = record.expires_at;
-    let prepared =
-        crate::renewal::prepare_player_watchtower(&record, &previous_tx, &contract, player_asset)?;
-    let outcome = run_one_renewal(rollover_keys, services, prepared, &previous_tx).await?;
-    let renewed = wait_for_record(&services.rest, &script, outcome.outpoint).await?;
-    require_new_expiry(old_expires_at, renewed.expires_at, renewed.outpoint)?;
-    let renewed_tx = services
-        .rest
-        .get_virtual_txs(&[renewed.outpoint.txid])
-        .await?
-        .remove(&renewed.outpoint.txid)
-        .ok_or_else(|| anyhow!("indexer omitted the renewed player transaction"))?;
-    renewed.validate_creating_transaction(&renewed_tx)?;
-    player::validate_player_state_record(&renewed, &contract, player_asset)?;
-    let renewed_state = player::player_state_from_tx(&renewed_tx)?
-        .ok_or_else(|| anyhow!("renewed player transaction has no state packets"))?;
-    if renewed_state != previous_state {
-        return Err(anyhow!("player renewal changed recursive state or XP"));
-    }
+        player_asset,
+        std::env::var(FORCE_ROLLOVER_ENV).as_deref() == Ok("1"),
+    )
+    .await?;
     println!(
         "{}",
         serde_json::json!({
             "kind": "player",
             "owner": owner.to_string(),
-            "xp": xp.value(),
+            "xp": renewed.xp,
             "playerAsset": player_asset.to_string(),
-            "oldOutpoint": record.outpoint.to_string(),
-            "oldExpiresAt": old_expires_at,
-            "newOutpoint": renewed.outpoint.to_string(),
-            "newExpiresAt": renewed.expires_at,
-            "commitmentTxid": outcome.commitment_txid.to_string(),
+            "oldOutpoint": renewed.old_outpoint.to_string(),
+            "oldExpiresAt": renewed.old_expires_at,
+            "newOutpoint": renewed.new_outpoint.to_string(),
+            "newExpiresAt": renewed.new_expires_at,
+            "commitmentTxid": renewed.commitment_txid.to_string(),
         })
     );
     Ok(())

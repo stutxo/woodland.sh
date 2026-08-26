@@ -27,9 +27,9 @@ path = "src/bin/woodland-keygen.rs"
 required-features = ["keygen"]
 
 [[bin]]
-name = "woodland-leaderboard"
-path = "src/bin/woodland-leaderboard.rs"
-required-features = ["leaderboard"]
+name = "woodland-server"
+path = "src/bin/woodland-server.rs"
+required-features = ["server"]
 
 [features]
 default = []
@@ -37,7 +37,7 @@ woodland-app = []
 # Add local-only fault probes and destructive browser-test hooks.
 regtest-e2e = ["woodland-app"]
 keygen = ["dep:bip39", "woodland-app"]
-leaderboard = ["woodland-app", "dep:axum", "dep:tower-http"]
+server = ["woodland-app", "dep:axum", "dep:tower-http"]
 fuzzing = []
 
 [dependencies]

@@ -7,7 +7,7 @@ woodland.sh uses three layers:
 1. native tests for packet encodings, host mirrors, builders, signature checks,
    and malformed state;
 2. production WASM and GitHub Pages artifact compilation for browser transport,
-   storage, manifest, CSP, optional leaderboard origin, and static-route paths;
+   storage, manifest, CSP, optional game-server origin, and static-route paths;
 3. destructive regtest profiles against stock arkd and the real emulator.
 
 ## Test Placement
@@ -27,8 +27,8 @@ cargo clippy --locked --all-targets --features woodland-app -- -D warnings
 cargo audit
 cargo test --locked --features keygen --bin woodland-keygen
 cargo clippy --locked --features keygen --bin woodland-keygen -- -D warnings
-cargo test --locked --all-targets --features leaderboard
-cargo clippy --locked --all-targets --features leaderboard -- -D warnings
+cargo test --locked --all-targets --features server
+cargo clippy --locked --all-targets --features server -- -D warnings
 CC_wasm32_unknown_unknown=<clang> \
   cargo check --locked --lib --target wasm32-unknown-unknown --features woodland-app
 node --check web/app.js
@@ -52,7 +52,7 @@ custom arkd patch is part of the protocol.
 ```
 
 Both clean wrapper-owned containers and volumes, start Bitcoin/indexers/stock
-arkd/emulator, deploy a fresh schema 1 world, start the native leaderboard,
+arkd/emulator, deploy a fresh schema 1 world, start the native Axum server,
 build the root-level Pages bundle, run browser and renewal stages, then stop the
 stack.
 
@@ -60,7 +60,7 @@ Smoke proves the complete path quickly. Full exercises deterministic depletion,
 regrowth, recovery, adversarial mutations, and four-player concurrency.
 
 The profiles exercise the same `dist/` layout deployed to GitHub Pages. The
-artifact contains a manifest-specific CSP including the configured leaderboard
+artifact contains a manifest-specific CSP including the configured game-server
 origin, `.nojekyll`, and an explicit 404. Gameplay still calls Arkade and the
 emulator directly.
 
@@ -134,13 +134,15 @@ watchtower leaf's signer closure and exact intent construction.
 ## Multiplayer
 
 Smoke starts two browser wallets; full starts four. Each receives 330 sats,
-issues a distinct PLAYER_ID, activates independently, rejects forged leaderboard
-consent, signs its own opt-in, appears with independently verified XP/LOG state,
-and chops disjoint trees concurrently. A same-tree race must produce one winning
-state transition. There is no shared activation reserve or finite ticket supply.
+issues a distinct PLAYER_ID, activates independently, rejects forged server
+consent and location, signs its own opt-in, exchanges authenticated presence and
+chat, and appears with independently verified XP/LOG state. Regtest also forces
+one signed delegated renewal and verifies revocation. Players then chop disjoint
+trees concurrently; a same-tree race must produce one winning state transition.
+There is no shared activation reserve or finite ticket supply.
 
 ## Known Gaps
 
 Tests do not prove public service availability, denial-of-service resistance,
-hidden randomness, geography, unique humans, hardened browser custody, or
-future operator/emulator signer retention.
+chat moderation, hidden randomness, geography, unique humans, hardened browser
+custody, or future operator/emulator/rollover signer retention.

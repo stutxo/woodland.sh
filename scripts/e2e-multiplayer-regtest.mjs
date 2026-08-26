@@ -26,7 +26,7 @@ const DRIVER_CONFIGS = Array.from({ length: PLAYER_COUNT }, (_, index) => ({
 }));
 const EXTERNAL_WEB_URL = process.env.WOODLAND_E2E_WEB_URL?.replace(/\/$/, '');
 const WEB_URL = EXTERNAL_WEB_URL || `http://127.0.0.1:${WEB_PORT}`;
-const LEADERBOARD_URL = process.env.WOODLAND_LEADERBOARD_URL?.replace(/\/$/, '')
+const SERVER_URL = process.env.WOODLAND_SERVER_URL?.replace(/\/$/, '')
   || 'http://127.0.0.1:8090';
 
 async function request(driverUrl, method, pathName, body, timeoutMs = 130_000) {
@@ -64,6 +64,11 @@ async function createPlayer(driverUrl, label, sessions) {
       leaderboard: globalThis.__WOODLAND_E2E_LEADERBOARD || [],
       leaderboardStatus: document.getElementById('leaderboard-status')?.textContent || '',
       joinLeaderboardHidden: document.getElementById('join-leaderboard')?.hidden ?? true,
+      social: globalThis.__WOODLAND_E2E_SOCIAL || null,
+      remotePlayers: document.querySelectorAll('#map .remote-player').length,
+      chat: document.getElementById('chat-messages')?.textContent || '',
+      delegateHidden: document.getElementById('delegate-renewal')?.hidden ?? true,
+      delegateText: document.getElementById('delegate-renewal')?.textContent || '',
     };
   `);
   const click = (id) => execute(`
@@ -169,7 +174,7 @@ async function assertLeaderboardMatches(views, label) {
   const payload = await waitFor(
     label,
     async () => {
-      const response = await fetch(`${LEADERBOARD_URL}/v1/leaderboard`, { cache: 'no-store' });
+      const response = await fetch(`${SERVER_URL}/v1/leaderboard`, { cache: 'no-store' });
       if (!response.ok) throw new Error(`leaderboard returned ${response.status}`);
       return response.json();
     },
@@ -188,7 +193,7 @@ async function main() {
   await Promise.all([
     waitForHttp('http://127.0.0.1:7070/v1/info', 5_000),
     waitForHttp('http://127.0.0.1:7073/v1/info', 5_000),
-    waitForHttp(`${LEADERBOARD_URL}/health.json`, 5_000),
+    waitForHttp(`${SERVER_URL}/health.json`, 5_000),
     ...(EXTERNAL_WEB_URL ? [] : [assertPortAvailable(WEB_PORT, 'web server')]),
     ...DRIVER_CONFIGS.flatMap(({ port, websocketPort }, index) => [
       assertPortAvailable(port, `WebDriver ${index + 1}`),
@@ -292,7 +297,7 @@ async function main() {
         && value.state.fundingRequiredSats === 0,
       180_000,
     )));
-    const activated = await refreshPlayers(
+    let activated = await refreshPlayers(
       players,
       'activated player synchronization',
       (value) => value.state?.fundingReady
@@ -307,31 +312,87 @@ async function main() {
     assert.equal(new Set(playerAssets).size, players.length);
     assertTreeValue(activated[0].state, 'post-activation state');
 
-    const forgedRegistration = await players[0].execute(
-      'return globalThis.__WOODLAND_E2E_APP.leaderboardRegistration(arguments[0]);',
-      [LEADERBOARD_URL],
-    );
+    const forgedRegistration = await players[0].executeAsync(`
+      const done = arguments[arguments.length - 1];
+      globalThis.__WOODLAND_E2E_SERVER_REGISTRATION().then(done);
+    `);
     forgedRegistration.signature = `${forgedRegistration.signature.slice(0, -1)}${
       forgedRegistration.signature.endsWith('0') ? '1' : '0'
     }`;
-    const forgedResponse = await fetch(`${LEADERBOARD_URL}/v1/players`, {
+    const forgedResponse = await fetch(`${SERVER_URL}/v1/players`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(forgedRegistration),
     });
-    assert.equal(forgedResponse.status, 400, 'forged leaderboard consent was accepted');
+    assert.equal(forgedResponse.status, 400, 'forged server consent was accepted');
 
     await Promise.all(players.map((player) => player.click('join-leaderboard')));
     const joined = await Promise.all(players.map((player) => waitFor(
-      `leaderboard opt-in (${player.label})`,
+      `server opt-in (${player.label})`,
       player.inspect,
       (value) => value.joinLeaderboardHidden
         && value.leaderboard.length >= PLAYER_COUNT
-        && value.leaderboardStatus.includes('verified player'),
+        && value.leaderboardStatus.includes('verified'),
       180_000,
     )));
     assert.ok(joined.every((view) => view.leaderboard.length >= PLAYER_COUNT));
     await assertLeaderboardMatches(activated, 'verified activation leaderboard');
+
+    const socialJoined = await Promise.all(players.map((player) => waitFor(
+      `authenticated presence (${player.label})`,
+      player.inspect,
+      (value) => value.social?.delegationAvailable === true
+        && value.social.locations?.length >= PLAYER_COUNT,
+      180_000,
+    )));
+    const forgedLocation = await players[0].executeAsync(`
+      const done = arguments[arguments.length - 1];
+      globalThis.__WOODLAND_E2E_SERVER_LOCATION(arguments[0], arguments[1]).then(done);
+    `, [socialJoined[0].player.x, socialJoined[0].player.y]);
+    forgedLocation.x = (forgedLocation.x + 1) % socialJoined[0].state.mapWidth;
+    const forgedLocationResponse = await fetch(`${SERVER_URL}/v1/location`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(forgedLocation),
+    });
+    assert.equal(forgedLocationResponse.status, 400, 'forged player location was accepted');
+
+    const chatText = `hello from ${playerAssets[0].slice(0, 8)}`;
+    await players[0].execute(`
+      const input = document.getElementById('chat-input');
+      input.value = arguments[0];
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('chat-form').requestSubmit();
+    `, [chatText]);
+    await Promise.all(players.map((player) => waitFor(
+      `authenticated chat (${player.label})`,
+      player.inspect,
+      (value) => value.chat.includes(chatText)
+        && value.social?.messages?.some((message) => message.message === chatText),
+      180_000,
+    )));
+
+    const delegatedInput = socialJoined[0].state.playerStateOutpoint;
+    await players[0].click('delegate-renewal');
+    const delegated = await waitFor(
+      'delegated player renewal',
+      players[0].inspect,
+      (value) => value.delegateText.startsWith('Stop delegated')
+        && value.social?.delegatedPlayerAssets?.includes(playerAssets[0])
+        && value.state?.playerStateOutpoint !== delegatedInput
+        && value.state.playerXp === 0
+        && value.state.playerLogs === 0,
+      180_000,
+    );
+    assert.equal(delegated.delegateHidden, false);
+    activated = await refreshPlayers(
+      players,
+      'delegated renewal synchronization',
+      (value, index) => value.state?.playerActive
+        && value.state.playerAsset === playerAssets[index]
+        && value.state.playerXp === 0
+        && value.state.playerLogs === 0,
+    );
 
     await Promise.all(players.map((player) => player.wd('POST', '/refresh', {})));
     const restoredOptIns = await Promise.all(players.map((player, index) => waitFor(
@@ -341,10 +402,19 @@ async function main() {
         && !value.busy
         && value.state?.playerAsset === playerAssets[index]
         && value.joinLeaderboardHidden
-        && value.leaderboard.some((entry) => entry.playerAsset === playerAssets[index]),
+        && value.leaderboard.some((entry) => entry.playerAsset === playerAssets[index])
+        && (index !== 0 || value.delegateText.startsWith('Stop delegated')),
       180_000,
     )));
     assert.ok(restoredOptIns.every((view) => view.joinLeaderboardHidden));
+    await players[0].click('delegate-renewal');
+    await waitFor(
+      'delegated renewal revocation',
+      players[0].inspect,
+      (value) => value.delegateText === 'Delegate renewals'
+        && !value.social?.delegatedPlayerAssets?.includes(playerAssets[0]),
+      180_000,
+    );
 
     const sharedBeforeChops = assertSharedWorld(activated, 'pre-chop shared world');
     const occupied = new Set(sharedBeforeChops.trees.map((tree) => `${tree.x}:${tree.y}`));
@@ -379,6 +449,17 @@ async function main() {
         && value.adjacentTree.health === 5
         && value.player?.x === selectedTrees[index].x
         && value.player?.y === selectedTrees[index].y + 1,
+    )));
+    await Promise.all(players.map((browserPlayer) => waitFor(
+      `remote map presence (${browserPlayer.label})`,
+      browserPlayer.inspect,
+      (value) => value.remotePlayers >= PLAYER_COUNT - 1
+        && selectedTrees.every((tree, index) => value.social?.locations?.some((location) => (
+          location.playerAsset === playerAssets[index]
+          && location.x === tree.x
+          && location.y === tree.y + 1
+        ))),
+      180_000,
     )));
 
     const initialChopResults = await Promise.all(players.map((player, index) => (

@@ -1,15 +1,15 @@
 import init, { WoodlandApp } from './pkg/woodland.js';
 
 const WORLD = new URL('./world.json', import.meta.url);
-const LEADERBOARD_URL = document
-  .querySelector('meta[name="woodland-leaderboard"]')
+const SERVER_URL = document
+  .querySelector('meta[name="woodland-server"]')
   ?.content.replace(/\/+$/, '') || '';
 const STORAGE_SCOPE = location.origin;
 const KEY = `woodland.sh:web:v1:key:${STORAGE_SCOPE}`;
 const PROFILE = `woodland.sh:web:v1:profile:${STORAGE_SCOPE}`;
 let pendingStorageKey = `woodland.sh:web:v1:pending:${STORAGE_SCOPE}`;
 const POSITION = `woodland.sh:web:v1:position:${STORAGE_SCOPE}`;
-const LEADERBOARD_REGISTRATION = `woodland.sh:web:v1:leaderboard:${STORAGE_SCOPE}:${LEADERBOARD_URL}`;
+const SERVER_REGISTRATION = `woodland.sh:web:v1:server:${STORAGE_SCOPE}:${SERVER_URL}`;
 
 const element = (id) => document.getElementById(id);
 const address = element('address');
@@ -47,6 +47,12 @@ const leaderboardPanel = element('leaderboard-panel');
 const leaderboardRows = element('leaderboard-rows');
 const leaderboardStatus = element('leaderboard-status');
 const joinLeaderboardButton = element('join-leaderboard');
+const delegateRenewalButton = element('delegate-renewal');
+const chatForm = element('chat-form');
+const chatInput = element('chat-input');
+const sendChatButton = element('send-chat');
+const chatMessagesElement = element('chat-messages');
+const chatStatus = element('chat-status');
 
 const DEFAULT_MAP_WIDTH = 45;
 const DEFAULT_MAP_HEIGHT = 19;
@@ -78,9 +84,17 @@ let focusedTreeId = null;
 let appQueue = Promise.resolve();
 let leaderboardPlayers = [];
 let leaderboardJoined = false;
-let leaderboardSyncing = false;
-let leaderboardOutpoint = null;
-let leaderboardRetryAfter = 0;
+let serverRegistrationSyncing = false;
+let serverRegistrationOutpoint = null;
+let serverRegistrationRetryAfter = 0;
+let remoteLocations = [];
+let chatMessages = [];
+let delegatedRenewal = false;
+let delegationAvailable = false;
+let socialPosting = false;
+let locationPosting = false;
+let lastPublishedLocation = null;
+let lastRenderedChatId = null;
 
 function withApp(action) {
   const operation = appQueue.then(action, action);
@@ -99,20 +113,20 @@ function setBusy(value, message = '') {
   render();
 }
 
-function restoreLeaderboardRegistration() {
+function restoreServerRegistration() {
   leaderboardJoined = false;
-  if (!LEADERBOARD_URL || !state?.genesisTxid || !state.playerAsset) return;
+  if (!SERVER_URL || !state?.genesisTxid || !state.playerAsset) return;
   try {
-    const registration = JSON.parse(localStorage.getItem(LEADERBOARD_REGISTRATION) || 'null');
+    const registration = JSON.parse(localStorage.getItem(SERVER_REGISTRATION) || 'null');
     leaderboardJoined = registration?.genesisTxid === state.genesisTxid
       && registration?.playerAsset === state.playerAsset;
   } catch {
-    localStorage.removeItem(LEADERBOARD_REGISTRATION);
+    localStorage.removeItem(SERVER_REGISTRATION);
   }
 }
 
 function renderLeaderboard() {
-  if (!LEADERBOARD_URL) return;
+  if (!SERVER_URL) return;
   leaderboardRows.replaceChildren();
   if (!leaderboardPlayers.length) {
     const row = document.createElement('tr');
@@ -143,55 +157,174 @@ function renderLeaderboard() {
   });
 }
 
-async function refreshLeaderboard() {
-  if (!LEADERBOARD_URL) return;
-  try {
-    const response = await fetch(`${LEADERBOARD_URL}/v1/leaderboard`, {
-      cache: 'no-store',
-      mode: 'cors',
-    });
-    if (!response.ok) throw new Error(`leaderboard returned ${response.status}`);
-    const payload = await response.json();
-    leaderboardPlayers = Array.isArray(payload.players) ? payload.players : [];
-    leaderboardStatus.textContent = `${leaderboardPlayers.length} verified player${leaderboardPlayers.length === 1 ? '' : 's'}`;
-    globalThis.__WOODLAND_E2E_LEADERBOARD = leaderboardPlayers;
-    renderLeaderboard();
-  } catch (error) {
-    leaderboardStatus.textContent = `Leaderboard unavailable: ${error}`;
+function renderChat() {
+  chatMessagesElement.replaceChildren();
+  if (!leaderboardJoined) {
+    chatMessagesElement.textContent = 'Join the server to chat.';
+    return;
+  }
+  if (!chatMessages.length) {
+    chatMessagesElement.textContent = 'No messages yet.';
+    return;
+  }
+  for (const entry of chatMessages) {
+    const row = document.createElement('div');
+    row.className = 'chat-message';
+    const playerName = document.createElement('span');
+    playerName.className = 'chat-player';
+    playerName.textContent = entry.playerAsset === state?.playerAsset
+      ? 'you'
+      : `${entry.playerAsset.slice(0, 8)}…`;
+    const message = document.createElement('span');
+    message.textContent = entry.message;
+    row.append(playerName, message);
+    chatMessagesElement.append(row);
+  }
+  const newest = chatMessages.at(-1)?.id ?? null;
+  if (newest !== lastRenderedChatId) {
+    chatMessagesElement.scrollTop = chatMessagesElement.scrollHeight;
+    lastRenderedChatId = newest;
   }
 }
 
-async function syncLeaderboardRegistration(force = false) {
+async function refreshSocial() {
+  if (!SERVER_URL) return;
+  try {
+    const response = await fetch(`${SERVER_URL}/v1/social`, {
+      cache: 'no-store',
+      mode: 'cors',
+    });
+    if (!response.ok) throw new Error(`server returned ${response.status}`);
+    const payload = await response.json();
+    leaderboardPlayers = Array.isArray(payload.players) ? payload.players : [];
+    remoteLocations = Array.isArray(payload.locations) ? payload.locations : [];
+    chatMessages = Array.isArray(payload.messages) ? payload.messages : [];
+    delegationAvailable = payload.delegationAvailable === true;
+    delegatedRenewal = Array.isArray(payload.delegatedPlayerAssets)
+      && payload.delegatedPlayerAssets.includes(state?.playerAsset);
+    leaderboardStatus.textContent = `${leaderboardPlayers.length} verified · ${remoteLocations.length} online`;
+    globalThis.__WOODLAND_E2E_LEADERBOARD = leaderboardPlayers;
+    globalThis.__WOODLAND_E2E_SOCIAL = payload;
+    render();
+  } catch (error) {
+    delegationAvailable = false;
+    delegatedRenewal = false;
+    render();
+    leaderboardStatus.textContent = `Server unavailable: ${error}`;
+  }
+}
+
+async function syncServerRegistration(force = false) {
   if (
-    !LEADERBOARD_URL
+    !SERVER_URL
     || !leaderboardJoined
     || !state?.playerActive
     || !state.playerAsset
-    || leaderboardSyncing
-    || (!force && Date.now() < leaderboardRetryAfter)
-    || (!force && leaderboardOutpoint === state.playerStateOutpoint)
+    || serverRegistrationSyncing
+    || (!force && Date.now() < serverRegistrationRetryAfter)
+    || (!force && serverRegistrationOutpoint === state.playerStateOutpoint)
   ) return;
-  leaderboardSyncing = true;
-  leaderboardRetryAfter = Date.now() + 15_000;
+  serverRegistrationSyncing = true;
+  serverRegistrationRetryAfter = Date.now() + 15_000;
   try {
-    const response = await fetch(`${LEADERBOARD_URL}/v1/players`, {
+    const registration = await withApp(() => app.serverRegistration(SERVER_URL));
+    const response = await fetch(`${SERVER_URL}/v1/players`, {
       method: 'POST',
       mode: 'cors',
       cache: 'no-store',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(app.leaderboardRegistration(LEADERBOARD_URL)),
+      body: JSON.stringify(registration),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error || `registration returned ${response.status}`);
-    leaderboardOutpoint = state.playerStateOutpoint;
-    localStorage.setItem(LEADERBOARD_REGISTRATION, JSON.stringify({
+    serverRegistrationOutpoint = state.playerStateOutpoint;
+    localStorage.setItem(SERVER_REGISTRATION, JSON.stringify({
       genesisTxid: state.genesisTxid,
       playerAsset: state.playerAsset,
     }));
-    await refreshLeaderboard();
-    leaderboardRetryAfter = 0;
+    await refreshSocial();
+    await publishLocation(true);
+    serverRegistrationRetryAfter = 0;
   } finally {
-    leaderboardSyncing = false;
+    serverRegistrationSyncing = false;
+  }
+}
+
+async function postServerAction(path, body) {
+  const response = await fetch(`${SERVER_URL}${path}`, {
+    method: 'POST',
+    mode: 'cors',
+    cache: 'no-store',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `server returned ${response.status}`);
+  return payload;
+}
+
+async function publishLocation(force = false) {
+  if (!SERVER_URL || !leaderboardJoined || !state?.playerActive || locationPosting) return;
+  const location = `${player.x}:${player.y}`;
+  if (!force && location === lastPublishedLocation) return;
+  locationPosting = true;
+  try {
+    const locationRequest = await withApp(() => (
+      app.serverLocation(SERVER_URL, player.x, player.y, Date.now())
+    ));
+    await postServerAction('/v1/location', locationRequest);
+    lastPublishedLocation = location;
+  } catch (error) {
+    leaderboardStatus.textContent = `Location update failed: ${error}`;
+  } finally {
+    locationPosting = false;
+  }
+}
+
+async function submitChat(message) {
+  if (!SERVER_URL || !leaderboardJoined || !state?.playerActive || socialPosting) return;
+  socialPosting = true;
+  render();
+  try {
+    const chatRequest = await withApp(() => app.serverChat(SERVER_URL, message, Date.now()));
+    await postServerAction('/v1/chat', chatRequest);
+    chatInput.value = '';
+    chatStatus.textContent = '';
+    await refreshSocial();
+  } catch (error) {
+    chatStatus.textContent = String(error);
+  } finally {
+    socialPosting = false;
+    render();
+  }
+}
+
+async function updateDelegation() {
+  if (
+    !SERVER_URL
+    || !leaderboardJoined
+    || !state?.playerActive
+    || !delegationAvailable
+    || socialPosting
+  ) return;
+  socialPosting = true;
+  render();
+  const enabled = !delegatedRenewal;
+  try {
+    const delegationRequest = await withApp(() => (
+      app.serverDelegation(SERVER_URL, enabled, Date.now())
+    ));
+    await postServerAction('/v1/delegation', delegationRequest);
+    delegatedRenewal = enabled;
+    chatStatus.textContent = enabled
+      ? 'Server renewal delegation enabled.'
+      : 'Server renewal delegation disabled.';
+    await refreshSocial();
+  } catch (error) {
+    chatStatus.textContent = String(error);
+  } finally {
+    socialPosting = false;
+    render();
   }
 }
 
@@ -271,6 +404,7 @@ async function walkTo(targets, treeId = null) {
   walkingTarget = null;
   walkingTargetTreeId = null;
   render();
+  void publishLocation();
   return true;
 }
 
@@ -354,6 +488,14 @@ function renderMap() {
   const width = state?.mapWidth || DEFAULT_MAP_WIDTH;
   const height = state?.mapHeight || DEFAULT_MAP_HEIGHT;
   const trees = new Map(worldTrees().map((tree) => [`${tree.x}:${tree.y}`, tree]));
+  const playersByPosition = new Map();
+  for (const location of remoteLocations) {
+    if (location.playerAsset === state?.playerAsset) continue;
+    const key = coordinateKey(location.x, location.y);
+    const present = playersByPosition.get(key) || [];
+    present.push(location.playerAsset);
+    playersByPosition.set(key, present);
+  }
   const cells = document.createDocumentFragment();
   map.style.setProperty('--map-width', width);
   for (let y = 0; y < height; y += 1) {
@@ -385,6 +527,14 @@ function renderMap() {
         || (!tree && walkingTarget?.x === x && walkingTarget?.y === y)
       ) {
         cell.classList.add('target');
+      }
+      const remotePlayers = playersByPosition.get(coordinateKey(x, y)) || [];
+      if (!tree && remotePlayers.length && (player.x !== x || player.y !== y)) {
+        cell.classList.add('remote-player');
+        cell.textContent = remotePlayers.length === 1 ? '&' : String(remotePlayers.length);
+        cell.title = remotePlayers
+          .map((asset) => `${asset.slice(0, 8)}…`)
+          .join(', ');
       }
       if (player.x === x && player.y === y) {
         cell.className = 'map-cell player';
@@ -494,10 +644,18 @@ function render() {
   dashboard.classList.toggle('player-active', playerActive);
   bagPanel.hidden = !playerActive;
   statsPanel.hidden = !playerActive;
-  leaderboardPanel.hidden = !LEADERBOARD_URL;
+  leaderboardPanel.hidden = !SERVER_URL;
   joinLeaderboardButton.hidden = !playerActive || leaderboardJoined;
-  joinLeaderboardButton.disabled = busy || leaderboardSyncing;
+  joinLeaderboardButton.disabled = busy || serverRegistrationSyncing || socialPosting;
+  delegateRenewalButton.hidden = !playerActive || !leaderboardJoined || !delegationAvailable;
+  delegateRenewalButton.disabled = busy || socialPosting;
+  delegateRenewalButton.textContent = delegatedRenewal
+    ? 'Stop delegated renewals'
+    : 'Delegate renewals';
+  chatInput.disabled = !playerActive || !leaderboardJoined || socialPosting;
+  sendChatButton.disabled = chatInput.disabled || !chatInput.value.trim();
   renderLeaderboard();
+  renderChat();
   address.textContent = state.address;
   copyAddressButton.disabled = !state.address;
   fundingInstructionElement.textContent = fundingMessage();
@@ -606,8 +764,8 @@ async function run(label, action, completion = () => 'Success') {
     persistProfile();
     persistPosition();
     setBusy(false);
-    void syncLeaderboardRegistration().catch((error) => {
-      leaderboardStatus.textContent = `Leaderboard registration failed: ${error}`;
+    void syncServerRegistration().catch((error) => {
+      leaderboardStatus.textContent = `Server registration failed: ${error}`;
     });
   }
 }
@@ -765,19 +923,29 @@ function attemptChop() {
 copyAddressButton.addEventListener('click', () => { void copyAddress(); });
 
 joinLeaderboardButton.addEventListener('click', async () => {
-  if (!state?.playerActive || !LEADERBOARD_URL || leaderboardSyncing) return;
+  if (!state?.playerActive || !SERVER_URL || serverRegistrationSyncing) return;
   leaderboardJoined = true;
   joinLeaderboardButton.disabled = true;
   leaderboardStatus.textContent = 'Verifying player state...';
   try {
-    await syncLeaderboardRegistration(true);
+    await syncServerRegistration(true);
     render();
   } catch (error) {
     leaderboardJoined = false;
-    localStorage.removeItem(LEADERBOARD_REGISTRATION);
-    leaderboardStatus.textContent = `Leaderboard registration failed: ${error}`;
+    localStorage.removeItem(SERVER_REGISTRATION);
+    leaderboardStatus.textContent = `Server registration failed: ${error}`;
     render();
   }
+});
+
+delegateRenewalButton.addEventListener('click', () => { void updateDelegation(); });
+chatInput.addEventListener('input', () => {
+  sendChatButton.disabled = chatInput.disabled || !chatInput.value.trim() || socialPosting;
+});
+chatForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const message = chatInput.value.trim();
+  if (message) void submitChat(message);
 });
 
 
@@ -797,7 +965,7 @@ resetButton.addEventListener('click', () => {
   localStorage.removeItem(PROFILE);
   localStorage.removeItem(pendingStorageKey);
   localStorage.removeItem(POSITION);
-  localStorage.removeItem(LEADERBOARD_REGISTRATION);
+  localStorage.removeItem(SERVER_REGISTRATION);
   location.reload();
 });
 
@@ -809,7 +977,7 @@ resetProfileButton.addEventListener('click', () => {
   ) return;
   localStorage.removeItem(PROFILE);
   localStorage.removeItem(POSITION);
-  localStorage.removeItem(LEADERBOARD_REGISTRATION);
+  localStorage.removeItem(SERVER_REGISTRATION);
   location.reload();
 });
 
@@ -854,14 +1022,20 @@ async function boot() {
     }
     if (!state.pendingChopTxid) status.textContent = 'Ready';
     appendLog('Connected to woodland.sh');
-    restoreLeaderboardRegistration();
-    await refreshLeaderboard();
+    restoreServerRegistration();
+    await refreshSocial();
     if (leaderboardJoined) {
-      await syncLeaderboardRegistration(true).catch((error) => {
-        leaderboardStatus.textContent = `Leaderboard registration failed: ${error}`;
+      await syncServerRegistration(true).catch((error) => {
+        leaderboardStatus.textContent = `Server registration failed: ${error}`;
       });
     }
     globalThis.__WOODLAND_E2E_APP = app;
+    globalThis.__WOODLAND_E2E_SERVER_REGISTRATION = () => (
+      withApp(() => app.serverRegistration(SERVER_URL))
+    );
+    globalThis.__WOODLAND_E2E_SERVER_LOCATION = (x, y) => (
+      withApp(() => app.serverLocation(SERVER_URL, x, y, Date.now()))
+    );
     globalThis.__WOODLAND_E2E_UNAUTHORIZED_REISSUANCE = () => (
       withApp(() => app.testUnauthorizedReissuance())
     );
@@ -938,19 +1112,21 @@ setInterval(async () => {
       && state.playerStateExpiresInSeconds != null
       && state.playerRolloverMarginSeconds != null
       && state.playerStateExpiresInSeconds < state.playerRolloverMarginSeconds
+      && !delegatedRenewal
     ) {
       status.textContent = 'Rolling player state into a fresh Arkade batch...';
       state = await renewPlayer();
     }
     persistProfile();
     render();
-    void syncLeaderboardRegistration().catch((error) => {
-      leaderboardStatus.textContent = `Leaderboard registration failed: ${error}`;
+    void syncServerRegistration().catch((error) => {
+      leaderboardStatus.textContent = `Server registration failed: ${error}`;
     });
   } catch {}
   finally { polling = false; }
 }, 1000);
 
 setInterval(() => {
-  void refreshLeaderboard();
-}, 15_000);
+  void refreshSocial();
+  void publishLocation();
+}, 2_000);

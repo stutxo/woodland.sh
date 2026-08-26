@@ -73,6 +73,9 @@ PLAYER_ID, or outpoint.
 
 Tree renewal and regrowth contend per tree. The maintenance watcher can process
 independent trees concurrently with a fixed concurrency bound.
+Delegated player renewals are exact per-player self-sends. The server processes
+due opt-ins sequentially, so they share batch/service capacity but no gameplay
+input.
 
 ## Indexing
 
@@ -82,12 +85,16 @@ public lookalikes do not create ambiguous state. It does not scan all players.
 Tree discovery remains one shared-script query followed by packet-based lineage
 selection for ten declared trees.
 
-The optional leaderboard is deliberately outside this state machine. Its
+The optional game server is deliberately outside this state machine. Its
 registry is capped at 10,000 signed opt-ins and refreshes owner-specific scripts
 with bounded concurrency. That scan is $O(N)$ in registered players and can be
-sharded independently without changing covenant contention. BIP340 consent
-prevents third parties from opting in another owner, but it does not rate-limit
-requests or make owners unique humans; the public deployment still needs
+sharded independently without changing covenant contention. Presence expires
+after 60 seconds, chat is bounded to 200 in-memory messages, and one combined
+snapshot serves the browser's two-second social poll.
+
+BIP340 consent prevents third parties from opting in another owner or forging
+their location, chat, or delegation payload. It does not rate-limit arbitrary
+HTTP clients or make owners unique humans; the public deployment still needs
 reverse-proxy request limits.
 
 ## Failure Domains
@@ -98,7 +105,8 @@ reverse-proxy request limits.
   recovery; reference localStorage is not production custody.
 - A player can self-renew without Woodland infrastructure.
 - Tree maintenance failure affects regrowth/expiry but not player authorization.
-- Leaderboard failure can stale or hide rankings but cannot block gameplay.
+- Game-server failure hides social state and rankings; online clients fall back
+  to owner renewal and gameplay remains direct.
 - Operator or emulator retirement still strands NUMS-exit recursive state; no
   signer rotation is encoded.
 

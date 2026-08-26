@@ -35,7 +35,7 @@ jobs:
           shared-key: msrv
       - run: cargo check --locked --all-targets --features regtest-e2e
       - run: cargo check --locked --features keygen --bin woodland-keygen
-      - run: cargo check --locked --all-targets --features leaderboard
+      - run: cargo check --locked --all-targets --features server
 
   audit:
     runs-on: ubuntu-latest
@@ -76,8 +76,8 @@ jobs:
       - run: cargo clippy --locked --all-targets --features woodland-app -- -D warnings
       - run: cargo test --locked --features keygen --bin woodland-keygen
       - run: cargo clippy --locked --features keygen --bin woodland-keygen -- -D warnings
-      - run: cargo test --locked --all-targets --features leaderboard
-      - run: cargo clippy --locked --all-targets --features leaderboard -- -D warnings
+      - run: cargo test --locked --all-targets --features server
+      - run: cargo clippy --locked --all-targets --features server -- -D warnings
       - run: CC_wasm32_unknown_unknown=clang cargo check --locked --lib --target wasm32-unknown-unknown --features regtest-e2e
       - run: CC_wasm32_unknown_unknown=clang cargo clippy --locked --lib --target wasm32-unknown-unknown --features regtest-e2e -- -D warnings
       - run: CC_wasm32_unknown_unknown=clang cargo check --locked --lib --target wasm32-unknown-unknown --features woodland-app
@@ -199,7 +199,7 @@ jobs:
       contents: read
     env:
       WOODLAND_WORLD_MANIFEST: ${{ vars.WOODLAND_PAGES_MANIFEST || 'mutinynet/woodland-world.json' }}
-      WOODLAND_LEADERBOARD_URL: ${{ vars.WOODLAND_LEADERBOARD_URL || '' }}
+      WOODLAND_SERVER_URL: ${{ vars.WOODLAND_SERVER_URL || '' }}
       WOODLAND_WASM_FEATURES: woodland-app
     steps:
       - uses: actions/checkout@v5

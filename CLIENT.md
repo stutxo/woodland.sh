@@ -82,24 +82,43 @@ equal the XP asset balance. Identity is:
 SHA256("woodland.sh/PlayerIdentity/v1" || owner_xonly || genesis_txid)
 ```
 
-## Optional Leaderboard Registration
+## Optional Game Server
 
-An alternate client joins a configured directory by BIP340-signing the SHA256
+An alternate client joins a configured server by BIP340-signing the SHA256
 digest of this exact UTF-8 message, including its final newline:
 
 ```text
-woodland.sh/LeaderboardRegistration/v1
+woodland.sh/ServerRegistration/v1
 world=<genesisTxid>
 owner=<owner x-only public key>
 playerAsset=<PLAYER_ID>
-leaderboard=<canonical leaderboard API origin>
+server=<canonical server origin>
 ```
 
-POST `{owner, playerAsset, signature}` to `/v1/players`. The service must bind
-the proof to its configured public origin and independently verify the live
+POST `{owner, playerAsset, signature}` to `/v1/players`. The server binds the
+proof to its configured public origin and independently verifies the live
 covenant, PLAYER_ID issuance, creating transaction, identity, and XP backing.
-Registration affects only public directory visibility; gameplay never depends
-on the service.
+
+Location, chat, and delegation use the same identity with a second signed
+message:
+
+```text
+woodland.sh/ServerAction/v1
+world=<genesisTxid>
+owner=<owner x-only public key>
+playerAsset=<PLAYER_ID>
+server=<canonical server origin>
+action=<location|chat|delegation>
+timestampMs=<unix milliseconds>
+payloadHash=<SHA256 of endpoint-specific UTF-8 payload>
+```
+
+Location payload is `x=<x>\ny=<y>\n`; chat payload is the exact message;
+delegation payload is `enabled=<true|false>\n`. Requests include those payload
+fields plus `timestampMs` and `signature`. The server accepts only active
+registered players, a five-minute clock window, and increasing action
+timestamps. Delegated renewal uses the rollover leaf and preserves player state
+exactly; it never gives the server the player key.
 
 ## Build a Swing
 

@@ -95,8 +95,9 @@ builds a local `dist/` bundle.
 
 Push `main` to trigger the gated `pages-build` and `pages-deploy` jobs. Select
 **GitHub Actions** as the repository's Pages source. The workflow uses
-`mutinynet/woodland-world.json` unless the repository variable
-`WOODLAND_PAGES_MANIFEST` names another tracked manifest.
+`mutinynet/woodland-world.json` unless `WOODLAND_PAGES_MANIFEST` names another
+tracked manifest. Set `WOODLAND_SERVER_URL` to enable the optional social,
+leaderboard, and renewal-delegation UI.
 
 The browser contacts the manifest-pinned public Arkade and emulator endpoints
 directly. The manifest and GitHub Pages artifact contain no secrets.
@@ -128,6 +129,10 @@ independently before creating irreversible assets.
 ./scripts/test-regtest.sh smoke
 ./scripts/test-regtest.sh full
 ```
+
+Both profiles start `woodland-server` on port 8090, authenticate player
+registration/location/chat, and exercise signed renewal delegation. Smoke uses
+two browsers; full uses four.
 
 The profiles are destructive only to resources owned by this checkout. If port
 3000 is already in use, set `MEMPOOL_WEB_PORT` to a free host port.

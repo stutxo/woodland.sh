@@ -9,11 +9,12 @@ export WOODLAND_DEPLOYER_SECRET=111111111111111111111111111111111111111111111111
 export WOODLAND_TREE_MAINTENANCE_SECRET=2222222222222222222222222222222222222222222222222222222222222222
 export WOODLAND_ROLLOVER_SECRET=4444444444444444444444444444444444444444444444444444444444444444
 export WOODLAND_WORLD_MANIFEST="$ROOT/regtest/_build/woodland-world.json"
-export WOODLAND_LEADERBOARD_URL=http://127.0.0.1:8090
-export WOODLAND_LEADERBOARD_PUBLIC_URL=http://127.0.0.1:8090
-export WOODLAND_LEADERBOARD_ORIGIN=http://127.0.0.1:18776
-export WOODLAND_LEADERBOARD_BIND=127.0.0.1:8090
-export WOODLAND_LEADERBOARD_DB="$ROOT/regtest/_build/leaderboard.json"
+export WOODLAND_SERVER_URL=http://127.0.0.1:8090
+export WOODLAND_SERVER_PUBLIC_URL=http://127.0.0.1:8090
+export WOODLAND_SERVER_ORIGIN=http://127.0.0.1:18776
+export WOODLAND_SERVER_BIND=127.0.0.1:8090
+export WOODLAND_SERVER_DB="$ROOT/regtest/_build/server.json"
+export WOODLAND_SERVER_FORCE_RENEWAL_ONCE=1
 PROFILE=${1:-full}
 
 case "$PROFILE" in
@@ -25,15 +26,15 @@ case "$PROFILE" in
 esac
 
 export WOODLAND_E2E_PROFILE=$PROFILE
-LEADERBOARD_PID=
-LEADERBOARD_LOG="${WOODLAND_E2E_ARTIFACT_DIR:-$ROOT/regtest/_build/ci-artifacts}/leaderboard.log"
+SERVER_PID=
+SERVER_LOG="${WOODLAND_E2E_ARTIFACT_DIR:-$ROOT/regtest/_build/ci-artifacts}/server.log"
 
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
-  if [[ -n "$LEADERBOARD_PID" ]]; then
-    kill "$LEADERBOARD_PID" 2>/dev/null || true
-    wait "$LEADERBOARD_PID" 2>/dev/null || true
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
   fi
   "$ROOT/scripts/regtest.sh" stop || true
   exit "$status"
@@ -46,18 +47,18 @@ trap 'exit 143' TERM
 printf 'Running woodland.sh %s regtest profile\n' "$PROFILE"
 "$ROOT/scripts/regtest.sh" clean --force
 "$ROOT/scripts/regtest.sh" start-tree
-cargo build --locked --features leaderboard --bin woodland-leaderboard
-rm -f "$WOODLAND_LEADERBOARD_DB"
-mkdir -p "$(dirname "$LEADERBOARD_LOG")"
-"$ROOT/target/debug/woodland-leaderboard" >"$LEADERBOARD_LOG" 2>&1 &
-LEADERBOARD_PID=$!
+cargo build --locked --features server --bin woodland-server
+rm -f "$WOODLAND_SERVER_DB"
+mkdir -p "$(dirname "$SERVER_LOG")"
+"$ROOT/target/debug/woodland-server" >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
 for attempt in {1..60}; do
-  if curl --fail --silent "$WOODLAND_LEADERBOARD_URL/health.json" >/dev/null; then
+  if curl --fail --silent "$WOODLAND_SERVER_URL/health.json" >/dev/null; then
     break
   fi
   if [[ $attempt == 60 ]]; then
-    cat "$LEADERBOARD_LOG" >&2
-    printf 'error: leaderboard did not become ready\n' >&2
+    cat "$SERVER_LOG" >&2
+    printf 'error: server did not become ready\n' >&2
     exit 1
   fi
   sleep 1

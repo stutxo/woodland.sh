@@ -39,8 +39,11 @@ mod web_app;
 #[cfg(all(feature = "woodland-app", not(target_arch = "wasm32")))]
 pub mod regtest_bootstrap;
 
-#[cfg(all(feature = "leaderboard", not(target_arch = "wasm32")))]
-pub mod leaderboard;
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+pub mod server;
+
+#[cfg(all(feature = "woodland-app", not(target_arch = "wasm32")))]
+mod watchtower;
 
 pub use keys::Keys;
 

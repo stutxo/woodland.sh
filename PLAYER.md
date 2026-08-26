@@ -5,8 +5,8 @@
 A player is one owner-specific recursive VTXO. It holds 330 sats, exactly one
 self-issued PLAYER_ID, immutable identity and position packets, numeric XP,
 harvested LOG, and earned XP. There is no carrier, PLAYER_TICKET, allocator,
-protocol registry, or player cap. A separately hosted opt-in leaderboard can
-index this public state but has no role in authorization or transitions.
+protocol registry, or player cap. A separately hosted opt-in game server can
+index public state, presence, and chat, but has no role in gameplay authorization.
 
 ```text
 player state: D sats + 1 PLAYER_ID + identity + position + numeric XP packet
@@ -113,9 +113,10 @@ batch, contributes the ephemeral MuSig2 cosigner, verifies the generated trees
 and forfeits, and confirms that expiry increased.
 
 The optional watchtower leaf uses the dedicated rollover key and never receives
-the player secret. It can rotate only the exact state into a new batch, but that
-outpoint change can race gameplay; unattended operation is therefore
-near-expiry policy, not a requirement for active players.
+the player secret. The game server enables it only after a separate BIP340-signed
+delegation and accepts a newer signed revocation. It can rotate only the exact
+state into a new batch, but that outpoint change can race gameplay; unattended
+operation is therefore near-expiry policy, not a requirement for active players.
 
 Every renewal preserves byte-for-byte:
 

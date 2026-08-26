@@ -107,7 +107,8 @@ The protocol-critical review surface is intentionally small:
 - `src/world.rs`: mandatory manifest validation and contract reconstruction;
 - `src/renewal.rs`: exact-self-send intent construction and approval checks;
 - `src/asset_packet.rs`: strict indexed-asset reconstruction;
-- `src/leaderboard.rs`: optional consent and independent public-state verification;
+- `src/server.rs`: authenticated social API and verified public-state refresh;
+- `src/watchtower.rs`: covenant-constrained delegated player renewal.
 
 `src/web_app.rs`, `src/batch.rs`, and `src/arkade.rs` are reference-client and
 transport code. Contract tests sit at the end of their corresponding source
@@ -125,15 +126,15 @@ actually exists.
 
 The manifest pins the Arkade and emulator service URLs and signer keys. The
 browser calls both services directly. GitHub Pages serves only the static web
-bundle and manifest; it receives no deployer, maintenance, rollover, leaderboard,
-or player secrets. Tree maintenance and the optional public leaderboard run as
+bundle and manifest; it receives no deployer, maintenance, rollover, server, or
+player secrets. Tree maintenance and the optional Axum game server run as
 separate native processes.
 
 ```text
 browser ──direct──> Arkade service
         ──direct──> Arkade emulator
         ──static──> GitHub Pages: web bundle + manifest
-        ──optional──> verified leaderboard API
+        ──optional──> Axum server: leaderboard, presence, chat, delegation
 
 maintenance host ──> tree regrowth and tree rollover
 ```
@@ -144,30 +145,38 @@ GitHub Pages cannot supply the stronger response headers a configurable CDN can;
 put a proxy in front later if COOP, frame, or Permissions Policy headers become
 release requirements.
 
-## Optional Verified Leaderboard
+## Optional Game Server
 
-The leaderboard is an off-chain directory, not protocol authority. A Pages build
-shows it only when `WOODLAND_LEADERBOARD_URL` is configured. **Join
-leaderboard** creates a BIP340 consent signature bound to the exact world
-genesis, owner key, PLAYER_ID, and leaderboard API origin. The browser sends only
-that signed public identity tuple; its signing key never leaves WASM.
+A Pages build connects to `woodland-server` only when `WOODLAND_SERVER_URL` is
+configured. **Join server** creates a BIP340 consent signature bound to the exact
+world genesis, owner key, PLAYER_ID, and server origin. Every location, chat, and
+delegation update has a separate signed action, timestamp, and payload hash. The
+player key never leaves WASM.
 
-Before publishing a score, `woodland-leaderboard` reconstructs the
-owner-specific covenant and independently verifies:
+The server independently verifies:
 
 - the one-unit uncontrolled PLAYER_ID supply and canonical owner metadata;
 - the exact live player script, marker, indexed creating transaction, and state
   identity;
 - numeric XP against the XP asset held by the same state.
 
-The API publishes owner, PLAYER_ID, XP, level, LOG count, current outpoint,
-expiry, activity, and registration/update times. Registration is durable and v1
-has no self-service deletion endpoint; clearing browser storage does not remove
-the server record. These values are public through Arkade, but aggregation adds
-linkability and the service or its reverse proxy may log IP addresses. The
-directory provides neither unique-human nor Sybil guarantees. Its failure only
-hides or stales the leaderboard; activation, chopping, and renewal still use the
-direct protocol path.
+It publishes the verified leaderboard and a two-second combined social snapshot.
+Claimed map locations expire after 60 seconds and are not covenant-enforced
+movement. Chat accepts one signed line of at most 280 characters every two
+seconds and retains only the newest 200 messages in memory.
+
+Players can separately enable or revoke delegated renewal. When configured with
+the manifest's rollover key, the server renews opted-in state near expiry through
+the covenant's exact-self-send watchtower leaf. That key cannot transfer or
+alter player state. If the server becomes unreachable, an online browser falls
+back to its owner-authorized renewal path.
+
+Registration and delegation choices persist; presence and chat do not survive a
+server restart. Registration has no self-service deletion endpoint, so clearing
+browser storage does not remove the server record. Aggregation adds linkability
+and the server or reverse proxy may log IP addresses. It provides neither
+unique-human nor Sybil guarantees. Gameplay remains on the direct Arkade path
+when the server is unavailable.
 
 ## Run Locally
 
@@ -184,7 +193,8 @@ wallet, press **Refresh**, then **Create player**. Click an empty tile to walk.
 Click a tree to walk beside it and chop until a LOG drops.
 
 Browser storage uses `woodland.sh:web:v1:*`. **New test wallet** clears the
-local key, profile (including PLAYER_ID), pending swing, and position.
+local key, profile (including PLAYER_ID), pending swing, position, and local
+server preference. It does not delete a durable server registration.
 
 For the public Mutinynet world, `run-mutinynet.sh` deploys or resumes the world,
 builds `dist/`, and runs the separate maintenance process:
@@ -197,14 +207,14 @@ GitHub Pages deployment is automatic after a successful push to `main`. In the
 repository settings, select **GitHub Actions** as the Pages source. The workflow
 builds `mutinynet/woodland-world.json` by default. Set
 `WOODLAND_PAGES_MANIFEST` to another tracked manifest path and set
-`WOODLAND_LEADERBOARD_URL` to the canonical public API origin when enabling the
-optional leaderboard.
+`WOODLAND_SERVER_URL` to the canonical public API origin when enabling the
+optional game server.
 
 The Pages artifact is static: there are no server functions, bindings, or
 GitHub-held application secrets. Browser gameplay talks directly to
 `https://mutinynet.arkade.sh` and
-`https://emulator.mutinynet.arkade.sh`; only opted-in directory updates use the
-separately hosted leaderboard API.
+`https://emulator.mutinynet.arkade.sh`; only opted-in social and delegation
+updates use the separately hosted game server.
 
 ## Verification
 
@@ -298,10 +308,10 @@ WOODLAND_WASM_FEATURES=woodland-app ./scripts/build-web.sh
 ```
 
 Commit the public mainnet manifest, set `WOODLAND_PAGES_MANIFEST` to its path,
-and, if deployed, set `WOODLAND_LEADERBOARD_URL` to the public leaderboard
-origin. Push `main`; the Pages jobs build and deploy only after the full
-CI/regtest gate passes. Attach the Pages site to the production custom domain in
-repository settings.
+and, if deployed, set `WOODLAND_SERVER_URL` to the public game-server origin.
+Push `main`; the Pages jobs build and deploy only after the full CI/regtest gate
+passes. Attach the Pages site to the production custom domain in repository
+settings.
 
 The operator fails closed unless endpoints use HTTPS, the service network
 matches Bitcoin, 330-sat VTXOs and extensions are supported, current and

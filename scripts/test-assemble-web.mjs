@@ -24,7 +24,7 @@ try {
   const validOutput = path.join(temporary, 'valid');
   await writeFile(validManifest, JSON.stringify(base));
   const valid = run(validManifest, validOutput, {
-    WOODLAND_LEADERBOARD_URL: 'https://leaderboard.example',
+    WOODLAND_SERVER_URL: 'https://server.example',
   });
   assert.equal(valid.status, 0, valid.stderr);
 
@@ -34,8 +34,8 @@ try {
   assert.match(index, /http-equiv="Content-Security-Policy"/);
   assert.ok(index.includes(base.arkadeServiceUrl));
   assert.ok(index.includes(base.emulatorUrl));
-  assert.match(index, /name="woodland-leaderboard" content="https:\/\/leaderboard\.example"/);
-  assert.match(index, /connect-src[^"]*https:\/\/leaderboard\.example/);
+  assert.match(index, /name="woodland-server" content="https:\/\/server\.example"/);
+  assert.match(index, /connect-src[^"]*https:\/\/server\.example/);
   assert.doesNotMatch(index, /WOODLAND_CSP/);
   assert.match(index, /src="\.\/app\.js"/);
   assert.match(app, /new URL\('\.\/world\.json', import\.meta\.url\)/);
@@ -46,12 +46,12 @@ try {
 
   const unconfiguredOutput = path.join(temporary, 'unconfigured');
   const unconfigured = run(validManifest, unconfiguredOutput, {
-    WOODLAND_LEADERBOARD_URL: '',
+    WOODLAND_SERVER_URL: '',
   });
   assert.equal(unconfigured.status, 0, unconfigured.stderr);
   const unconfiguredIndex = await readFile(path.join(unconfiguredOutput, 'index.html'), 'utf8');
-  assert.match(unconfiguredIndex, /name="woodland-leaderboard" content=""/);
-  assert.doesNotMatch(unconfiguredIndex, /leaderboard\.example/);
+  assert.match(unconfiguredIndex, /name="woodland-server" content=""/);
+  assert.doesNotMatch(unconfiguredIndex, /server\.example/);
 
   const insecureManifest = path.join(temporary, 'insecure-mainnet.json');
   await writeFile(insecureManifest, JSON.stringify({
@@ -64,20 +64,20 @@ try {
   assert.notEqual(insecure.status, 0);
   assert.match(insecure.stderr, /mainnet web bundles require HTTPS service URLs/);
 
-  const insecureLeaderboardManifest = path.join(temporary, 'insecure-leaderboard.json');
-  await writeFile(insecureLeaderboardManifest, JSON.stringify({
+  const insecureServerManifest = path.join(temporary, 'insecure-server.json');
+  await writeFile(insecureServerManifest, JSON.stringify({
     ...base,
     network: 'bitcoin',
     arkadeServiceUrl: 'https://arkade.invalid',
     emulatorUrl: 'https://emulator.invalid',
   }));
-  const insecureLeaderboard = run(
-    insecureLeaderboardManifest,
-    path.join(temporary, 'insecure-leaderboard'),
-    { WOODLAND_LEADERBOARD_URL: 'http://leaderboard.invalid' },
+  const insecureServer = run(
+    insecureServerManifest,
+    path.join(temporary, 'insecure-server'),
+    { WOODLAND_SERVER_URL: 'http://server.invalid' },
   );
-  assert.notEqual(insecureLeaderboard.status, 0);
-  assert.match(insecureLeaderboard.stderr, /must be a canonical HTTPS origin on mainnet/);
+  assert.notEqual(insecureServer.status, 0);
+  assert.match(insecureServer.stderr, /must be a canonical HTTPS origin on mainnet/);
 
   const wrongProtocol = path.join(temporary, 'wrong-protocol.json');
   await writeFile(wrongProtocol, JSON.stringify({ ...base, protocolVersion: 2 }));

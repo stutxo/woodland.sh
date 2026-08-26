@@ -157,67 +157,85 @@ reconnect errors, service `/v1/info` availability, and tree renewal failures.
 The host clock must remain synchronized because the regrowth delay is signer
 policy rather than a covenant clock.
 
-## Optional leaderboard host
+## Optional game-server host
 
-Build and install the public directory separately from maintenance:
+Build and install the Axum server separately from maintenance:
 
 ```bash
-cargo build --release --locked --features leaderboard --bin woodland-leaderboard
-sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin woodland-leaderboard
+cargo build --release --locked --features server --bin woodland-server
+sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin woodland-server
 ```
 
 Install:
 
 ```text
-/opt/woodland/woodland-leaderboard
+/opt/woodland/woodland-server
 /etc/woodland/woodland-world.json
-/etc/woodland/leaderboard.env
-/etc/systemd/system/woodland-leaderboard.service
+/etc/woodland/server.env
+/etc/systemd/system/woodland-server.service
 ```
 
 Use:
 
 ```text
-/opt/woodland/woodland-leaderboard       root:root                    0555
-/etc/woodland/woodland-world.json        root:root                    0444
-/etc/woodland/leaderboard.env            root:woodland-leaderboard    0640
+/opt/woodland/woodland-server       root:root             0555
+/etc/woodland/woodland-world.json   root:root             0444
+/etc/woodland/server.env            root:woodland-server  0640
 ```
 
-Populate `leaderboard.env` from `leaderboard.env.example`. The process must not
-receive deployer, maintenance, rollover, root-mnemonic, or player secrets.
-`WOODLAND_LEADERBOARD_PUBLIC_URL` is the canonical public API origin signed by
-players. `WOODLAND_LEADERBOARD_ORIGIN` is the one exact Pages origin allowed by
-CORS. Both must use HTTPS on mainnet.
+Populate `server.env` from `server.env.example`.
+`WOODLAND_SERVER_PUBLIC_URL` is the canonical public API origin signed by
+players. `WOODLAND_SERVER_ORIGIN` is the one exact Pages origin allowed by CORS.
+Both must use HTTPS on mainnet.
 
-Terminate TLS in a reverse proxy in front of the loopback listener. Expose only
-`GET /health.json`, `GET /v1/leaderboard`, and `POST /v1/players`; cap request
-bodies at 4 KiB and rate-limit registration by source IP. CORS is not an
-authentication or denial-of-service boundary. Choose and disclose a short
-access-log retention period because registration links IP addresses to public
-owner and PLAYER_ID values.
+The optional `WOODLAND_ROLLOVER_SECRET` enables signed player delegation. The
+process must never receive the deployer child, maintenance child, either root
+mnemonic, or a player key. Compromise of the rollover child can force or race
+exact-self-send renewals, but the covenant does not let it transfer or mutate
+player state.
+
+Terminate TLS in a reverse proxy in front of the loopback listener. Expose:
+
+```text
+GET  /health.json
+GET  /v1/leaderboard
+GET  /v1/social
+POST /v1/players
+POST /v1/location
+POST /v1/chat
+POST /v1/delegation
+```
+
+Cap request bodies at 4 KiB and rate-limit all POST routes by source IP. CORS is
+not an authentication or denial-of-service boundary. Chat has no moderation
+system; set an abuse policy before public launch. Choose and disclose a short
+access-log retention period because requests link IP addresses to public
+PLAYER_ID values.
 
 Enable the service:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now woodland-leaderboard.service
-sudo journalctl -u woodland-leaderboard.service -f
-curl --fail https://replace-with-leaderboard-api.example/health.json
+sudo systemctl enable --now woodland-server.service
+sudo journalctl -u woodland-server.service -f
+curl --fail https://replace-with-server-api.example/health.json
 ```
 
-Monitor `ready`, `lastRefreshAt`, `lastError`, process restarts, registry size,
-Arkade/emulator latency, and disk writes. The registry persists in
-`/var/lib/woodland-leaderboard/players.json`; back it up as public data.
-Registration is durable and v1 has no self-service deletion API. Honor removal
-requests by stopping the service, removing the requested entry from a backup
-copy, validating the JSON, atomically replacing the file, and restarting.
-Leaderboard failure must not be treated as game downtime.
+Monitor `ready`, `lastRefreshAt`, `lastError`, `onlinePlayers`,
+`delegationAvailable`, process restarts, registry size, Arkade/emulator latency,
+and disk writes. Signed registration and delegation persist in
+`/var/lib/woodland-server/players.json`; presence expires after 60 seconds and
+the newest 200 chat messages remain in memory only. Registration has no
+self-service deletion API. Honor removal requests by stopping the service,
+removing the entry from a backup copy, validating the JSON, atomically replacing
+the file, and restarting. Game-server failure must not be treated as gameplay
+downtime.
 
 ## GitHub Pages
 
 The public manifest contains no secrets. Commit it and set
-`WOODLAND_PAGES_MANIFEST` to its tracked path. For a deployed leaderboard, set
-`WOODLAND_LEADERBOARD_URL` to the same canonical origin as
-`WOODLAND_LEADERBOARD_PUBLIC_URL`; leaving it unset removes the directory UI and
-API origin from the built CSP. Push `main`. The gated Pages workflow builds and
+`WOODLAND_PAGES_MANIFEST` to its tracked path. For a deployed server, set
+`WOODLAND_SERVER_URL` to the same canonical origin as
+`WOODLAND_SERVER_PUBLIC_URL`; leaving it unset removes the social UI and API
+origin from the built CSP. Push `main`. The gated Pages workflow builds and
 deploys the static site only after CI and regtest pass.
