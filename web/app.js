@@ -36,6 +36,7 @@ const levelNumber = element('level-number');
 const xpNumber = element('xp-number');
 const xpNext = element('xp-next');
 const map = element('map');
+const mapViewport = element('map-viewport');
 const mapHint = element('map-hint');
 const refreshButton = element('refresh');
 const renewButton = element('renew-player');
@@ -95,6 +96,8 @@ let socialPosting = false;
 let locationPosting = false;
 let lastPublishedLocation = null;
 let lastRenderedChatId = null;
+let lastCameraPosition = null;
+let cameraInitialized = false;
 
 function withApp(action) {
   const operation = appQueue.then(action, action);
@@ -477,11 +480,55 @@ function flashTree(treeId, type, duration, renderNow = true) {
   effects.push({ treeId, type });
   globalThis.__WOODLAND_E2E_TREE_EFFECTS = effects.slice(-100);
   if (renderNow) renderMap();
+
   treeEffectTimer = setTimeout(() => {
     if (treeEffect?.serial !== serial) return;
     treeEffect = null;
     renderMap();
   }, duration);
+}
+function followPlayerCamera(force = false) {
+  if (!state?.playerActive) return;
+  const position = coordinateKey(player.x, player.y);
+  if (!force && position === lastCameraPosition) return;
+  lastCameraPosition = position;
+  requestAnimationFrame(() => {
+    const cell = map.querySelector(
+      `.map-cell[data-x="${player.x}"][data-y="${player.y}"]`,
+    );
+    if (!cell) return;
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const viewportBounds = mapViewport.getBoundingClientRect();
+    const cellBounds = cell.getBoundingClientRect();
+    const targetLeft = Math.max(
+      0,
+      mapViewport.scrollLeft
+        + cellBounds.left
+        + cellBounds.width / 2
+        - viewportBounds.left
+        - viewportBounds.width / 2,
+    );
+    const targetTop = Math.max(
+      0,
+      mapViewport.scrollTop
+        + cellBounds.top
+        + cellBounds.height / 2
+        - viewportBounds.top
+        - viewportBounds.height / 2,
+    );
+    mapViewport.scrollTo({
+      left: targetLeft,
+      top: targetTop,
+      behavior: cameraInitialized && !reducedMotion ? 'smooth' : 'auto',
+    });
+    cameraInitialized = true;
+    globalThis.__WOODLAND_E2E_CAMERA = {
+      x: player.x,
+      y: player.y,
+      targetLeft,
+      targetTop,
+    };
+  });
 }
 
 function renderMap() {
@@ -569,6 +616,7 @@ function renderMap() {
   }
   else if (adjacent) mapHint.textContent = `In range of tree #${adjacent.treeId}. Click the tree to chop until LOG.`;
   else mapHint.textContent = 'Click a tile to walk, or click a tree to walk there and chop.';
+  followPlayerCamera();
 
   globalThis.__WOODLAND_E2E_PLAYER = { ...player };
   globalThis.__WOODLAND_E2E_ADJACENT = Boolean(adjacent);
@@ -1124,7 +1172,11 @@ setInterval(async () => {
     });
   } catch {}
   finally { polling = false; }
+
 }, 1000);
+window.addEventListener('resize', () => {
+  followPlayerCamera(true);
+});
 
 setInterval(() => {
   void refreshSocial();

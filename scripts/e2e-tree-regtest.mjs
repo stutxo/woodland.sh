@@ -110,6 +110,20 @@ async function main() {
         map: document.getElementById('map')?.textContent || '',
         mapHint: document.getElementById('map-hint')?.textContent || '',
         mapCells: document.querySelectorAll('#map .map-cell').length,
+        camera: (() => {
+          const viewport = document.getElementById('map-viewport');
+          const playerCell = document.querySelector('#map .player');
+          if (!viewport || !playerCell) return null;
+          const viewportBounds = viewport.getBoundingClientRect();
+          const playerBounds = playerCell.getBoundingClientRect();
+          return {
+            target: globalThis.__WOODLAND_E2E_CAMERA || null,
+            scrollLeft: viewport.scrollLeft,
+            clientHeight: viewport.clientHeight,
+            playerCenterX: playerBounds.left + playerBounds.width / 2 - viewportBounds.left,
+            viewportCenterX: viewportBounds.width / 2,
+          };
+        })(),
         bagLogs: document.getElementById('player-logs')?.textContent || '',
         logSlotLabel: document.getElementById('log-slot')?.getAttribute('aria-label') || '',
         logIcon: document.querySelector('#log-slot .bag-item')?.textContent || '',
@@ -474,6 +488,21 @@ async function main() {
       (sum, tree) => sum + tree.valueSats,
       deployed.state.walletSats,
     );
+
+    await wd('POST', '/window/rect', { width: 390, height: 844 });
+    await clickMapCell(30, 10);
+    const mobileCamera = await waitFor(
+      'mobile camera follows player',
+      inspect,
+      (value) => value.player?.x === 30
+        && value.player?.y === 10
+        && value.camera?.target?.x === 30
+        && value.camera?.target?.y === 10
+        && value.camera.scrollLeft > 200
+        && Math.abs(value.camera.playerCenterX - value.camera.viewportCenterX) < 2,
+    );
+    assert.ok(mobileCamera.camera.clientHeight <= 360);
+    await wd('POST', '/window/rect', { width: 1280, height: 900 });
 
     const firstTree = initial.state.trees.find((tree) => tree.treeId === 417);
     assert.ok(firstTree, 'deterministic tree 417 is unavailable');

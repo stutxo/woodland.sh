@@ -58,6 +58,8 @@ stack.
 
 Smoke proves the complete path quickly. Full exercises deterministic depletion,
 regrowth, recovery, adversarial mutations, and four-player concurrency.
+Both resize the primary browser to 390×844, move across the map, and require the
+mobile viewport to keep the player horizontally centered.
 
 The profiles exercise the same `dist/` layout deployed to GitHub Pages. The
 artifact contains a manifest-specific CSP including the configured game-server

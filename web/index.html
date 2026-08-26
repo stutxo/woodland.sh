@@ -20,7 +20,7 @@
     button:hover:not(:disabled) { border-color: #b9e879; }
     button:disabled { opacity: .4; cursor: not-allowed; }
     #status, .muted { color: #8e9b88; font-size: .78rem; }
-    .map-scroll { overflow: auto; padding: 10px; border: 1px solid #222d1f; background: #090c08; }
+    .map-scroll { overflow: auto; padding: 10px; border: 1px solid #222d1f; background: #090c08; overscroll-behavior: contain; scroll-behavior: smooth; scrollbar-width: thin; }
     #map { --map-width: 45; display: grid; grid-template-columns: repeat(var(--map-width), 1.2rem); grid-auto-rows: 1.2rem; width: max-content; min-width: 100%; color: #4c6246; font-size: .72rem; }
     .map-cell { display: grid; width: 1.2rem; height: 1.2rem; place-items: center; border-radius: 2px; line-height: 1; cursor: pointer; }
     .map-cell.tree { color: #dff5d5; font-size: 1rem; }
@@ -107,9 +107,13 @@
     .detail-grid dd { margin: 3px 0 0; color: #dfe9da; }
     .error { color: #ff9f8d !important; }
     [hidden] { display: none !important; }
-    @media (prefers-reduced-motion: reduce) { .map-cell.chop-flash, .map-cell.log-flash, .map-cell.locked { animation-duration: .01ms; } }
+    @media (prefers-reduced-motion: reduce) {
+      .map-scroll { scroll-behavior: auto; }
+      .map-cell.chop-flash, .map-cell.log-flash, .map-cell.locked { animation-duration: .01ms; }
+    }
     @media (max-width: 680px) {
       header, .map-help, .address-row { align-items: stretch; flex-direction: column; }
+      .map-scroll { height: min(52vh, 360px); }
       #dashboard.player-active .dashboard-grid { grid-template-columns: 1fr; }
       .bag, .stats-box { width: 100%; }
       .stats-box { grid-column: auto; max-width: none; }
@@ -124,7 +128,7 @@
     </header>
 
     <section id="game">
-      <div class="map-scroll"><div id="map" role="img" aria-label="Woodland map"></div></div>
+      <div id="map-viewport" class="map-scroll"><div id="map" role="img" aria-label="Woodland map"></div></div>
       <div class="map-help"><span>@ you · &amp; player · tree · + stump</span><span id="map-hint">Entering the woodland...</span></div>
     </section>
 
