@@ -65,7 +65,8 @@ async function createPlayer(driverUrl, label, sessions) {
       leaderboardStatus: document.getElementById('leaderboard-status')?.textContent || '',
       joinLeaderboardHidden: document.getElementById('join-leaderboard')?.hidden ?? true,
       social: globalThis.__WOODLAND_E2E_SOCIAL || null,
-      remotePlayers: document.querySelectorAll('#map .remote-player').length,
+      mapFrame: globalThis.__WOODLAND_E2E_MAP_FRAME || null,
+      remotePlayers: globalThis.__WOODLAND_E2E_MAP_FRAME?.remotePlayerCount || 0,
       chat: document.getElementById('chat-messages')?.textContent || '',
       delegateHidden: document.getElementById('delegate-renewal')?.hidden ?? true,
       delegateText: document.getElementById('delegate-renewal')?.textContent || '',
@@ -78,11 +79,8 @@ async function createPlayer(driverUrl, label, sessions) {
     button.click();
   `, [id]);
   const moveTo = (x, y) => execute(`
-    const cell = document.querySelector(
-      '#map .map-cell[data-x="' + arguments[0] + '"][data-y="' + arguments[1] + '"]',
-    );
-    if (!cell) throw new Error('missing map cell');
-    cell.click();
+    if (!globalThis.__WOODLAND_E2E_CLICK_MAP) throw new Error('missing canvas map hook');
+    globalThis.__WOODLAND_E2E_CLICK_MAP(arguments[0], arguments[1]);
   `, [x, y]);
   const chopExpected = (snapshot, tree) => executeAsync(`
     const done = arguments[arguments.length - 1];
@@ -450,15 +448,25 @@ async function main() {
         && value.player?.x === selectedTrees[index].x
         && value.player?.y === selectedTrees[index].y + 1,
     )));
-    await Promise.all(players.map((browserPlayer) => waitFor(
+    await Promise.all(players.map((browserPlayer, viewerIndex) => waitFor(
       `remote map presence (${browserPlayer.label})`,
       browserPlayer.inspect,
-      (value) => value.remotePlayers >= PLAYER_COUNT - 1
-        && selectedTrees.every((tree, index) => value.social?.locations?.some((location) => (
-          location.playerAsset === playerAssets[index]
-          && location.x === tree.x
-          && location.y === tree.y + 1
-        ))),
+      (value) => {
+        if (!value.mapFrame) return false;
+        const visibleOthers = selectedTrees.filter((tree, index) => (
+          index !== viewerIndex
+          && tree.x >= value.mapFrame?.minX
+          && tree.x <= value.mapFrame?.maxX
+          && tree.y + 1 >= value.mapFrame?.minY
+          && tree.y + 1 <= value.mapFrame?.maxY
+        )).length;
+        return value.remotePlayers === visibleOthers
+          && selectedTrees.every((tree, index) => value.social?.locations?.some((location) => (
+            location.playerAsset === playerAssets[index]
+            && location.x === tree.x
+            && location.y === tree.y + 1
+          )));
+      },
       180_000,
     )));
 

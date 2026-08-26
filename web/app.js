@@ -39,6 +39,11 @@ const xpNext = element('xp-next');
 const map = element('map');
 const mapViewport = element('map-viewport');
 const cameraPlayer = element('camera-player');
+const mapHud = element('map-hud');
+const hudLevel = element('hud-level');
+const hudXp = element('hud-xp');
+const hudLogs = element('hud-logs');
+const hudOnline = element('hud-online');
 const mapHint = element('map-hint');
 const refreshButton = element('refresh');
 const renewButton = element('renew-player');
@@ -65,6 +70,8 @@ const CHOP_FLASH_MS = 340;
 const LOG_FLASH_MS = 800;
 const DIRECTIONS = [[0, -1], [-1, 0], [1, 0], [0, 1]];
 const TREE_GLYPH = '🌲';
+const TILE_SIZE = 20;
+const PATH_NODE_LIMIT = 4096;
 const player = { x: 3, y: 17 };
 
 let app;
@@ -98,6 +105,7 @@ let socialPosting = false;
 let locationPosting = false;
 let lastPublishedLocation = null;
 let lastRenderedChatId = null;
+let mapFrame = null;
 
 function withApp(action) {
   const operation = appQueue.then(action, action);
@@ -353,7 +361,11 @@ function findWalkPath(targets) {
   const queue = [{ x: player.x, y: player.y }];
   const previous = new Map([[startKey, null]]);
   let foundKey = null;
-  for (let index = 0; index < queue.length && foundKey == null; index += 1) {
+  for (
+    let index = 0;
+    index < queue.length && foundKey == null && previous.size < PATH_NODE_LIMIT;
+    index += 1
+  ) {
     const current = queue[index];
     for (const [dx, dy] of DIRECTIONS) {
       const next = { x: current.x + dx, y: current.y + dy };
@@ -415,10 +427,8 @@ async function walkTo(targets, treeId = null) {
   return true;
 }
 
-async function handleMapClick(event) {
-  if (!(event.target instanceof Element)) return;
-  const cell = event.target.closest('.map-cell');
-  if (!cell || !state) return;
+async function handleMapPosition(x, y) {
+  if (!state || !isMapCoordinate(x, y)) return;
   if (!state.playerActive) {
     status.textContent = 'Create a player before moving.';
     return;
@@ -428,16 +438,12 @@ async function handleMapClick(event) {
     return;
   }
   if (busy) return;
-  const x = Number(cell.dataset.x);
-  const y = Number(cell.dataset.y);
-  const treeId = cell.dataset.treeId ? Number(cell.dataset.treeId) : null;
-  if (treeId != null) {
-    const tree = worldTrees().find((candidate) => candidate.treeId === treeId);
-    if (!tree) return;
-    focusedTreeId = treeId;
-    lockedTreeId = tree.health > 0 ? treeId : null;
+  const tree = worldTrees().find((candidate) => candidate.x === x && candidate.y === y);
+  if (tree) {
+    focusedTreeId = tree.treeId;
+    lockedTreeId = tree.health > 0 ? tree.treeId : null;
     if (tree.health === 0) {
-      status.textContent = `Tree #${treeId} is a stump.`;
+      status.textContent = `Tree #${tree.treeId} is a stump.`;
       render();
       return;
     }
@@ -449,12 +455,12 @@ async function handleMapClick(event) {
           candidate.x === position.x && candidate.y === position.y
         ))
       ));
-    if (await walkTo(destinations, treeId)) {
-      if (state.playerActive && state.fundingReady) {
+    if (await walkTo(destinations, tree.treeId)) {
+      if (state.fundingReady) {
         attemptChop();
       } else {
         lockedTreeId = null;
-        status.textContent = 'Create a player to chop this tree.';
+        status.textContent = 'Player state is reconciling.';
         render();
       }
     } else {
@@ -465,6 +471,14 @@ async function handleMapClick(event) {
   }
   lockedTreeId = null;
   await walkTo([{ x, y }]);
+}
+
+function handleMapClick(event) {
+  if (!mapFrame) return;
+  const bounds = map.getBoundingClientRect();
+  const x = Math.floor((event.clientX - bounds.left - mapFrame.originX) / TILE_SIZE);
+  const y = Math.floor((event.clientY - bounds.top - mapFrame.originY) / TILE_SIZE);
+  void handleMapPosition(x, y);
 }
 
 function adjacentTree() {
@@ -495,106 +509,174 @@ function flashTree(treeId, type, duration, renderNow = true) {
     renderMap();
   }, duration);
 }
-function followPlayerCamera() {
-  if (!state?.playerActive) {
-    cameraPlayer.hidden = true;
-    map.style.transform = '';
-    return;
-  }
-  const firstCell = map.querySelector('.map-cell');
-  if (!firstCell) return;
-  cameraPlayer.hidden = false;
-  cameraPlayer.title = `Player at (${player.x}, ${player.y})`;
-
-  const cellBounds = firstCell.getBoundingClientRect();
-  const mapX = mapViewport.clientWidth / 2 - (player.x + 0.5) * cellBounds.width;
-  const mapY = mapViewport.clientHeight / 2 - (player.y + 0.5) * cellBounds.height;
-  map.style.transform = `translate3d(${mapX}px, ${mapY}px, 0)`;
-  mapViewport.scrollLeft = 0;
-  mapViewport.scrollTop = 0;
-
-  const viewportBounds = mapViewport.getBoundingClientRect();
-  const playerBounds = cameraPlayer.getBoundingClientRect();
-  const camera = {
-    x: player.x,
-    y: player.y,
-    mapX,
-    mapY,
-    deltaX: playerBounds.left
-      + playerBounds.width / 2
-      - viewportBounds.left
-      - viewportBounds.width / 2,
-    deltaY: playerBounds.top
-      + playerBounds.height / 2
-      - viewportBounds.top
-      - viewportBounds.height / 2,
-  };
-  globalThis.__WOODLAND_E2E_CAMERA = camera;
-  const trail = globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [];
-  const previous = trail.at(-1);
-  if (!previous || previous.x !== camera.x || previous.y !== camera.y) {
-    trail.push(camera);
-    globalThis.__WOODLAND_E2E_CAMERA_TRAIL = trail.slice(-100);
-  }
-}
-
 function renderMap() {
-  const width = state?.mapWidth || DEFAULT_MAP_WIDTH;
-  const height = state?.mapHeight || DEFAULT_MAP_HEIGHT;
-  const trees = new Map(worldTrees().map((tree) => [`${tree.x}:${tree.y}`, tree]));
+  const worldWidth = state?.mapWidth || DEFAULT_MAP_WIDTH;
+  const worldHeight = state?.mapHeight || DEFAULT_MAP_HEIGHT;
+  const canvasWidth = map.clientWidth || mapViewport.clientWidth;
+  const canvasHeight = map.clientHeight || mapViewport.clientHeight;
+  if (!canvasWidth || !canvasHeight) return;
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+  const backingWidth = Math.round(canvasWidth * pixelRatio);
+  const backingHeight = Math.round(canvasHeight * pixelRatio);
+  if (map.width !== backingWidth || map.height !== backingHeight) {
+    map.width = backingWidth;
+    map.height = backingHeight;
+  }
+  const context = map.getContext('2d');
+  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+  context.clearRect(0, 0, canvasWidth, canvasHeight);
+  context.fillStyle = '#090c08';
+  context.fillRect(0, 0, canvasWidth, canvasHeight);
+
+  const focusX = state?.playerActive ? player.x : (worldWidth - 1) / 2;
+  const focusY = state?.playerActive ? player.y : (worldHeight - 1) / 2;
+  const originX = canvasWidth / 2 - (focusX + 0.5) * TILE_SIZE;
+  const originY = canvasHeight / 2 - (focusY + 0.5) * TILE_SIZE;
+  const minX = Math.max(0, Math.floor(-originX / TILE_SIZE) - 1);
+  const maxX = Math.min(
+    worldWidth - 1,
+    Math.ceil((canvasWidth - originX) / TILE_SIZE) + 1,
+  );
+  const minY = Math.max(0, Math.floor(-originY / TILE_SIZE) - 1);
+  const maxY = Math.min(
+    worldHeight - 1,
+    Math.ceil((canvasHeight - originY) / TILE_SIZE) + 1,
+  );
+  const visible = (x, y) => x >= minX && x <= maxX && y >= minY && y <= maxY;
+  const screenX = (x) => originX + x * TILE_SIZE;
+  const screenY = (y) => originY + y * TILE_SIZE;
+
+  context.fillStyle = '#263123';
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      context.fillRect(screenX(x) + TILE_SIZE / 2, screenY(y) + TILE_SIZE / 2, 1, 1);
+    }
+  }
+  context.strokeStyle = '#222d1f';
+  context.strokeRect(
+    originX,
+    originY,
+    worldWidth * TILE_SIZE,
+    worldHeight * TILE_SIZE,
+  );
+
+  const targetTree = walkingTargetTreeId == null
+    ? null
+    : worldTrees().find((tree) => tree.treeId === walkingTargetTreeId);
+  const target = targetTree || walkingTarget;
+  if (target && visible(target.x, target.y)) {
+    context.fillStyle = '#1b2618';
+    context.fillRect(screenX(target.x), screenY(target.y), TILE_SIZE, TILE_SIZE);
+    context.strokeStyle = '#b9e879';
+    context.strokeRect(
+      screenX(target.x) + 0.5,
+      screenY(target.y) + 0.5,
+      TILE_SIZE - 1,
+      TILE_SIZE - 1,
+    );
+  }
+
+  let standingTreeCount = 0;
+  let stumpCount = 0;
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  for (const tree of worldTrees()) {
+    if (tree.health > 0) standingTreeCount += 1;
+    else stumpCount += 1;
+    if (!visible(tree.x, tree.y)) continue;
+    const x = screenX(tree.x);
+    const y = screenY(tree.y);
+    if (treeEffect?.treeId === tree.treeId) {
+      context.fillStyle = treeEffect.type === 'log' ? '#6f8f43' : '#607d4d';
+      context.fillRect(x, y, TILE_SIZE, TILE_SIZE);
+    }
+    if (tree.treeId === lockedTreeId) {
+      context.strokeStyle = '#f2d475';
+      context.lineWidth = 2;
+      context.strokeRect(x + 1, y + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+      context.lineWidth = 1;
+    }
+    context.font = tree.health === 0 ? 'bold 14px ui-monospace' : '16px sans-serif';
+    context.fillStyle = tree.health === 0 ? '#b58654' : '#dff5d5';
+    context.fillText(
+      tree.health === 0 ? '+' : TREE_GLYPH,
+      x + TILE_SIZE / 2,
+      y + TILE_SIZE / 2,
+    );
+  }
+
   const playersByPosition = new Map();
   for (const location of remoteLocations) {
-    if (location.playerAsset === state?.playerAsset) continue;
+    if (location.playerAsset === state?.playerAsset || !visible(location.x, location.y)) continue;
     const key = coordinateKey(location.x, location.y);
     const present = playersByPosition.get(key) || [];
     present.push(location.playerAsset);
     playersByPosition.set(key, present);
   }
-  const cells = document.createDocumentFragment();
+  for (const [key, present] of playersByPosition) {
+    const [x, y] = key.split(':').map(Number);
+    const centerX = screenX(x) + TILE_SIZE / 2;
+    const centerY = screenY(y) + TILE_SIZE / 2;
+    context.fillStyle = '#78c9e8';
+    context.beginPath();
+    context.arc(centerX, centerY, 7, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = '#091014';
+    context.font = 'bold 10px ui-monospace';
+    context.fillText(present.length === 1 ? '&' : String(present.length), centerX, centerY);
+  }
+
+  cameraPlayer.hidden = !state?.playerActive;
+  mapHud.hidden = !state?.playerActive;
   map.classList.toggle('movement-disabled', !state?.playerActive);
-  map.style.setProperty('--map-width', width);
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const cell = document.createElement('span');
-      const tree = trees.get(`${x}:${y}`);
-      cell.className = 'map-cell';
-      cell.dataset.x = String(x);
-      cell.dataset.y = String(y);
-      cell.setAttribute('aria-hidden', 'true');
-      cell.textContent = '.';
-      if (tree) {
-        cell.dataset.treeId = String(tree.treeId);
-        cell.classList.add(tree.health === 0 ? 'stump' : 'tree');
-        if (treeEffect?.treeId === tree.treeId) {
-          cell.classList.add(treeEffect.type === 'log' ? 'log-flash' : 'chop-flash');
-          cell.dataset.effect = treeEffect.type;
-        }
-        cell.textContent = tree.health === 0 ? '+' : TREE_GLYPH;
-        cell.title = tree.health === 0
-          ? `Tree #${tree.treeId}: stump`
-          : `Tree #${tree.treeId}: ${tree.health} LOG`;
-      }
-      if (tree?.treeId === lockedTreeId) {
-        cell.classList.add('locked');
-      }
-      if (
-        (tree && tree.treeId === walkingTargetTreeId)
-        || (!tree && walkingTarget?.x === x && walkingTarget?.y === y)
-      ) {
-        cell.classList.add('target');
-      }
-      const remotePlayers = playersByPosition.get(coordinateKey(x, y)) || [];
-      if (!tree && remotePlayers.length && (player.x !== x || player.y !== y)) {
-        cell.classList.add('remote-player');
-        cell.textContent = remotePlayers.length === 1 ? '&' : String(remotePlayers.length);
-        cell.title = remotePlayers
-          .map((asset) => `${asset.slice(0, 8)}…`)
-          .join(', ');
-      }
-      cells.append(cell);
+  if (state?.playerActive) {
+    cameraPlayer.title = `Player at (${player.x}, ${player.y})`;
+  }
+  const viewportBounds = mapViewport.getBoundingClientRect();
+  const playerBounds = cameraPlayer.getBoundingClientRect();
+  const camera = state?.playerActive
+    ? {
+      x: player.x,
+      y: player.y,
+      mapX: originX,
+      mapY: originY,
+      deltaX: playerBounds.left
+        + playerBounds.width / 2
+        - viewportBounds.left
+        - viewportBounds.width / 2,
+      deltaY: playerBounds.top
+        + playerBounds.height / 2
+        - viewportBounds.top
+        - viewportBounds.height / 2,
+    }
+    : null;
+  globalThis.__WOODLAND_E2E_CAMERA = camera;
+  if (camera) {
+    const trail = globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [];
+    const previous = trail.at(-1);
+    if (!previous || previous.x !== camera.x || previous.y !== camera.y) {
+      trail.push(camera);
+      globalThis.__WOODLAND_E2E_CAMERA_TRAIL = trail.slice(-100);
     }
   }
-  map.replaceChildren(cells);
+
+  mapFrame = {
+    originX,
+    originY,
+    tileSize: TILE_SIZE,
+    minX,
+    maxX,
+    minY,
+    maxY,
+    visibleTileCount: (maxX - minX + 1) * (maxY - minY + 1),
+    totalTileCount: worldWidth * worldHeight,
+    standingTreeCount,
+    stumpCount,
+    remotePlayerCount: [...playersByPosition.values()]
+      .reduce((total, players) => total + players.length, 0),
+    clusterCount: playersByPosition.size,
+  };
+  globalThis.__WOODLAND_E2E_MAP_FRAME = mapFrame;
 
   const adjacent = adjacentTree();
   if (!state) mapHint.textContent = 'Connecting...';
@@ -619,15 +701,12 @@ function renderMap() {
   }
   else if (adjacent) mapHint.textContent = `In range of tree #${adjacent.treeId}. Click the tree to chop until LOG.`;
   else mapHint.textContent = 'Click a tile to walk, or click a tree to walk there and chop.';
-  followPlayerCamera();
 
   globalThis.__WOODLAND_E2E_PLAYER = { ...player };
   globalThis.__WOODLAND_E2E_ADJACENT = Boolean(adjacent);
   globalThis.__WOODLAND_E2E_ADJACENT_TREE = adjacent;
   globalThis.__WOODLAND_E2E_LOCKED_TREE = lockedTreeId;
 }
-
-
 function fundingMessage() {
   if (state.activationBlockedReason) return state.activationBlockedReason;
   if (state.fundingRequiredSats <= 0) return 'No additional player funding required';
@@ -690,6 +769,10 @@ function render() {
   const standingTrees = worldTrees().filter((tree) => tree.health > 0).length;
   const tree = focusedTree();
   const playerActive = Boolean(state.playerActive);
+  hudLevel.textContent = String(state.playerLevel);
+  hudXp.textContent = String(state.playerXp);
+  hudLogs.textContent = String(state.playerLogs || 0);
+  hudOnline.textContent = String(remoteLocations.length);
 
   onboarding.hidden = playerActive;
   dashboard.classList.toggle('player-active', playerActive);
@@ -1087,6 +1170,13 @@ async function boot() {
     globalThis.__WOODLAND_E2E_SERVER_LOCATION = (x, y) => (
       withApp(() => app.serverLocation(SERVER_URL, x, y, Date.now()))
     );
+    globalThis.__WOODLAND_E2E_CLICK_MAP = (x, y) => {
+      void handleMapPosition(Number(x), Number(y));
+    };
+    globalThis.__WOODLAND_E2E_CLICK_TREE = (treeId) => {
+      const tree = worldTrees().find((candidate) => candidate.treeId === Number(treeId));
+      if (tree) void handleMapPosition(tree.x, tree.y);
+    };
     globalThis.__WOODLAND_E2E_UNAUTHORIZED_REISSUANCE = () => (
       withApp(() => app.testUnauthorizedReissuance())
     );
@@ -1177,9 +1267,7 @@ setInterval(async () => {
   finally { polling = false; }
 
 }, 1000);
-window.addEventListener('resize', () => {
-  followPlayerCamera();
-});
+window.addEventListener('resize', renderMap);
 
 setInterval(() => {
   void refreshSocial();

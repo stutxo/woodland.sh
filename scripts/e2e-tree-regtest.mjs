@@ -107,9 +107,9 @@ async function main() {
         autoChop: globalThis.__WOODLAND_E2E_LAST_CHOP_RUN || null,
         treeEffects: globalThis.__WOODLAND_E2E_TREE_EFFECTS || [],
         busy: Boolean(document.getElementById('refresh')?.disabled),
-        map: document.getElementById('map')?.textContent || '',
+        mapFrame: globalThis.__WOODLAND_E2E_MAP_FRAME || null,
         mapHint: document.getElementById('map-hint')?.textContent || '',
-        mapCells: document.querySelectorAll('#map .map-cell').length,
+        mapCells: globalThis.__WOODLAND_E2E_MAP_FRAME?.visibleTileCount || 0,
         camera: (() => {
           const viewport = document.getElementById('map-viewport');
           const playerCell = document.getElementById('camera-player');
@@ -146,8 +146,8 @@ async function main() {
           return Boolean(bag && stats && stats.left >= bag.right);
         })(),
         statsText: document.querySelector('.stats-box')?.textContent.replace(/\\s+/g, ' ').trim() || '',
-        standingTreeGlyphs: document.querySelectorAll('#map .map-cell.tree').length,
-        stumpGlyphs: document.querySelectorAll('#map .map-cell.stump').length,
+        standingTreeGlyphs: globalThis.__WOODLAND_E2E_MAP_FRAME?.standingTreeCount || 0,
+        stumpGlyphs: globalThis.__WOODLAND_E2E_MAP_FRAME?.stumpCount || 0,
         focusedTreeHealth: document.getElementById('tree-health')?.textContent || '',
         chance: document.getElementById('log-chance')?.textContent || '',
         fundingInstruction: document.getElementById('funding-instruction')?.textContent || '',
@@ -157,18 +157,23 @@ async function main() {
     `);
     const click = (id) => execute(`document.getElementById(arguments[0]).click();`, [id]);
     const clickMapCell = (x, y) => execute(`
-      const cell = document.querySelector(
-        '#map .map-cell[data-x=\"' + arguments[0] + '\"][data-y=\"' + arguments[1] + '\"]',
-      );
-      if (!cell) throw new Error('missing map cell');
-      cell.click();
+      if (!globalThis.__WOODLAND_E2E_CLICK_MAP) throw new Error('missing canvas map hook');
+      globalThis.__WOODLAND_E2E_CLICK_MAP(arguments[0], arguments[1]);
+    `, [x, y]);
+    const clickCanvasPoint = (x, y) => execute(`
+      const canvas = document.getElementById('map');
+      const frame = globalThis.__WOODLAND_E2E_MAP_FRAME;
+      if (!canvas || !frame) throw new Error('missing canvas frame');
+      const bounds = canvas.getBoundingClientRect();
+      canvas.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        clientX: bounds.left + frame.originX + (arguments[0] + 0.5) * frame.tileSize,
+        clientY: bounds.top + frame.originY + (arguments[1] + 0.5) * frame.tileSize,
+      }));
     `, [x, y]);
     const clickTree = (treeId) => execute(`
-      const tree = document.querySelector(
-        '#map .map-cell[data-tree-id=\"' + arguments[0] + '\"]',
-      );
-      if (!tree) throw new Error('missing tree cell');
-      tree.click();
+      if (!globalThis.__WOODLAND_E2E_CLICK_TREE) throw new Error('missing canvas tree hook');
+      globalThis.__WOODLAND_E2E_CLICK_TREE(arguments[0]);
     `, [treeId]);
     const assertInvalidXpRejected = async (treeId, label) => {
       const before = await inspect();
@@ -347,7 +352,7 @@ async function main() {
     );
     assert.equal(initial.state.mapWidth, 45);
     assert.equal(initial.state.mapHeight, 19);
-    assert.equal(initial.mapCells, initial.state.mapWidth * initial.state.mapHeight);
+    assert.ok(initial.mapCells > 0 && initial.mapCells < initial.state.mapWidth * initial.state.mapHeight);
     assert.equal(initial.standingTreeGlyphs, 10);
     assert.equal(initial.stumpGlyphs, 0);
     assert.equal(initial.state.dustSats, 330);
@@ -485,6 +490,18 @@ async function main() {
     assertLogSupply(deployed.state, 100, 'activated player');
     assertXpAccounting(deployed.state, 100, 'activated player');
     assertTreeValue(deployed.state, 'activated player');
+    await clickCanvasPoint(4, 17);
+    await waitFor(
+      'canvas coordinate movement',
+      inspect,
+      (value) => value.player?.x === 4 && value.player?.y === 17,
+    );
+    await clickCanvasPoint(3, 17);
+    await waitFor(
+      'canvas coordinate return',
+      inspect,
+      (value) => value.player?.x === 3 && value.player?.y === 17,
+    );
     deployed = await assertPlayerRenewed(deployed, 'zero-XP player renewal');
     const playerStateBeforeBrowserReload = deployed.state.playerStateOutpoint;
     const fixedSats = deployed.state.trees.reduce(
@@ -548,7 +565,7 @@ async function main() {
         && Math.abs(value.camera.playerCenterX - value.camera.viewportCenterX) < 2
         && Math.abs(value.camera.playerCenterY - value.camera.viewportCenterY) < 2
         && value.camera.playerGlyph === '@'
-        && value.map.includes('🌲'),
+        && value.mapFrame?.standingTreeCount === 10,
     );
     await wd('POST', '/refresh', {});
     await waitFor(
@@ -725,7 +742,7 @@ async function main() {
       }));
       return;
     }
-    assert.ok(chopped.map.includes('+'));
+    assert.equal(chopped.mapFrame.stumpCount, 1);
     assert.equal(chopped.standingTreeGlyphs, 9);
     assert.equal(chopped.stumpGlyphs, 1);
     assert.equal(chopped.focusedTreeHealth, 'stump');

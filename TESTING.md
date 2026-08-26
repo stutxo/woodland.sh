@@ -59,9 +59,9 @@ then run before teardown.
 Smoke proves the complete path quickly. Full exercises deterministic depletion,
 regrowth, recovery, adversarial mutations, and four-player concurrency.
 Both mobile and desktop checks require the player overlay to remain exactly
-centered across every sampled frame while only the map transform changes.
-The browser also proves mouse movement is rejected until activation creates a
-live PLAYER_ID state.
+centered across every sampled frame while only the Canvas camera changes. Tests
+also require viewport-only tile rendering, zero per-tile DOM nodes, real canvas
+coordinate input, and movement rejection before activation.
 
 The same `dist/` layout can alternatively deploy to GitHub Pages. The artifact
 contains a manifest-specific CSP, `.nojekyll`, and an explicit 404. Gameplay

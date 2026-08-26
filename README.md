@@ -195,9 +195,10 @@ Deposit the displayed 330 sats from any Arkade wallet, press **Refresh**, then
 **Create player**. Click an empty tile to walk or a tree to approach and chop.
 Map movement remains locked until player activation succeeds.
 
-The map is always a bounded camera viewport. The player is a separate fixed
-overlay at its center; every movement step translates the map layer underneath.
-This remains true at world edges and after orientation changes.
+The map is a bounded Canvas 2D viewport. It draws only visible tiles, sparse
+trees, and nearby player clusters; the player remains a separate fixed overlay
+while the canvas camera moves underneath. Player details and social UI are
+collapsible, with level, XP, LOG, and online count kept in the map HUD.
 
 Browser storage uses `woodland.sh:web:v1:*`. **New test wallet** clears the
 local key, profile (including PLAYER_ID), pending swing, position, and local
