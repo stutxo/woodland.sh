@@ -38,6 +38,7 @@ const xpNumber = element('xp-number');
 const xpNext = element('xp-next');
 const map = element('map');
 const mapViewport = element('map-viewport');
+const cameraPlayer = element('camera-player');
 const mapHint = element('map-hint');
 const refreshButton = element('refresh');
 const renewButton = element('renew-player');
@@ -487,51 +488,36 @@ function flashTree(treeId, type, duration, renderNow = true) {
   }, duration);
 }
 function followPlayerCamera() {
-  if (!state?.playerActive) {
-    mapViewport.style.padding = '';
-    mapViewport.scrollLeft = 0;
-    mapViewport.scrollTop = 0;
+  if (!state) {
+    cameraPlayer.hidden = true;
+    map.style.transform = '';
     return;
   }
   const firstCell = map.querySelector('.map-cell');
-  const playerCell = map.querySelector('.map-cell.player');
-  if (!firstCell || !playerCell) return;
-  const basePadding = 10;
+  if (!firstCell) return;
+  cameraPlayer.hidden = false;
+  cameraPlayer.title = `Player at (${player.x}, ${player.y})`;
 
   const cellBounds = firstCell.getBoundingClientRect();
-  const horizontalPadding = Math.max(
-    basePadding,
-    (mapViewport.clientWidth - cellBounds.width) / 2,
-  );
-  const verticalPadding = Math.max(
-    basePadding,
-    (mapViewport.clientHeight - cellBounds.height) / 2,
-  );
-  mapViewport.style.padding = `${verticalPadding}px ${horizontalPadding}px`;
+  const mapX = mapViewport.clientWidth / 2 - (player.x + 0.5) * cellBounds.width;
+  const mapY = mapViewport.clientHeight / 2 - (player.y + 0.5) * cellBounds.height;
+  map.style.transform = `translate3d(${mapX}px, ${mapY}px, 0)`;
+  mapViewport.scrollLeft = 0;
+  mapViewport.scrollTop = 0;
 
   const viewportBounds = mapViewport.getBoundingClientRect();
-  const playerBounds = playerCell.getBoundingClientRect();
-  mapViewport.scrollLeft += playerBounds.left
-    + playerBounds.width / 2
-    - viewportBounds.left
-    - viewportBounds.width / 2;
-  mapViewport.scrollTop += playerBounds.top
-    + playerBounds.height / 2
-    - viewportBounds.top
-    - viewportBounds.height / 2;
-
-  const fixedBounds = playerCell.getBoundingClientRect();
+  const playerBounds = cameraPlayer.getBoundingClientRect();
   const camera = {
     x: player.x,
     y: player.y,
-    scrollLeft: mapViewport.scrollLeft,
-    scrollTop: mapViewport.scrollTop,
-    deltaX: fixedBounds.left
-      + fixedBounds.width / 2
+    mapX,
+    mapY,
+    deltaX: playerBounds.left
+      + playerBounds.width / 2
       - viewportBounds.left
       - viewportBounds.width / 2,
-    deltaY: fixedBounds.top
-      + fixedBounds.height / 2
+    deltaY: playerBounds.top
+      + playerBounds.height / 2
       - viewportBounds.top
       - viewportBounds.height / 2,
   };
@@ -595,11 +581,6 @@ function renderMap() {
         cell.title = remotePlayers
           .map((asset) => `${asset.slice(0, 8)}…`)
           .join(', ');
-      }
-      if (player.x === x && player.y === y) {
-        cell.className = 'map-cell player';
-        cell.textContent = '@';
-        cell.title = `Player at (${x}, ${y})`;
       }
       cells.append(cell);
     }

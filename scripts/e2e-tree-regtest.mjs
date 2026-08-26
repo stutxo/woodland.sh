@@ -112,14 +112,14 @@ async function main() {
         mapCells: document.querySelectorAll('#map .map-cell').length,
         camera: (() => {
           const viewport = document.getElementById('map-viewport');
-          const playerCell = document.querySelector('#map .player');
+          const playerCell = document.getElementById('camera-player');
           if (!viewport || !playerCell) return null;
           const viewportBounds = viewport.getBoundingClientRect();
           const playerBounds = playerCell.getBoundingClientRect();
           return {
             target: globalThis.__WOODLAND_E2E_CAMERA || null,
             trail: globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [],
-            scrollLeft: viewport.scrollLeft,
+            playerGlyph: playerCell.textContent,
             clientWidth: viewport.clientWidth,
             clientHeight: viewport.clientHeight,
             playerCenterX: playerBounds.left + playerBounds.width / 2 - viewportBounds.left,
@@ -502,7 +502,7 @@ async function main() {
         && value.player?.y === 10
         && value.camera?.target?.x === 30
         && value.camera?.target?.y === 10
-        && value.camera.scrollLeft > 200
+        && Math.abs(value.camera.target.mapX) > 200
         && Math.abs(value.camera.playerCenterX - value.camera.viewportCenterX) < 2
         && Math.abs(value.camera.playerCenterY - value.camera.viewportCenterY) < 2,
     );
@@ -548,7 +548,7 @@ async function main() {
         && value.camera?.clientWidth <= 720
         && Math.abs(value.camera.playerCenterX - value.camera.viewportCenterX) < 2
         && Math.abs(value.camera.playerCenterY - value.camera.viewportCenterY) < 2
-        && value.map.includes('@')
+        && value.camera.playerGlyph === '@'
         && value.map.includes('🌲'),
     );
     await wd('POST', '/refresh', {});

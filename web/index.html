@@ -20,12 +20,12 @@
     button:hover:not(:disabled) { border-color: #b9e879; }
     button:disabled { opacity: .4; cursor: not-allowed; }
     #status, .muted { color: #8e9b88; font-size: .78rem; }
-    .map-scroll { width: min(100%, 720px); height: min(52vh, 360px); margin: 0 auto; overflow: hidden; padding: 10px; border: 1px solid #222d1f; background: #090c08; overscroll-behavior: contain; }
-    #map { --map-width: 45; display: grid; grid-template-columns: repeat(var(--map-width), 1.2rem); grid-auto-rows: 1.2rem; width: max-content; min-width: 100%; color: #4c6246; font-size: .72rem; }
+    .map-scroll { position: relative; width: min(100%, 720px); height: min(52vh, 360px); margin: 0 auto; overflow: clip; border: 1px solid #222d1f; background: #090c08; }
+    #map { --map-width: 45; position: absolute; top: 0; left: 0; display: grid; grid-template-columns: repeat(var(--map-width), 1.2rem); grid-auto-rows: 1.2rem; width: max-content; color: #4c6246; font-size: .72rem; transform-origin: 0 0; will-change: transform; }
     .map-cell { display: grid; width: 1.2rem; height: 1.2rem; place-items: center; border-radius: 2px; line-height: 1; cursor: pointer; }
     .map-cell.tree { color: #dff5d5; font-size: 1rem; }
     .map-cell.stump { color: #b58654; font-weight: 700; }
-    .map-cell.player { color: #f2d475; font-weight: 700; }
+    .camera-player { position: absolute; z-index: 3; top: 50%; left: 50%; display: grid; width: 1.2rem; height: 1.2rem; place-items: center; border-radius: 2px; color: #f2d475; background: #28331f; font-weight: 700; line-height: 1; pointer-events: none; transform: translate(-50%, -50%); }
     .map-cell:hover { background: #243020; }
     .map-cell.target { outline: 1px solid #b9e879; background: #1b2618; }
     .map-cell.remote-player { color: #78c9e8; font-weight: 700; }
@@ -124,7 +124,10 @@
     </header>
 
     <section id="game">
-      <div id="map-viewport" class="map-scroll"><div id="map" role="img" aria-label="Woodland map"></div></div>
+      <div id="map-viewport" class="map-scroll">
+        <div id="map" role="img" aria-label="Woodland map"></div>
+        <div id="camera-player" class="camera-player" aria-label="You" hidden>@</div>
+      </div>
       <div class="map-help"><span>@ you · &amp; player · tree · + stump</span><span id="map-hint">Entering the woodland...</span></div>
     </section>
 

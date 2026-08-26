@@ -12,8 +12,12 @@ use crate::watchtower::{self, WatchtowerServices};
 use crate::world::{ValidatedWorld, WorldManifest, GAME_ID, PROTOCOL_VERSION};
 use anyhow::{anyhow, bail, Context, Result};
 use ark_core::asset::AssetId;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{
+    header::{CACHE_CONTROL, CONTENT_TYPE},
+    HeaderValue, Method, StatusCode,
+};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -1058,6 +1062,14 @@ fn canonical_http_origin(value: &str, name: &str, mainnet: bool) -> Result<Strin
     Ok(url.origin().ascii_serialization())
 }
 
+async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
@@ -1219,6 +1231,7 @@ pub async fn run_cli() -> Result<()> {
     } else {
         app
     };
+    let app = app.layer(axum::middleware::from_fn(no_store));
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind woodland.sh server at {bind}"))?;

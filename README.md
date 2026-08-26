@@ -194,9 +194,9 @@ Open `http://127.0.0.1:8000/`. The app and social API use that same origin.
 Deposit the displayed 330 sats from any Arkade wallet, press **Refresh**, then
 **Create player**. Click an empty tile to walk or a tree to approach and chop.
 
-The map is always a bounded camera viewport. The player stays fixed at its
-center on every movement step while the map scrolls underneath, including at
-world edges and after orientation changes.
+The map is always a bounded camera viewport. The player is a separate fixed
+overlay at its center; every movement step translates the map layer underneath.
+This remains true at world edges and after orientation changes.
 
 Browser storage uses `woodland.sh:web:v1:*`. **New test wallet** clears the
 local key, profile (including PLAYER_ID), pending swing, position, and local

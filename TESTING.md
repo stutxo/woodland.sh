@@ -58,8 +58,8 @@ then run before teardown.
 
 Smoke proves the complete path quickly. Full exercises deterministic depletion,
 regrowth, recovery, adversarial mutations, and four-player concurrency.
-Both mobile and desktop viewport checks require every sampled movement frame,
-including a world edge, to keep the player centered while the map moves.
+Both mobile and desktop checks require the player overlay to remain exactly
+centered across every sampled frame while only the map transform changes.
 
 The same `dist/` layout can alternatively deploy to GitHub Pages. The artifact
 contains a manifest-specific CSP, `.nojekyll`, and an explicit 404. Gameplay
