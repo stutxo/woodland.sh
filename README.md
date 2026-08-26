@@ -192,9 +192,9 @@ Open `http://127.0.0.1:8000/`. Deposit the displayed 330 sats from any Arkade
 wallet, press **Refresh**, then **Create player**. Click an empty tile to walk.
 Click a tree to walk beside it and chop until a LOG drops.
 
-On screens up to 680 px wide, the map becomes a bounded scroll viewport. The
-camera centers the active player after activation, movement, reload, and
-orientation changes.
+On screens up to 680 px wide, the map becomes a bounded camera viewport. The
+player stays fixed at its center on every movement step while the map scrolls
+underneath, including at world edges and after orientation changes.
 
 Browser storage uses `woodland.sh:web:v1:*`. **New test wallet** clears the
 local key, profile (including PLAYER_ID), pending swing, position, and local

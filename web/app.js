@@ -96,8 +96,6 @@ let socialPosting = false;
 let locationPosting = false;
 let lastPublishedLocation = null;
 let lastRenderedChatId = null;
-let lastCameraPosition = null;
-let cameraInitialized = false;
 
 function withApp(action) {
   const operation = appQueue.then(action, action);
@@ -487,48 +485,68 @@ function flashTree(treeId, type, duration, renderNow = true) {
     renderMap();
   }, duration);
 }
-function followPlayerCamera(force = false) {
-  if (!state?.playerActive) return;
-  const position = coordinateKey(player.x, player.y);
-  if (!force && position === lastCameraPosition) return;
-  lastCameraPosition = position;
-  requestAnimationFrame(() => {
-    const cell = map.querySelector(
-      `.map-cell[data-x="${player.x}"][data-y="${player.y}"]`,
-    );
-    if (!cell) return;
-    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const viewportBounds = mapViewport.getBoundingClientRect();
-    const cellBounds = cell.getBoundingClientRect();
-    const targetLeft = Math.max(
-      0,
-      mapViewport.scrollLeft
-        + cellBounds.left
-        + cellBounds.width / 2
-        - viewportBounds.left
-        - viewportBounds.width / 2,
-    );
-    const targetTop = Math.max(
-      0,
-      mapViewport.scrollTop
-        + cellBounds.top
-        + cellBounds.height / 2
-        - viewportBounds.top
-        - viewportBounds.height / 2,
-    );
-    mapViewport.scrollTo({
-      left: targetLeft,
-      top: targetTop,
-      behavior: cameraInitialized && !reducedMotion ? 'smooth' : 'auto',
-    });
-    cameraInitialized = true;
-    globalThis.__WOODLAND_E2E_CAMERA = {
-      x: player.x,
-      y: player.y,
-      targetLeft,
-      targetTop,
-    };
-  });
+function followPlayerCamera() {
+  if (!state?.playerActive) {
+    mapViewport.style.padding = '';
+    return;
+  }
+  const firstCell = map.querySelector('.map-cell');
+  const playerCell = map.querySelector('.map-cell.player');
+  if (!firstCell || !playerCell) return;
+  const basePadding = 10;
+  const needsCamera = map.scrollWidth + basePadding * 2 > mapViewport.clientWidth
+    || map.scrollHeight + basePadding * 2 > mapViewport.clientHeight;
+  if (!needsCamera) {
+    mapViewport.style.padding = '';
+    mapViewport.scrollLeft = 0;
+    mapViewport.scrollTop = 0;
+    return;
+  }
+
+  const cellBounds = firstCell.getBoundingClientRect();
+  const horizontalPadding = Math.max(
+    basePadding,
+    (mapViewport.clientWidth - cellBounds.width) / 2,
+  );
+  const verticalPadding = Math.max(
+    basePadding,
+    (mapViewport.clientHeight - cellBounds.height) / 2,
+  );
+  mapViewport.style.padding = `${verticalPadding}px ${horizontalPadding}px`;
+
+  const viewportBounds = mapViewport.getBoundingClientRect();
+  const playerBounds = playerCell.getBoundingClientRect();
+  mapViewport.scrollLeft += playerBounds.left
+    + playerBounds.width / 2
+    - viewportBounds.left
+    - viewportBounds.width / 2;
+  mapViewport.scrollTop += playerBounds.top
+    + playerBounds.height / 2
+    - viewportBounds.top
+    - viewportBounds.height / 2;
+
+  const fixedBounds = playerCell.getBoundingClientRect();
+  const camera = {
+    x: player.x,
+    y: player.y,
+    scrollLeft: mapViewport.scrollLeft,
+    scrollTop: mapViewport.scrollTop,
+    deltaX: fixedBounds.left
+      + fixedBounds.width / 2
+      - viewportBounds.left
+      - viewportBounds.width / 2,
+    deltaY: fixedBounds.top
+      + fixedBounds.height / 2
+      - viewportBounds.top
+      - viewportBounds.height / 2,
+  };
+  globalThis.__WOODLAND_E2E_CAMERA = camera;
+  const trail = globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [];
+  const previous = trail.at(-1);
+  if (!previous || previous.x !== camera.x || previous.y !== camera.y) {
+    trail.push(camera);
+    globalThis.__WOODLAND_E2E_CAMERA_TRAIL = trail.slice(-100);
+  }
 }
 
 function renderMap() {
@@ -1175,7 +1193,7 @@ setInterval(async () => {
 
 }, 1000);
 window.addEventListener('resize', () => {
-  followPlayerCamera(true);
+  followPlayerCamera();
 });
 
 setInterval(() => {

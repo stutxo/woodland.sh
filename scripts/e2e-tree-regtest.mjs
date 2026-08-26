@@ -118,10 +118,13 @@ async function main() {
           const playerBounds = playerCell.getBoundingClientRect();
           return {
             target: globalThis.__WOODLAND_E2E_CAMERA || null,
+            trail: globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [],
             scrollLeft: viewport.scrollLeft,
             clientHeight: viewport.clientHeight,
             playerCenterX: playerBounds.left + playerBounds.width / 2 - viewportBounds.left,
+            playerCenterY: playerBounds.top + playerBounds.height / 2 - viewportBounds.top,
             viewportCenterX: viewportBounds.width / 2,
+            viewportCenterY: viewportBounds.height / 2,
           };
         })(),
         bagLogs: document.getElementById('player-logs')?.textContent || '',
@@ -492,16 +495,40 @@ async function main() {
     await wd('POST', '/window/rect', { width: 390, height: 844 });
     await clickMapCell(30, 10);
     const mobileCamera = await waitFor(
-      'mobile camera follows player',
+      'mobile camera fixes player at viewport center',
       inspect,
       (value) => value.player?.x === 30
         && value.player?.y === 10
         && value.camera?.target?.x === 30
         && value.camera?.target?.y === 10
         && value.camera.scrollLeft > 200
-        && Math.abs(value.camera.playerCenterX - value.camera.viewportCenterX) < 2,
+        && Math.abs(value.camera.playerCenterX - value.camera.viewportCenterX) < 2
+        && Math.abs(value.camera.playerCenterY - value.camera.viewportCenterY) < 2,
     );
     assert.ok(mobileCamera.camera.clientHeight <= 360);
+    assert.ok(mobileCamera.camera.trail.length > 10);
+    assert.ok(mobileCamera.camera.trail.every((frame) => (
+      Math.abs(frame.deltaX) < 2 && Math.abs(frame.deltaY) < 2
+    )));
+    await clickMapCell(0, 0);
+    const edgeCamera = await waitFor(
+      'mobile camera keeps map edge fixed',
+      inspect,
+      (value) => value.player?.x === 0
+        && value.player?.y === 0
+        && value.camera?.target?.x === 0
+        && value.camera?.target?.y === 0
+        && Math.abs(value.camera.target.deltaX) < 2
+        && Math.abs(value.camera.target.deltaY) < 2,
+    );
+    assert.ok(
+      Math.abs(edgeCamera.camera.playerCenterX - edgeCamera.camera.viewportCenterX) < 4
+        && Math.abs(edgeCamera.camera.playerCenterY - edgeCamera.camera.viewportCenterY) < 4,
+      JSON.stringify(edgeCamera.camera),
+    );
+    assert.ok(edgeCamera.camera.trail.every((frame) => (
+      Math.abs(frame.deltaX) < 2 && Math.abs(frame.deltaY) < 2
+    )));
     await wd('POST', '/window/rect', { width: 1280, height: 900 });
 
     const firstTree = initial.state.trees.find((tree) => tree.treeId === 417);

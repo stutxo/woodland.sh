@@ -50,9 +50,18 @@ printf 'Running woodland.sh %s regtest profile\n' "$PROFILE"
 cargo build --locked --features server --bin woodland-server
 rm -f "$WOODLAND_SERVER_DB"
 mkdir -p "$(dirname "$SERVER_LOG")"
+if curl --fail --silent --max-time 1 "$WOODLAND_SERVER_URL/health.json" >/dev/null 2>&1; then
+  printf 'error: server port is already in use\n' >&2
+  exit 1
+fi
 "$ROOT/target/debug/woodland-server" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 for attempt in {1..60}; do
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    cat "$SERVER_LOG" >&2
+    printf 'error: server exited before readiness\n' >&2
+    exit 1
+  fi
   if curl --fail --silent "$WOODLAND_SERVER_URL/health.json" >/dev/null; then
     break
   fi
