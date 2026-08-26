@@ -1,0 +1,15 @@
+{
+  "name": "woodland-regtest",
+  "version": "1.0.0",
+  "private": true,
+  "description": "woodland.sh's local Arkade and emulator test stack.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node regtest.mjs start",
+    "stop": "node regtest.mjs stop",
+    "clean": "node regtest.mjs clean"
+  }
+}

@@ -1,0 +1,35 @@
+[Unit]
+Description=woodland.sh verified public leaderboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=woodland-leaderboard
+Group=woodland-leaderboard
+WorkingDirectory=/opt/woodland
+EnvironmentFile=/etc/woodland/leaderboard.env
+ExecStart=/opt/woodland/woodland-leaderboard
+Restart=always
+RestartSec=5
+UMask=0077
+StateDirectory=woodland-leaderboard
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,256 @@
+# In-house base layer for arkade-regtest — replaces nigiri entirely.
+#
+# Chain + indexers + explorer + counterparty Lightning node. This file creates
+# the project and its default network; docker/compose.ark.yml is layered on top
+# in the same `docker compose -f base -f ark` invocation, so every service is
+# reachable by its service name on one shared network (no external network).
+#
+# Explorer/indexer stack is Fulcrum (Electrum) + mempool. Arkd consumes the
+# Esplora-compatible REST API that mempool serves under /api.
+name: arkade-regtest
+
+services:
+  # ── Bitcoin Core (regtest) ─────────────────────────────────────────────────
+  bitcoin:
+    image: ${BITCOIN_IMAGE:-btcpayserver/bitcoin:31.0}
+    container_name: bitcoin
+    profiles: ["base"]
+    restart: on-failure
+    stop_grace_period: 30s
+    environment:
+      # The BTCPay image builds bitcoin.conf from BITCOIN_NETWORK (which creates
+      # the [regtest] section) + BITCOIN_EXTRA_ARGS appended under it. It only
+      # sets rpcallowip=::/0 and no rpcbind, so we add rpcbind=0.0.0.0 +
+      # rpcallowip=0.0.0.0/0 for inter-container RPC. Low-fee is baked in here so
+      # the orchestrator never has to rewrite the conf and restart bitcoind.
+      BITCOIN_NETWORK: regtest
+      BITCOIN_EXTRA_ARGS: |
+        rpcbind=0.0.0.0
+        rpcallowip=0.0.0.0/0
+        rpcuser=admin1
+        rpcpassword=123
+        txindex=1
+        fallbackfee=0.00001
+        minrelaytxfee=0
+        mintxfee=0
+        blockmintxfee=0
+        whitelist=0.0.0.0/0
+        whitelistforcerelay=1
+        zmqpubrawblock=tcp://0.0.0.0:28332
+        zmqpubrawtx=tcp://0.0.0.0:28333
+        blockfilterindex=1
+        peerblockfilters=1
+    volumes:
+      - bitcoin_datadir:/data
+    ports:
+      - 127.0.0.1:${BITCOIN_RPC_PORT:-18443}:18443
+      - 127.0.0.1:${BITCOIN_P2P_PORT:-18444}:18444
+      - 127.0.0.1:${BITCOIN_ZMQ_BLOCK_PORT:-28332}:28332
+      - 127.0.0.1:${BITCOIN_ZMQ_TX_PORT:-28333}:28333
+
+  # ── Auto-miner — mines 1 block every AUTOMINE_INTERVAL seconds ──────────────
+  # On by default (600s / 10 min); set AUTOMINE_INTERVAL=0 to disable. Mines via
+  # the bitcoin node's wallet over RPC. The first tick is one full interval away,
+  # so the (faster) start bootstrap stays deterministic.
+  bitcoin-miner:
+    image: ${BITCOIN_IMAGE:-btcpayserver/bitcoin:31.0}
+    container_name: bitcoin-miner
+    profiles: ["base"]
+    restart: unless-stopped
+    depends_on:
+      - bitcoin
+    environment:
+      AUTOMINE_INTERVAL: ${AUTOMINE_INTERVAL:-600}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        if [ -z "$$AUTOMINE_INTERVAL" ] || [ "$$AUTOMINE_INTERVAL" = "0" ]; then
+          echo "auto-miner disabled (AUTOMINE_INTERVAL=$$AUTOMINE_INTERVAL)"
+          exec sleep infinity
+        fi
+        echo "auto-miner: mining 1 block every $${AUTOMINE_INTERVAL}s"
+        while true; do
+          sleep "$$AUTOMINE_INTERVAL"
+          bitcoin-cli -regtest -rpcconnect=bitcoin -rpcuser=admin1 -rpcpassword=123 -generate 1 >/dev/null 2>&1 \
+            && echo "auto-miner: mined a block" || echo "auto-miner: skipped (node/wallet not ready)"
+        done
+
+  # ── Postgres for NBXplorer ─────────────────────────────────────────────────
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    container_name: postgres
+    profiles: ["base"]
+    restart: unless-stopped
+    # Exposed on the host so external consumers can reach the DBs directly — in
+    # particular a BTCPay ServerTester, whose `explorer.postgres` reads
+    # NBXplorer's DB straight from Postgres. 39372 is NBXplorer's conventional
+    # host port, so BTCPay's default `explorer.postgres` (127.0.0.1:39372) and a
+    # BTCPay app DB on the same server both work with no extra wiring (trust auth).
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-39372}:5432"
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: arkd
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d arkd"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - postgres_datadir:/var/lib/postgresql/data
+
+  # ── NBXplorer for arkd-wallet ──────────────────────────────────────────────
+  nbxplorer:
+    image: ${NBXPLORER_IMAGE:-nicolasdorier/nbxplorer:2.6.7}
+    container_name: nbxplorer
+    profiles: ["base"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bitcoin:
+        condition: service_started
+    environment:
+      NBXPLORER_NETWORK: regtest
+      NBXPLORER_CHAINS: "btc"
+      NBXPLORER_BTCRPCURL: http://bitcoin:18443/
+      NBXPLORER_BTCNODEENDPOINT: bitcoin:18444
+      NBXPLORER_BTCRPCUSER: admin1
+      NBXPLORER_BTCRPCPASSWORD: 123
+      NBXPLORER_VERBOSE: 1
+      NBXPLORER_BIND: 0.0.0.0:32838
+      NBXPLORER_TRIMEVENTS: 10000
+      NBXPLORER_SIGNALFILESDIR: /datadir
+      NBXPLORER_POSTGRES: "User ID=postgres;Host=postgres;Port=5432;Application Name=nbxplorer;MaxPoolSize=20;Database=nbxplorer"
+      NBXPLORER_EXPOSERPC: 1
+      NBXPLORER_NOAUTH: 1
+    volumes:
+      - nbxplorer_datadir:/datadir
+    ports:
+      - "127.0.0.1:${NBXPLORER_PORT:-32838}:32838"
+    # NBXplorer only binds its HTTP port after it has finished DB migrations and
+    # connected to bitcoind, so a listening port is a good "ready" signal. The
+    # image is Ubuntu (bash + /dev/tcp, no curl/wget). Gating arkd-wallet on this
+    # stops it from racing nbxplorer's first-boot (which otherwise causes the
+    # "lookup nbxplorer: no such host" / arkd crash-loop chain).
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/32838'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  # ── Fulcrum (Electrum server backing mempool) ──────────────────────────────
+  fulcrum:
+    image: ${FULCRUM_IMAGE:-cculianu/fulcrum:latest}
+    container_name: fulcrum
+    profiles: ["base"]
+    restart: on-failure
+    stop_grace_period: 30s
+    depends_on:
+      - bitcoin
+    volumes:
+      - fulcrum_datadir:/data
+    command:
+      - Fulcrum
+      - --bitcoind
+      - bitcoin:18443
+      - --rpcuser
+      - admin1
+      - --rpcpassword
+      - "123"
+      - --tcp
+      - 0.0.0.0:50001
+      - --ws
+      - 0.0.0.0:50003
+    ports:
+      - "127.0.0.1:${FULCRUM_TCP_PORT:-50001}:50001"
+      - "127.0.0.1:${FULCRUM_WS_PORT:-50003}:50003"
+
+  # ── mempool: MariaDB + backend API + web frontend ──────────────────────────
+  mempool_mariadb:
+    image: ${MARIADB_IMAGE:-mariadb:10.5}
+    container_name: mempool_mariadb
+    profiles: ["base"]
+    restart: on-failure
+    stop_grace_period: 1m
+    environment:
+      MYSQL_DATABASE: mempool
+      MYSQL_USER: mempool
+      MYSQL_PASSWORD: mempool
+      MYSQL_ROOT_PASSWORD: mempool_root
+    volumes:
+      - mempool_mariadb:/var/lib/mysql
+
+  mempool_api:
+    image: ${MEMPOOL_BACKEND_IMAGE:-mempool/backend:v3.3.1}
+    container_name: mempool_api
+    profiles: ["base"]
+    user: "1000:1000"
+    init: true
+    restart: on-failure
+    stop_grace_period: 1m
+    command: "./wait-for-it.sh mempool_mariadb:3306 --timeout=720 --strict -- ./start.sh"
+    depends_on:
+      - mempool_mariadb
+      - fulcrum
+    environment:
+      # Bitcoin Core RPC
+      CORE_RPC_HOST: bitcoin
+      CORE_RPC_PORT: "18443"
+      CORE_RPC_USERNAME: admin1
+      CORE_RPC_PASSWORD: "123"
+      CORE_RPC_TIMEOUT: "120000"
+      # Electrum backend (Fulcrum)
+      MEMPOOL_BACKEND: electrum
+      ELECTRUM_HOST: fulcrum
+      ELECTRUM_PORT: "50001"
+      ELECTRUM_TLS_ENABLED: "false"
+      # Database
+      DATABASE_ENABLED: "true"
+      DATABASE_HOST: mempool_mariadb
+      DATABASE_PORT: "3306"
+      DATABASE_DATABASE: mempool
+      DATABASE_USERNAME: mempool
+      DATABASE_PASSWORD: mempool
+      # Core
+      MEMPOOL_NETWORK: regtest
+      MEMPOOL_HTTP_PORT: "8999"
+      MEMPOOL_CACHE_DIR: /backend/cache
+      MEMPOOL_POLL_RATE_MS: "2000"
+      MEMPOOL_INDEXING_BLOCKS_AMOUNT: "-1"
+      MEMPOOL_STDOUT_LOG_MIN_PRIORITY: debug
+      STATISTICS_ENABLED: "false"
+      LIGHTNING_ENABLED: "false"
+      NODE_OPTIONS: "--max-old-space-size=2048"
+    volumes:
+      - mempool_api_datadir:/backend/cache
+    ports:
+      - "127.0.0.1:${MEMPOOL_API_PORT:-8999}:8999"
+
+  mempool_web:
+    image: ${MEMPOOL_FRONTEND_IMAGE:-mempool/frontend:v3.3.1}
+    container_name: mempool_web
+    profiles: ["base"]
+    user: "1000:1000"
+    init: true
+    restart: on-failure
+    stop_grace_period: 1m
+    command: "./wait-for mempool_api:8999 --timeout=720 -- nginx -g 'daemon off;'"
+    depends_on:
+      - mempool_api
+    environment:
+      FRONTEND_HTTP_PORT: "80"
+      BACKEND_MAINNET_HTTP_HOST: mempool_api
+    ports:
+      - "127.0.0.1:${MEMPOOL_WEB_PORT:-3000}:80"
+
+volumes:
+  bitcoin_datadir:
+  postgres_datadir:
+  nbxplorer_datadir:
+  fulcrum_datadir:
+  mempool_mariadb:
+  mempool_api_datadir:

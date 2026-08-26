@@ -1,0 +1,9 @@
+/target/
+/.toolchain/
+/.cache/
+/dist/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+.env
+*.log
