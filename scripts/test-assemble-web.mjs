@@ -44,6 +44,15 @@ try {
   assert.match(notFound, /Not found/);
   await assert.rejects(readFile(path.join(validOutput, '_headers')));
 
+  const sameOriginOutput = path.join(temporary, 'same-origin');
+  const sameOrigin = run(validManifest, sameOriginOutput, {
+    WOODLAND_SERVER_URL: 'self',
+  });
+  assert.equal(sameOrigin.status, 0, sameOrigin.stderr);
+  const sameOriginIndex = await readFile(path.join(sameOriginOutput, 'index.html'), 'utf8');
+  assert.match(sameOriginIndex, /name="woodland-server" content="self"/);
+  assert.doesNotMatch(sameOriginIndex, /server\.example/);
+
   const unconfiguredOutput = path.join(temporary, 'unconfigured');
   const unconfigured = run(validManifest, unconfiguredOutput, {
     WOODLAND_SERVER_URL: '',

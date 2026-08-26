@@ -11,9 +11,10 @@ emulator.
 ./scripts/run-web.sh
 ```
 
-Open `http://127.0.0.1:8000/`. The browser calls local arkd on 7070 and the
-emulator on 7073 directly. The development server serves the same `dist/`
-bundle used by GitHub Pages and supervises one local maintenance watcher.
+Open `http://127.0.0.1:8000/`. `woodland-server` serves both `dist/` and every
+`/v1/*` API on that origin. Gameplay still calls local arkd on 7070 and the
+emulator on 7073 directly; a separate local maintenance watcher runs alongside
+Axum.
 
 Protocol v1 uses schema 1 and storage under `woodland.sh:web:v1:*`. A fresh
 world creates three fixed-supply groups:
@@ -120,6 +121,16 @@ WOODLAND_ROLLOVER_SECRET
 WOODLAND_WORLD_MANIFEST
 ```
 
+The unified server additionally accepts:
+
+```text
+WOODLAND_SERVER_PUBLIC_URL
+WOODLAND_SERVER_BIND
+WOODLAND_SERVER_WEB_ROOT
+WOODLAND_SERVER_DB
+WOODLAND_SERVER_REFRESH_SECONDS
+```
+
 Mainnet requires HTTPS and explicit service pins. Reconfirm signer/version values
 independently before creating irreversible assets.
 
@@ -130,9 +141,9 @@ independently before creating irreversible assets.
 ./scripts/test-regtest.sh full
 ```
 
-Both profiles start `woodland-server` on port 8090, authenticate player
-registration/location/chat, and exercise signed renewal delegation. Smoke uses
-two browsers; full uses four.
+Both profiles serve the web bundle and API from `woodland-server` on port 8090,
+authenticate player registration/location/chat, and exercise signed renewal
+delegation. Smoke uses two browsers; full uses four.
 
 The profiles are destructive only to resources owned by this checkout. If port
 3000 is already in use, set `MEMPOOL_WEB_PORT` to a free host port.

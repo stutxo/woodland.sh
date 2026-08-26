@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 
 const REGISTRY_SCHEMA: u32 = 2;
 const DEFAULT_BIND: &str = "127.0.0.1:8090";
@@ -1077,6 +1078,18 @@ pub async fn run_cli() -> Result<()> {
     .parse::<u64>()
     .context("parse WOODLAND_SERVER_REFRESH_SECONDS")?
     .max(5);
+    let web_root = std::env::var("WOODLAND_SERVER_WEB_ROOT")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from);
+    if let Some(root) = &web_root {
+        for required in ["index.html", "world.json", "404.html"] {
+            let path = root.join(required);
+            if !path.is_file() {
+                bail!("server web root is missing {}", path.display());
+            }
+        }
+    }
 
     let manifest = WorldManifest::from_json(
         &std::fs::read_to_string(&manifest_path)
@@ -1102,17 +1115,17 @@ pub async fn run_cli() -> Result<()> {
     if force_renewal_once && params.network != bitcoin::Network::Regtest {
         bail!("WOODLAND_SERVER_FORCE_RENEWAL_ONCE is restricted to regtest");
     }
-    let origin = canonical_http_origin(
-        &setting("WOODLAND_SERVER_ORIGIN")?,
-        "WOODLAND_SERVER_ORIGIN",
-        mainnet,
-    )?;
-    let origin = HeaderValue::from_str(&origin).context("encode server CORS origin")?;
     let server_url = canonical_http_origin(
         &setting("WOODLAND_SERVER_PUBLIC_URL")?,
         "WOODLAND_SERVER_PUBLIC_URL",
         mainnet,
     )?;
+    let origin = canonical_http_origin(
+        &optional_setting("WOODLAND_SERVER_ORIGIN", &server_url),
+        "WOODLAND_SERVER_ORIGIN",
+        mainnet,
+    )?;
+    let origin = HeaderValue::from_str(&origin).context("encode server CORS origin")?;
     let rollover_keys = std::env::var("WOODLAND_ROLLOVER_SECRET")
         .ok()
         .filter(|secret| !secret.trim().is_empty())
@@ -1196,6 +1209,16 @@ pub async fn run_cli() -> Result<()> {
                 .allow_headers([CONTENT_TYPE]),
         )
         .with_state(state);
+    let app = if let Some(root) = web_root {
+        let not_found = ServeFile::new(root.join("404.html"));
+        app.fallback_service(
+            ServeDir::new(root)
+                .append_index_html_on_directories(true)
+                .not_found_service(not_found),
+        )
+    } else {
+        app
+    };
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind woodland.sh server at {bind}"))?;

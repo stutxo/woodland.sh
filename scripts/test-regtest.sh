@@ -11,10 +11,12 @@ export WOODLAND_ROLLOVER_SECRET=444444444444444444444444444444444444444444444444
 export WOODLAND_WORLD_MANIFEST="$ROOT/regtest/_build/woodland-world.json"
 export WOODLAND_SERVER_URL=http://127.0.0.1:8090
 export WOODLAND_SERVER_PUBLIC_URL=http://127.0.0.1:8090
-export WOODLAND_SERVER_ORIGIN=http://127.0.0.1:18776
+export WOODLAND_SERVER_ORIGIN=http://127.0.0.1:8090
 export WOODLAND_SERVER_BIND=127.0.0.1:8090
+export WOODLAND_SERVER_WEB_ROOT="$ROOT/dist"
 export WOODLAND_SERVER_DB="$ROOT/regtest/_build/server.json"
 export WOODLAND_SERVER_FORCE_RENEWAL_ONCE=1
+export WOODLAND_E2E_WEB_URL="$WOODLAND_SERVER_URL"
 PROFILE=${1:-full}
 
 case "$PROFILE" in
@@ -27,15 +29,18 @@ esac
 
 export WOODLAND_E2E_PROFILE=$PROFILE
 SERVER_PID=
+WATCHER_PID=
 SERVER_LOG="${WOODLAND_E2E_ARTIFACT_DIR:-$ROOT/regtest/_build/ci-artifacts}/server.log"
+WATCHER_LOG="${WOODLAND_E2E_ARTIFACT_DIR:-$ROOT/regtest/_build/ci-artifacts}/watcher.log"
 
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
-  if [[ -n "$SERVER_PID" ]]; then
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-  fi
+  for pid in "$SERVER_PID" "$WATCHER_PID"; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
   "$ROOT/scripts/regtest.sh" stop || true
   exit "$status"
 }
@@ -50,6 +55,9 @@ printf 'Running woodland.sh %s regtest profile\n' "$PROFILE"
 cargo build --locked --features server --bin woodland-server
 rm -f "$WOODLAND_SERVER_DB"
 mkdir -p "$(dirname "$SERVER_LOG")"
+WOODLAND_SERVER_URL=self "$ROOT/scripts/build-web.sh"
+"$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" >"$WATCHER_LOG" 2>&1 &
+WATCHER_PID=$!
 if curl --fail --silent --max-time 1 "$WOODLAND_SERVER_URL/health.json" >/dev/null 2>&1; then
   printf 'error: server port is already in use\n' >&2
   exit 1
@@ -72,5 +80,4 @@ for attempt in {1..60}; do
   fi
   sleep 1
 done
-"$ROOT/scripts/build-web.sh"
 node "$ROOT/scripts/e2e-suite.mjs"

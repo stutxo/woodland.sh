@@ -66,8 +66,8 @@ web-sys = { version = "0.3", features = ["AbortSignal", "Window", "Storage", "He
 # through reqwest's WASM transport.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum = { version = "0.8", optional = true, features = ["json", "http1", "tokio"] }
-tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tower-http = { version = "0.6", optional = true, features = ["cors"] }
+tokio = { version = "1", default-features = false, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6", optional = true, features = ["cors", "fs"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers = { version = "0.3", features = ["futures"] }

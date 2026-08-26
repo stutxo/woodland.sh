@@ -20,7 +20,7 @@
     button:hover:not(:disabled) { border-color: #b9e879; }
     button:disabled { opacity: .4; cursor: not-allowed; }
     #status, .muted { color: #8e9b88; font-size: .78rem; }
-    .map-scroll { overflow: auto; padding: 10px; border: 1px solid #222d1f; background: #090c08; overscroll-behavior: contain; scrollbar-width: thin; }
+    .map-scroll { width: min(100%, 720px); height: min(52vh, 360px); margin: 0 auto; overflow: hidden; padding: 10px; border: 1px solid #222d1f; background: #090c08; overscroll-behavior: contain; }
     #map { --map-width: 45; display: grid; grid-template-columns: repeat(var(--map-width), 1.2rem); grid-auto-rows: 1.2rem; width: max-content; min-width: 100%; color: #4c6246; font-size: .72rem; }
     .map-cell { display: grid; width: 1.2rem; height: 1.2rem; place-items: center; border-radius: 2px; line-height: 1; cursor: pointer; }
     .map-cell.tree { color: #dff5d5; font-size: 1rem; }
@@ -110,7 +110,6 @@
     @media (prefers-reduced-motion: reduce) { .map-cell.chop-flash, .map-cell.log-flash, .map-cell.locked { animation-duration: .01ms; } }
     @media (max-width: 680px) {
       header, .map-help, .address-row { align-items: stretch; flex-direction: column; }
-      .map-scroll { height: min(52vh, 360px); overflow: hidden; }
       #dashboard.player-active .dashboard-grid { grid-template-columns: 1fr; }
       .bag, .stats-box { width: 100%; }
       .stats-box { grid-column: auto; max-width: none; }

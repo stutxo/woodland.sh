@@ -27,7 +27,8 @@ if (manifest.network === 'bitcoin' && (arkade.protocol !== 'https:' || emulator.
 }
 
 const serverValue = (process.env.WOODLAND_SERVER_URL || '').trim();
-const server = serverValue ? new URL(serverValue) : null;
+const sameOriginServer = serverValue === 'self';
+const server = serverValue && !sameOriginServer ? new URL(serverValue) : null;
 if (
   server
   && (
@@ -68,7 +69,7 @@ const index = indexTemplate
   )
   .replace(
     serverMarker,
-    `  <meta name="woodland-server" content="${htmlAttribute(server?.origin || '')}">`,
+    `  <meta name="woodland-server" content="${htmlAttribute(sameOriginServer ? 'self' : server?.origin || '')}">`,
   );
 
 await mkdir(outputPath, { recursive: true });

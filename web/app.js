@@ -1,9 +1,10 @@
 import init, { WoodlandApp } from './pkg/woodland.js';
 
 const WORLD = new URL('./world.json', import.meta.url);
-const SERVER_URL = document
-  .querySelector('meta[name="woodland-server"]')
-  ?.content.replace(/\/+$/, '') || '';
+const SERVER_SETTING = document.querySelector('meta[name="woodland-server"]')?.content || '';
+const SERVER_URL = SERVER_SETTING === 'self'
+  ? location.origin
+  : SERVER_SETTING.replace(/\/+$/, '');
 const STORAGE_SCOPE = location.origin;
 const KEY = `woodland.sh:web:v1:key:${STORAGE_SCOPE}`;
 const PROFILE = `woodland.sh:web:v1:profile:${STORAGE_SCOPE}`;
@@ -488,20 +489,14 @@ function flashTree(treeId, type, duration, renderNow = true) {
 function followPlayerCamera() {
   if (!state?.playerActive) {
     mapViewport.style.padding = '';
+    mapViewport.scrollLeft = 0;
+    mapViewport.scrollTop = 0;
     return;
   }
   const firstCell = map.querySelector('.map-cell');
   const playerCell = map.querySelector('.map-cell.player');
   if (!firstCell || !playerCell) return;
   const basePadding = 10;
-  const needsCamera = map.scrollWidth + basePadding * 2 > mapViewport.clientWidth
-    || map.scrollHeight + basePadding * 2 > mapViewport.clientHeight;
-  if (!needsCamera) {
-    mapViewport.style.padding = '';
-    mapViewport.scrollLeft = 0;
-    mapViewport.scrollTop = 0;
-    return;
-  }
 
   const cellBounds = firstCell.getBoundingClientRect();
   const horizontalPadding = Math.max(

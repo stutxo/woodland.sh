@@ -26,13 +26,37 @@ set +a
 : "${WOODLAND_ROLLOVER_SECRET:?missing WOODLAND_ROLLOVER_SECRET}"
 : "${WOODLAND_WORLD_MANIFEST:?missing WOODLAND_WORLD_MANIFEST}"
 
+PORT=${WOODLAND_SERVER_PORT:-8000}
+export WOODLAND_SERVER_PUBLIC_URL=${WOODLAND_SERVER_PUBLIC_URL:-http://127.0.0.1:$PORT}
+export WOODLAND_SERVER_BIND=${WOODLAND_SERVER_BIND:-127.0.0.1:$PORT}
+export WOODLAND_SERVER_WEB_ROOT=${WOODLAND_SERVER_WEB_ROOT:-$ROOT/dist}
+export WOODLAND_SERVER_DB=${WOODLAND_SERVER_DB:-$ROOT/.cache/mutinynet-server.json}
+WATCHER_PID=
+SERVER_PID=
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  for pid in "$SERVER_PID" "$WATCHER_PID"; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 mkdir -p "$(dirname "$WOODLAND_WORLD_MANIFEST")"
 cargo build \
   --manifest-path "$ROOT/Cargo.toml" \
   --release \
   --locked \
-  --features woodland-app \
-  --bin woodland-operator
+  --features server \
+  --bin woodland-operator \
+  --bin woodland-server
 
 OPERATOR="$ROOT/target/release/woodland-operator"
 status=$($OPERATOR status "$WOODLAND_WORLD_MANIFEST")
@@ -56,8 +80,13 @@ esac
 
 "$OPERATOR" ensure "$WOODLAND_WORLD_MANIFEST"
 unset WOODLAND_DEPLOYER_SECRET
-WOODLAND_WASM_FEATURES=woodland-app "$ROOT/scripts/build-web.sh"
+WOODLAND_SERVER_URL=self WOODLAND_WASM_FEATURES=woodland-app "$ROOT/scripts/build-web.sh"
 
-printf '\nGitHub Pages bundle ready in %s/dist\n' "$ROOT"
-printf 'Push main to deploy through the gated Pages workflow.\n\n'
-exec "$OPERATOR" watch "$WOODLAND_WORLD_MANIFEST"
+"$OPERATOR" watch "$WOODLAND_WORLD_MANIFEST" &
+WATCHER_PID=$!
+env -u WOODLAND_TREE_MAINTENANCE_SECRET "$ROOT/target/release/woodland-server" &
+SERVER_PID=$!
+
+printf '\nwoodland.sh app and API: %s/\n' "$WOODLAND_SERVER_PUBLIC_URL"
+printf 'Static app, leaderboard, presence, chat, and delegation share one origin.\n\n'
+wait -n "$WATCHER_PID" "$SERVER_PID"

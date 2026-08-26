@@ -159,10 +159,13 @@ policy rather than a covenant clock.
 
 ## Optional game-server host
 
-Build and install the Axum server separately from maintenance:
+Build the Axum server and a same-origin web bundle separately from maintenance:
 
 ```bash
 cargo build --release --locked --features server --bin woodland-server
+WOODLAND_SERVER_URL=self \
+  WOODLAND_WASM_FEATURES=woodland-app \
+  ./scripts/build-web.sh
 sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin woodland-server
 ```
 
@@ -170,6 +173,7 @@ Install:
 
 ```text
 /opt/woodland/woodland-server
+/opt/woodland/web/
 /etc/woodland/woodland-world.json
 /etc/woodland/server.env
 /etc/systemd/system/woodland-server.service
@@ -179,14 +183,16 @@ Use:
 
 ```text
 /opt/woodland/woodland-server       root:root             0555
+/opt/woodland/web/                  root:root             0555
 /etc/woodland/woodland-world.json   root:root             0444
 /etc/woodland/server.env            root:woodland-server  0640
 ```
 
 Populate `server.env` from `server.env.example`.
-`WOODLAND_SERVER_PUBLIC_URL` is the canonical public API origin signed by
-players. `WOODLAND_SERVER_ORIGIN` is the one exact Pages origin allowed by CORS.
-Both must use HTTPS on mainnet.
+`WOODLAND_SERVER_PUBLIC_URL` is the canonical public app/API origin signed by
+players. `WOODLAND_SERVER_WEB_ROOT` makes Axum serve the bundle on that same
+origin. `WOODLAND_SERVER_ORIGIN` is needed only to allow a separate static
+frontend such as GitHub Pages. Public origins must use HTTPS on mainnet.
 
 The optional `WOODLAND_ROLLOVER_SECRET` enables signed player delegation. The
 process must never receive the deployer child, maintenance child, either root
@@ -194,7 +200,8 @@ mnemonic, or a player key. Compromise of the rollover child can force or race
 exact-self-send renewals, but the covenant does not let it transfer or mutate
 player state.
 
-Terminate TLS in a reverse proxy in front of the loopback listener. Expose:
+Terminate TLS in a reverse proxy in front of the loopback listener. The same
+public origin serves `/`, static bundle files, and:
 
 ```text
 GET  /health.json
@@ -231,11 +238,11 @@ removing the entry from a backup copy, validating the JSON, atomically replacing
 the file, and restarting. Game-server failure must not be treated as gameplay
 downtime.
 
-## GitHub Pages
+## Separate GitHub Pages Option
 
-The public manifest contains no secrets. Commit it and set
-`WOODLAND_PAGES_MANIFEST` to its tracked path. For a deployed server, set
-`WOODLAND_SERVER_URL` to the same canonical origin as
-`WOODLAND_SERVER_PUBLIC_URL`; leaving it unset removes the social UI and API
-origin from the built CSP. Push `main`. The gated Pages workflow builds and
-deploys the static site only after CI and regtest pass.
+Same-origin Axum hosting is the default. To host only the static bundle on
+GitHub Pages instead, commit the public manifest, set `WOODLAND_PAGES_MANIFEST`
+to its path, and set `WOODLAND_SERVER_URL` to the canonical external Axum
+origin. Leaving it unset removes the social UI and API origin from the Pages
+artifact. Push `main`; the gated Pages workflow builds and deploys the static
+site only after CI and regtest pass.

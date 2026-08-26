@@ -52,19 +52,18 @@ custom arkd patch is part of the protocol.
 ```
 
 Both clean wrapper-owned containers and volumes, start Bitcoin/indexers/stock
-arkd/emulator, deploy a fresh schema 1 world, start the native Axum server,
-build the root-level Pages bundle, run browser and renewal stages, then stop the
-stack.
+arkd/emulator, deploy a fresh schema 1 world, build the web bundle, and serve the
+bundle plus `/v1/*` API from one native Axum origin. Browser and renewal stages
+then run before teardown.
 
 Smoke proves the complete path quickly. Full exercises deterministic depletion,
 regrowth, recovery, adversarial mutations, and four-player concurrency.
-Both resize the primary browser to 390×844 and require every sampled movement
-frame, including a world edge, to keep the player centered while the map moves.
+Both mobile and desktop viewport checks require every sampled movement frame,
+including a world edge, to keep the player centered while the map moves.
 
-The profiles exercise the same `dist/` layout deployed to GitHub Pages. The
-artifact contains a manifest-specific CSP including the configured game-server
-origin, `.nojekyll`, and an explicit 404. Gameplay still calls Arkade and the
-emulator directly.
+The same `dist/` layout can alternatively deploy to GitHub Pages. The artifact
+contains a manifest-specific CSP, `.nojekyll`, and an explicit 404. Gameplay
+still calls Arkade and the emulator directly.
 
 CI allows 120 two-second emulator readiness attempts. A timeout prints the
 container state and the final 200 log lines before teardown, so startup failures

@@ -120,6 +120,7 @@ async function main() {
             target: globalThis.__WOODLAND_E2E_CAMERA || null,
             trail: globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [],
             scrollLeft: viewport.scrollLeft,
+            clientWidth: viewport.clientWidth,
             clientHeight: viewport.clientHeight,
             playerCenterX: playerBounds.left + playerBounds.width / 2 - viewportBounds.left,
             playerCenterY: playerBounds.top + playerBounds.height / 2 - viewportBounds.top,
@@ -544,6 +545,9 @@ async function main() {
         && value.adjacentTree?.treeId === firstTree.treeId
         && value.player?.x === firstTree.x
         && value.player?.y === firstTree.y + 1
+        && value.camera?.clientWidth <= 720
+        && Math.abs(value.camera.playerCenterX - value.camera.viewportCenterX) < 2
+        && Math.abs(value.camera.playerCenterY - value.camera.viewportCenterY) < 2
         && value.map.includes('@')
         && value.map.includes('🌲'),
     );

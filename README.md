@@ -124,20 +124,21 @@ actually exists.
 
 ## Network Architecture
 
-The manifest pins the Arkade and emulator service URLs and signer keys. The
-browser calls both services directly. GitHub Pages serves only the static web
-bundle and manifest; it receives no deployer, maintenance, rollover, server, or
-player secrets. Tree maintenance and the optional Axum game server run as
-separate native processes.
+The manifest pins the Arkade and emulator service URLs and signer keys. Gameplay
+calls those services directly. The default deployment serves the static bundle,
+leaderboard, presence, chat, and delegation API from one Axum origin; the
+server receives no deployer, maintenance, or player secret.
 
 ```text
-browser ──direct──> Arkade service
-        ──direct──> Arkade emulator
-        ──static──> GitHub Pages: web bundle + manifest
-        ──optional──> Axum server: leaderboard, presence, chat, delegation
+browser ──same origin──> Axum server: static app + social API
+        ──direct───────> Arkade service
+        ──direct───────> Arkade emulator
 
 maintenance host ──> tree regrowth and tree rollover
 ```
+
+GitHub Pages remains an optional separate static origin. In that mode the
+browser still calls the external Axum origin configured at build time.
 
 `scripts/build-web.sh` generates a deploy-ready `dist/` directory with a
 manifest-specific CSP meta policy, `.nojekyll`, and an explicit `404.html`.
@@ -145,13 +146,14 @@ GitHub Pages cannot supply the stronger response headers a configurable CDN can;
 put a proxy in front later if COOP, frame, or Permissions Policy headers become
 release requirements.
 
-## Optional Game Server
+## Game Server
 
-A Pages build connects to `woodland-server` only when `WOODLAND_SERVER_URL` is
-configured. **Join server** creates a BIP340 consent signature bound to the exact
-world genesis, owner key, PLAYER_ID, and server origin. Every location, chat, and
-delegation update has a separate signed action, timestamp, and payload hash. The
-player key never leaves WASM.
+`woodland-server` serves `dist/` and every `/v1/*` route on one port when
+`WOODLAND_SERVER_WEB_ROOT` is configured. Build the bundle with
+`WOODLAND_SERVER_URL=self`; the browser then derives the API URL from
+`location.origin`. **Join server** creates a BIP340 consent signature bound to
+that exact origin. Every location, chat, and delegation update has a separate
+signed action, timestamp, and payload hash. The player key never leaves WASM.
 
 The server independently verifies:
 
@@ -188,37 +190,30 @@ Docker Compose, Firefox, and `geckodriver` for browser tests.
 ./scripts/run-web.sh
 ```
 
-Open `http://127.0.0.1:8000/`. Deposit the displayed 330 sats from any Arkade
-wallet, press **Refresh**, then **Create player**. Click an empty tile to walk.
-Click a tree to walk beside it and chop until a LOG drops.
+Open `http://127.0.0.1:8000/`. The app and social API use that same origin.
+Deposit the displayed 330 sats from any Arkade wallet, press **Refresh**, then
+**Create player**. Click an empty tile to walk or a tree to approach and chop.
 
-On screens up to 680 px wide, the map becomes a bounded camera viewport. The
-player stays fixed at its center on every movement step while the map scrolls
-underneath, including at world edges and after orientation changes.
+The map is always a bounded camera viewport. The player stays fixed at its
+center on every movement step while the map scrolls underneath, including at
+world edges and after orientation changes.
 
 Browser storage uses `woodland.sh:web:v1:*`. **New test wallet** clears the
 local key, profile (including PLAYER_ID), pending swing, position, and local
 server preference. It does not delete a durable server registration.
 
 For the public Mutinynet world, `run-mutinynet.sh` deploys or resumes the world,
-builds `dist/`, and runs the separate maintenance process:
+builds the same-origin bundle, and runs both maintenance and Axum:
 
 ```bash
 ./scripts/run-mutinynet.sh
 ```
 
-GitHub Pages deployment is automatic after a successful push to `main`. In the
-repository settings, select **GitHub Actions** as the Pages source. The workflow
-builds `mutinynet/woodland-world.json` by default. Set
-`WOODLAND_PAGES_MANIFEST` to another tracked manifest path and set
-`WOODLAND_SERVER_URL` to the canonical public API origin when enabling the
-optional game server.
-
-The Pages artifact is static: there are no server functions, bindings, or
-GitHub-held application secrets. Browser gameplay talks directly to
-`https://mutinynet.arkade.sh` and
-`https://emulator.mutinynet.arkade.sh`; only opted-in social and delegation
-updates use the separately hosted game server.
+GitHub Pages deployment is available as a separate-static-host alternative. Set
+`WOODLAND_PAGES_MANIFEST` to the tracked manifest and `WOODLAND_SERVER_URL` to
+the canonical external Axum origin. The Pages artifact contains no secrets;
+gameplay still talks directly to the manifest-pinned Arkade and emulator
+services.
 
 ## Verification
 
