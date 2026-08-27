@@ -128,6 +128,34 @@ function assertConverged(views, label) {
   assert.equal(treeXp + playerXp, 100, `${label}: XP supply changed`);
 }
 
+async function refreshUntilConverged(players, label) {
+  let attempts = 0;
+  const result = await waitFor(
+    `${label} convergence`,
+    async () => {
+      attempts += 1;
+      const views = await mapLimit(players, ACTIVATION_CONCURRENCY, async (player) => {
+        const refreshed = await player.refresh();
+        if (refreshed.error) throw new Error(refreshed.error);
+        return player.inspect();
+      });
+      try {
+        assertConverged(views, label);
+        return { views, converged: true, divergence: null };
+      } catch (error) {
+        return {
+          views,
+          converged: false,
+          divergence: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+    (value) => value.converged,
+    OPERATION_TIMEOUT_MS,
+  );
+  return { views: result.views, retries: attempts - 1 };
+}
+
 function percentile(values, ratio) {
   if (!values.length) return 0;
   const sorted = [...values].sort((left, right) => left - right);
@@ -155,6 +183,7 @@ const drivers = [];
 const players = [];
 const roundReports = [];
 let recoveredUnknownOutcomes = 0;
+let convergenceRetries = 0;
 const startedAt = Date.now();
 
 try {
@@ -287,12 +316,9 @@ try {
       `round ${round}: multiple clients reported an accepted swing: ${JSON.stringify(results)}`,
     );
     if (ROUND_DELAY_MS) await sleep(ROUND_DELAY_MS);
-    views = await mapLimit(players, ACTIVATION_CONCURRENCY, async (player) => {
-      const refreshed = await player.refresh();
-      assert.equal(refreshed.error, undefined, refreshed.error);
-      return player.inspect();
-    });
-    assertConverged(views, `round ${round}`);
+    const convergence = await refreshUntilConverged(players, `round ${round}`);
+    views = convergence.views;
+    convergenceRetries += convergence.retries;
     const afterTree = views[0].state.trees.find((tree) => tree.treeId === targetTreeId);
     assert.notEqual(afterTree.treeOutpoint, beforeTree.treeOutpoint, `round ${round}: tree did not rotate`);
     const changedPlayers = views
@@ -372,6 +398,7 @@ try {
     totalPlayerXp: views.reduce((total, view) => total + view.state.playerXp, 0),
     totalPlayerLogs: views.reduce((total, view) => total + view.state.playerLogs, 0),
     indexedAssetSupplies,
+    convergenceRetries,
     server: health,
     roundReports,
   };

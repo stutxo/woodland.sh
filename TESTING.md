@@ -167,8 +167,10 @@ Every round requires exactly one committed player/tree transition, converged
 tree state, no pending chops, conserved 100 LOG/XP across all players and trees,
 and indexed supplies of 10 TREE, 100 LOG, and 100 XP. The runner determines the
 winner from reconciled outpoints rather than a possibly ambiguous submission
-response. The JSON report records client-reported acceptances, recovered unknown
-outcomes, indexed supplies, and p50/p95 round latency under
+response. It polls for convergence because independent browser refreshes can
+straddle a legitimate maintenance regrowth. The JSON report records
+client-reported acceptances, recovered unknown outcomes, convergence retries,
+indexed supplies, and p50/p95 round latency under
 `regtest/_build/soak-report.json`.
 
 Load and remote-facing pressure are explicit:
