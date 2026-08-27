@@ -169,6 +169,7 @@ enum ChopMutation {
     PlayerMarkerMetadata,
     AssetControl,
     FundExtension,
+    SubmissionFailure,
 }
 
 impl ChopMutation {
@@ -584,6 +585,17 @@ impl WoodlandApp {
         self.rejected_chop_mutation_probe(tree_id, mutation)
             .await
             .map_err(js_err)
+    }
+
+    #[cfg(feature = "regtest-e2e")]
+    #[wasm_bindgen(js_name = testSubmissionRecovery)]
+    pub async fn test_submission_recovery(&mut self, tree_id: u32) -> Result<JsValue, JsValue> {
+        let success = self
+            .chop_inner_with_options(tree_id, ChopMutation::SubmissionFailure, None)
+            .await
+            .map_err(js_err)?;
+        self.last_attempt = Some(AttemptView { tree_id, success });
+        self.refresh().await
     }
 }
 
@@ -1022,10 +1034,24 @@ impl WoodlandApp {
         Ok(())
     }
 
-    async fn resume_pending_chop_inner(&mut self) -> Result<()> {
+    async fn resume_pending_chop_inner(&mut self) -> Result<bool> {
+        let pending_before_sync = self.pending_chop.clone();
         self.sync().await?;
         let Some(pending) = self.pending_chop.clone() else {
-            return Ok(());
+            let Some(previously_pending) = pending_before_sync else {
+                return Ok(false);
+            };
+            let expected_txid = previously_pending.txid()?;
+            let accepted = self
+                .player_state
+                .as_ref()
+                .is_some_and(|state| state.record.outpoint.txid == expected_txid)
+                && self
+                    .trees
+                    .iter()
+                    .find(|tree| tree.state.tree_id == previously_pending.tree_id)
+                    .is_some_and(|tree| tree.record.outpoint.txid == expected_txid);
+            return Ok(accepted);
         };
         let contract = self.player_contract()?;
         let (expected_ark, expected_checkpoints) = pending.decode_psbts()?;
@@ -1069,7 +1095,7 @@ impl WoodlandApp {
                 "pending chop {txid} was submitted but did not reconcile"
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn activate_inner(&mut self) -> Result<()> {
@@ -1599,7 +1625,11 @@ impl WoodlandApp {
         let expected_checkpoints = chop.checkpoint_txs.clone();
         let chop_tx = expected_ark.unsigned_tx.clone();
         let chop_txid = chop_tx.compute_txid();
-        if matches!(mutation, ChopMutation::None) {
+        let recoverable_submission = matches!(
+            mutation,
+            ChopMutation::None | ChopMutation::SubmissionFailure
+        );
+        if recoverable_submission {
             self.persist_pending_chop(PendingChop::new(
                 tree_id,
                 success,
@@ -1609,11 +1639,44 @@ impl WoodlandApp {
                 &expected_checkpoints,
             ))?;
         }
-        let (returned_ark, returned_checkpoints) = self
-            .emulator
-            .submit_tx(&expected_ark, &expected_checkpoints)
-            .await
-            .context("submit chop to emulator")?;
+        let submission = if matches!(mutation, ChopMutation::SubmissionFailure) {
+            Err(anyhow!("simulated emulator internal error"))
+        } else {
+            self.emulator
+                .submit_tx(&expected_ark, &expected_checkpoints)
+                .await
+                .context("submit chop to emulator")
+        };
+        let (returned_ark, returned_checkpoints) = match submission {
+            Ok(response) => response,
+            Err(submission_error) => {
+                let definitive_rejection = submission_error.chain().any(|failure| {
+                    failure
+                        .downcast_ref::<crate::arkade::HttpFailure>()
+                        .and_then(crate::arkade::HttpFailure::status_code)
+                        .is_some_and(|status| {
+                            (400..500).contains(&status) && ![408, 409, 425, 429].contains(&status)
+                        })
+                });
+                if recoverable_submission && definitive_rejection {
+                    self.clear_pending_chop()?;
+                }
+                if recoverable_submission && !definitive_rejection {
+                    let submission_detail = format!("{submission_error:#}");
+                    sleep_ms(500).await;
+                    return match self.resume_pending_chop_inner().await {
+                        Ok(true) => Ok(success),
+                        Ok(false) => Err(anyhow!(
+                            "chop conflicted while recovering from submission failure: {submission_detail}"
+                        )),
+                        Err(recovery_error) => Err(recovery_error.context(format!(
+                            "recover exact pending chop after submission failure: {submission_detail}"
+                        ))),
+                    };
+                }
+                return Err(submission_error);
+            }
+        };
         player::verify_player_chop_response(
             &self.keys,
             &state.contract,

@@ -140,12 +140,16 @@ watchtower leaf's signer closure and exact intent construction.
 ## Multiplayer
 
 Smoke starts two browser wallets; full starts four. Each receives 330 sats,
-issues a distinct PLAYER_ID, activates independently, rejects forged server
-consent and location, signs its own opt-in, exchanges authenticated presence and
-chat, and appears with independently verified XP/LOG state. Regtest also forces
-one signed delegated renewal and verifies revocation. Players then chop disjoint
-trees concurrently; a same-tree race must produce one winning state transition.
-There is no shared activation reserve or finite ticket supply.
+issues a distinct PLAYER_ID, activates, automatically registers, rejects forged
+registration and location, exchanges authenticated presence and chat, and
+appears with independently verified XP/LOG state. Regtest also forces one signed
+delegated renewal and verifies revocation. Players then chop disjoint trees
+concurrently; a same-tree race must produce one winning state transition. There
+is no shared activation reserve or finite ticket supply.
+
+The multiplayer stage injects one emulator submission failure after journaling,
+then requires exact-PSBT recovery, rotated state/tree outpoints, and no remaining
+pending chop.
 
 ## Known Gaps
 

@@ -74,8 +74,8 @@ PLAYER_ID, or outpoint.
 Tree renewal and regrowth contend per tree. The maintenance watcher can process
 independent trees concurrently with a fixed concurrency bound.
 Delegated player renewals are exact per-player self-sends. The server processes
-due opt-ins sequentially, so they share batch/service capacity but no gameplay
-input.
+due delegations sequentially, so they share batch/service capacity but no
+gameplay input.
 
 ## Indexing
 
@@ -86,9 +86,9 @@ Tree discovery remains one shared-script query followed by packet-based lineage
 selection for ten declared trees.
 
 The optional game server is deliberately outside this state machine. Its
-registry is capped at 10,000 signed opt-ins. Verification is staggered in
-256-player batches with bounded concurrency; delegated players and signed
-actions are verified on demand instead of waiting for their batch.
+registry is capped at 10,000 automatically registered players. Verification is
+staggered in 256-player batches; delegated players and signed actions are
+verified on demand instead of waiting for their batch.
 
 Presence uses a 32×32 spatial chunk index. Clients query only their Canvas
 viewport plus a small margin, with a 2,000-player response cap. Canvas rendering
@@ -96,10 +96,10 @@ touches visible tiles and nearby clusters rather than allocating one DOM node
 per world tile or player. Chat is bounded to 200 in-memory messages, and the
 leaderboard is paginated to at most 200 rows per request.
 
-BIP340 consent prevents third parties from opting in another owner or forging
-their location, chat, or delegation payload. It does not rate-limit arbitrary
-HTTP clients or make owners unique humans; the public deployment still needs
-reverse-proxy request limits.
+BIP340 signatures prevent third parties from registering another owner or
+forging their location, chat, or delegation payload. They do not rate-limit
+arbitrary HTTP clients or make owners unique humans; the public deployment still
+needs reverse-proxy request limits.
 
 ## Failure Domains
 

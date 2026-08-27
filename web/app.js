@@ -10,7 +10,6 @@ const KEY = `woodland.sh:web:v1:key:${STORAGE_SCOPE}`;
 const PROFILE = `woodland.sh:web:v1:profile:${STORAGE_SCOPE}`;
 let pendingStorageKey = `woodland.sh:web:v1:pending:${STORAGE_SCOPE}`;
 const POSITION = `woodland.sh:web:v1:position:${STORAGE_SCOPE}`;
-const SERVER_REGISTRATION = `woodland.sh:web:v1:server:${STORAGE_SCOPE}:${SERVER_URL}`;
 
 const element = (id) => document.getElementById(id);
 const address = element('address');
@@ -54,7 +53,6 @@ const details = element('details');
 const leaderboardPanel = element('leaderboard-panel');
 const leaderboardRows = element('leaderboard-rows');
 const leaderboardStatus = element('leaderboard-status');
-const joinLeaderboardButton = element('join-leaderboard');
 const delegateRenewalButton = element('delegate-renewal');
 const chatForm = element('chat-form');
 const chatInput = element('chat-input');
@@ -64,9 +62,9 @@ const chatStatus = element('chat-status');
 
 const DEFAULT_MAP_WIDTH = 45;
 const DEFAULT_MAP_HEIGHT = 19;
-const WALK_STEP_MS = 110;
-const CHOP_SWING_MS = 900;
+const WALK_STEP_MS = 45;
 const CHOP_FLASH_MS = 340;
+const CHOP_FEEDBACK_MS = 450;
 const LOG_FLASH_MS = 800;
 const DIRECTIONS = [[0, -1], [-1, 0], [1, 0], [0, 1]];
 const TREE_GLYPH = '🌲';
@@ -94,7 +92,7 @@ let focusedTreeId = null;
 let leaderboardTotal = 0;
 let appQueue = Promise.resolve();
 let leaderboardPlayers = [];
-let leaderboardJoined = false;
+let serverRegistered = false;
 let delegatedPlayerAssets = [];
 let presenceTruncated = false;
 let serverRegistrationSyncing = false;
@@ -110,6 +108,7 @@ let lastPublishedLocation = null;
 let lastRenderedChatId = null;
 let mapFrame = null;
 
+let pendingRetryAfter = 0;
 function withApp(action) {
   const operation = appQueue.then(action, action);
   appQueue = operation.catch(() => {});
@@ -127,17 +126,6 @@ function setBusy(value, message = '') {
   render();
 }
 
-function restoreServerRegistration() {
-  leaderboardJoined = false;
-  if (!SERVER_URL || !state?.genesisTxid || !state.playerAsset) return;
-  try {
-    const registration = JSON.parse(localStorage.getItem(SERVER_REGISTRATION) || 'null');
-    leaderboardJoined = registration?.genesisTxid === state.genesisTxid
-      && registration?.playerAsset === state.playerAsset;
-  } catch {
-    localStorage.removeItem(SERVER_REGISTRATION);
-  }
-}
 
 function renderLeaderboard() {
   if (!SERVER_URL) return;
@@ -173,8 +161,10 @@ function renderLeaderboard() {
 
 function renderChat() {
   chatMessagesElement.replaceChildren();
-  if (!leaderboardJoined) {
-    chatMessagesElement.textContent = 'Join the server to chat.';
+  if (!serverRegistered) {
+    chatMessagesElement.textContent = state?.playerActive
+      ? 'Registering player with server...'
+      : 'Create a player to use chat.';
     return;
   }
   if (!chatMessages.length) {
@@ -308,7 +298,6 @@ async function refreshLeaderboard() {
 async function syncServerRegistration(force = false) {
   if (
     !SERVER_URL
-    || !leaderboardJoined
     || !state?.playerActive
     || !state.playerAsset
     || serverRegistrationSyncing
@@ -329,12 +318,9 @@ async function syncServerRegistration(force = false) {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error || `registration returned ${response.status}`);
     serverRegistrationOutpoint = state.playerStateOutpoint;
-    localStorage.setItem(SERVER_REGISTRATION, JSON.stringify({
-      genesisTxid: state.genesisTxid,
-      playerAsset: state.playerAsset,
-    }));
-    await Promise.all([refreshLeaderboard(), refreshPresence(), refreshChat()]);
-    await publishLocation(true);
+    serverRegistered = true;
+    void Promise.all([refreshLeaderboard(), refreshPresence(), refreshChat()]);
+    void publishLocation(true);
     serverRegistrationRetryAfter = 0;
   } finally {
     serverRegistrationSyncing = false;
@@ -355,7 +341,7 @@ async function postServerAction(path, body) {
 }
 
 async function publishLocation(force = false) {
-  if (!SERVER_URL || !leaderboardJoined || !state?.playerActive || locationPosting) return;
+  if (!SERVER_URL || !serverRegistered || !state?.playerActive || locationPosting) return;
   const location = `${player.x}:${player.y}`;
   if (!force && location === lastPublishedLocation) return;
   locationPosting = true;
@@ -373,7 +359,7 @@ async function publishLocation(force = false) {
 }
 
 async function submitChat(message) {
-  if (!SERVER_URL || !leaderboardJoined || !state?.playerActive || socialPosting) return;
+  if (!SERVER_URL || !serverRegistered || !state?.playerActive || socialPosting) return;
   socialPosting = true;
   render();
   try {
@@ -393,7 +379,7 @@ async function submitChat(message) {
 async function updateDelegation() {
   if (
     !SERVER_URL
-    || !leaderboardJoined
+    || !serverRegistered
     || !state?.playerActive
     || !delegationAvailable
     || socialPosting
@@ -485,6 +471,7 @@ async function walkTo(targets, treeId = null) {
     status.textContent = 'That tile is unreachable.';
     return false;
   }
+  const startedAt = performance.now();
   const generation = ++walkGeneration;
   walking = true;
   walkingTarget = targets[0] || null;
@@ -503,6 +490,10 @@ async function walkTo(targets, treeId = null) {
   walkingTarget = null;
   walkingTargetTreeId = null;
   render();
+  globalThis.__WOODLAND_E2E_LAST_WALK = {
+    steps: path.length,
+    durationMs: Math.round(performance.now() - startedAt),
+  };
   void publishLocation();
   return true;
 }
@@ -859,14 +850,12 @@ function render() {
   bagPanel.hidden = !playerActive;
   statsPanel.hidden = !playerActive;
   leaderboardPanel.hidden = !SERVER_URL;
-  joinLeaderboardButton.hidden = !playerActive || leaderboardJoined;
-  joinLeaderboardButton.disabled = busy || serverRegistrationSyncing || socialPosting;
-  delegateRenewalButton.hidden = !playerActive || !leaderboardJoined || !delegationAvailable;
+  delegateRenewalButton.hidden = !playerActive || !serverRegistered || !delegationAvailable;
   delegateRenewalButton.disabled = busy || socialPosting;
   delegateRenewalButton.textContent = delegatedRenewal
     ? 'Stop delegated renewals'
     : 'Delegate renewals';
-  chatInput.disabled = !playerActive || !leaderboardJoined || socialPosting;
+  chatInput.disabled = !playerActive || !serverRegistered || socialPosting;
   sendChatButton.disabled = chatInput.disabled || !chatInput.value.trim();
   renderLeaderboard();
   renderChat();
@@ -956,6 +945,7 @@ function render() {
     element('last-chop').textContent = tree.lastAttemptTxid || 'none';
   }
   globalThis.__WOODLAND_E2E_STATE = state;
+  globalThis.__WOODLAND_E2E_SERVER_REGISTERED = serverRegistered;
 }
 
 async function run(label, action, completion = () => 'Success') {
@@ -1049,13 +1039,6 @@ activateButton.addEventListener('click', () => (
   run('Issuing PLAYER_ID into owner-authorized player state...', activatePlayer)
 ));
 
-async function waitForSwingCadence(startedAt) {
-  let remaining = CHOP_SWING_MS - (performance.now() - startedAt);
-  while (remaining > 0 && !stopChopping) {
-    await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
-    remaining = CHOP_SWING_MS - (performance.now() - startedAt);
-  }
-}
 
 async function chopUntilLog(treeId) {
   let swings = 0;
@@ -1069,15 +1052,24 @@ async function chopUntilLog(treeId) {
       const tree = worldTrees().find((candidate) => candidate.treeId === treeId);
       if (!tree || tree.health === 0) break;
       flashTree(treeId, 'chop', CHOP_FLASH_MS);
-      const startedAt = performance.now();
-      status.textContent = `Swinging at tree #${treeId} (${swings + 1})...`;
-      const nextState = await app.chopExpected(
-        treeId,
-        tree.treeOutpoint,
-        state.playerStateOutpoint,
-        tree.nextDrop,
-      );
-      await waitForSwingCadence(startedAt);
+      const submittedAt = performance.now();
+      status.textContent = `Submitting swing ${swings + 1} at tree #${treeId}...`;
+      const feedbackTimer = setInterval(() => {
+        flashTree(treeId, 'chop', CHOP_FLASH_MS);
+        const seconds = Math.max(1, Math.round((performance.now() - submittedAt) / 1000));
+        status.textContent = `Swing ${swings + 1} pending (${seconds}s)...`;
+      }, CHOP_FEEDBACK_MS);
+      let nextState;
+      try {
+        nextState = await app.chopExpected(
+          treeId,
+          tree.treeOutpoint,
+          state.playerStateOutpoint,
+          tree.nextDrop,
+        );
+      } finally {
+        clearInterval(feedbackTimer);
+      }
       state = nextState;
       swings += 1;
       success = state.lastAttempt?.success === true;
@@ -1136,21 +1128,6 @@ function attemptChop() {
 
 copyAddressButton.addEventListener('click', () => { void copyAddress(); });
 
-joinLeaderboardButton.addEventListener('click', async () => {
-  if (!state?.playerActive || !SERVER_URL || serverRegistrationSyncing) return;
-  leaderboardJoined = true;
-  joinLeaderboardButton.disabled = true;
-  leaderboardStatus.textContent = 'Verifying player state...';
-  try {
-    await syncServerRegistration(true);
-    render();
-  } catch (error) {
-    leaderboardJoined = false;
-    localStorage.removeItem(SERVER_REGISTRATION);
-    leaderboardStatus.textContent = `Server registration failed: ${error}`;
-    render();
-  }
-});
 
 delegateRenewalButton.addEventListener('click', () => { void updateDelegation(); });
 chatInput.addEventListener('input', () => {
@@ -1179,7 +1156,6 @@ resetButton.addEventListener('click', () => {
   localStorage.removeItem(PROFILE);
   localStorage.removeItem(pendingStorageKey);
   localStorage.removeItem(POSITION);
-  localStorage.removeItem(SERVER_REGISTRATION);
   location.reload();
 });
 
@@ -1191,7 +1167,6 @@ resetProfileButton.addEventListener('click', () => {
   ) return;
   localStorage.removeItem(PROFILE);
   localStorage.removeItem(POSITION);
-  localStorage.removeItem(SERVER_REGISTRATION);
   location.reload();
 });
 
@@ -1236,13 +1211,12 @@ async function boot() {
     }
     if (!state.pendingChopTxid) status.textContent = 'Ready';
     appendLog('Connected to woodland.sh');
-    restoreServerRegistration();
-    await Promise.all([refreshLeaderboard(), refreshPresence(), refreshChat()]);
-    if (leaderboardJoined) {
-      await syncServerRegistration(true).catch((error) => {
-        leaderboardStatus.textContent = `Server registration failed: ${error}`;
-      });
-    }
+    globalThis.__WOODLAND_E2E_READY = true;
+    globalThis.__WOODLAND_E2E_SUBMISSION_RECOVERY = async (treeId) => {
+      state = await withApp(() => app.testSubmissionRecovery(treeId));
+      render();
+      return state;
+    };
     globalThis.__WOODLAND_E2E_APP = app;
     globalThis.__WOODLAND_E2E_SERVER_REGISTRATION = () => (
       withApp(() => app.serverRegistration(SERVER_URL))
@@ -1303,7 +1277,12 @@ async function boot() {
       render();
       return state;
     };
-    globalThis.__WOODLAND_E2E_READY = true;
+    void Promise.all([refreshLeaderboard(), refreshPresence(), refreshChat()]);
+    if (state.playerActive) {
+      void syncServerRegistration(true).catch((error) => {
+        leaderboardStatus.textContent = `Server registration failed: ${error}`;
+      });
+    }
   } finally {
     busy = false;
     render();
@@ -1330,7 +1309,16 @@ setInterval(async () => {
   if (!app || busy || polling) return;
   polling = true;
   try {
-    state = await withApp(() => app.refresh());
+    const resumePending = Boolean(state?.pendingChopTxid)
+      && Date.now() >= pendingRetryAfter;
+    if (resumePending) pendingRetryAfter = Date.now() + 5_000;
+    state = await withApp(() => (
+      resumePending ? app.resumePendingChop() : app.refresh()
+    ));
+    if (resumePending && !state.pendingChopTxid) {
+      pendingRetryAfter = 0;
+      status.textContent = 'Pending swing recovered.';
+    }
     if (
       state.playerActive
       && !state.pendingChopTxid

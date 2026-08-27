@@ -151,9 +151,10 @@ release requirements.
 `woodland-server` serves `dist/` and every `/v1/*` route on one port when
 `WOODLAND_SERVER_WEB_ROOT` is configured. Build the bundle with
 `WOODLAND_SERVER_URL=self`; the browser then derives the API URL from
-`location.origin`. **Join server** creates a BIP340 consent signature bound to
-that exact origin. Every location, chat, and delegation update has a separate
-signed action, timestamp, and payload hash. The player key never leaves WASM.
+`location.origin`. After activation, it automatically registers the PLAYER_ID
+with a BIP340 signature bound to that exact origin. Every location, chat, and
+delegation update has a separate signed action, timestamp, and payload hash. The
+player key never leaves WASM.
 
 The server independently verifies:
 
@@ -174,12 +175,12 @@ the covenant's exact-self-send watchtower leaf. That key cannot transfer or
 alter player state. If the server becomes unreachable, an online browser falls
 back to its owner-authorized renewal path.
 
-Registration and delegation choices persist; presence and chat do not survive a
-server restart. Registration has no self-service deletion endpoint, so clearing
-browser storage does not remove the server record. Aggregation adds linkability
-and the server or reverse proxy may log IP addresses. It provides neither
-unique-human nor Sybil guarantees. Gameplay remains on the direct Arkade path
-when the server is unavailable.
+Registration persists; presence and chat do not survive a server restart.
+Registration has no self-service deletion endpoint, so clearing browser storage
+does not remove the server record. Aggregation adds linkability and the server
+or reverse proxy may log IP addresses. It provides neither unique-human nor
+Sybil guarantees. Gameplay remains on the direct Arkade path when the server is
+unavailable.
 
 ## Run Locally
 
@@ -202,8 +203,8 @@ while the canvas camera moves underneath. Player details and social UI are
 collapsible, with level, XP, LOG, and online count kept in the map HUD.
 
 Browser storage uses `woodland.sh:web:v1:*`. **New test wallet** clears the
-local key, profile (including PLAYER_ID), pending swing, position, and local
-server preference. It does not delete a durable server registration.
+local key, profile (including PLAYER_ID), pending swing, and position. It does
+not delete a durable server registration.
 
 For the public Mutinynet world, `run-mutinynet.sh` deploys or resumes the world,
 builds the same-origin bundle, and runs both maintenance and Axum:

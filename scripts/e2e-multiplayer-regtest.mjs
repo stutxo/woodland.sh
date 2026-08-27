@@ -63,7 +63,7 @@ async function createPlayer(driverUrl, label, sessions) {
       log: document.getElementById('log')?.textContent || '',
       leaderboard: globalThis.__WOODLAND_E2E_LEADERBOARD || [],
       leaderboardStatus: document.getElementById('leaderboard-status')?.textContent || '',
-      joinLeaderboardHidden: document.getElementById('join-leaderboard')?.hidden ?? true,
+      serverRegistered: Boolean(globalThis.__WOODLAND_E2E_SERVER_REGISTERED),
       social: globalThis.__WOODLAND_E2E_SOCIAL || null,
       mapFrame: globalThis.__WOODLAND_E2E_MAP_FRAME || null,
       remotePlayers: globalThis.__WOODLAND_E2E_MAP_FRAME?.remotePlayerCount || 0,
@@ -184,6 +184,24 @@ async function assertLeaderboardMatches(views, label) {
   );
   assert.ok(payload.players.length >= expected.size, `${label}: missing verified players`);
   return payload;
+}
+
+async function assertSubmissionRecovery(player, view, treeId) {
+  const beforeTree = view.state.trees.find((tree) => tree.treeId === treeId);
+  const result = await player.executeAsync(`
+    const done = arguments[arguments.length - 1];
+    globalThis.__WOODLAND_E2E_SUBMISSION_RECOVERY(arguments[0])
+      .then((state) => done({ state }))
+      .catch((error) => done({ error: String(error) }));
+  `, [treeId]);
+  assert.equal(result.error, undefined, result.error);
+  assert.equal(result.state.pendingChopTxid ?? null, null);
+  assert.notEqual(result.state.playerStateOutpoint, view.state.playerStateOutpoint);
+  assert.notEqual(
+    result.state.trees.find((tree) => tree.treeId === treeId).treeOutpoint,
+    beforeTree.treeOutpoint,
+  );
+  return result.state;
 }
 
 async function main() {
@@ -324,11 +342,10 @@ async function main() {
     });
     assert.equal(forgedResponse.status, 400, 'forged server consent was accepted');
 
-    await Promise.all(players.map((player) => player.click('join-leaderboard')));
     const joined = await Promise.all(players.map((player) => waitFor(
-      `server opt-in (${player.label})`,
+      `automatic server registration (${player.label})`,
       player.inspect,
-      (value) => value.joinLeaderboardHidden
+      (value) => value.serverRegistered
         && value.leaderboard.length >= PLAYER_COUNT
         && value.leaderboardStatus.includes('verified'),
       180_000,
@@ -394,17 +411,17 @@ async function main() {
 
     await Promise.all(players.map((player) => player.wd('POST', '/refresh', {})));
     const restoredOptIns = await Promise.all(players.map((player, index) => waitFor(
-      `world-scoped leaderboard opt-in reload (${player.label})`,
+      `automatic server registration reload (${player.label})`,
       player.inspect,
       (value) => value.ready
         && !value.busy
         && value.state?.playerAsset === playerAssets[index]
-        && value.joinLeaderboardHidden
+        && value.serverRegistered
         && value.leaderboard.some((entry) => entry.playerAsset === playerAssets[index])
         && (index !== 0 || value.delegateText.startsWith('Stop delegated')),
       180_000,
     )));
-    assert.ok(restoredOptIns.every((view) => view.joinLeaderboardHidden));
+    assert.ok(restoredOptIns.every((view) => view.serverRegistered));
     await players[0].click('delegate-renewal');
     await waitFor(
       'delegated renewal revocation',
@@ -577,6 +594,7 @@ async function main() {
         assert.ok(tree.lastAttemptTxid);
       }
       await assertLeaderboardMatches(chopped, 'verified smoke leaderboard');
+      await assertSubmissionRecovery(players[0], chopped[0], selectedTrees[0].treeId);
       console.log(JSON.stringify({
         profile: E2E_PROFILE,
         players: chopped.map((view, index) => ({
@@ -681,6 +699,7 @@ async function main() {
     assertTreeValue(sharedAfterChops, 'post-chop state');
 
     await assertLeaderboardMatches(chopped, 'verified XP leaderboard');
+    await assertSubmissionRecovery(players[0], chopped[0], selectedTrees[0].treeId);
     console.log(JSON.stringify({
       profile: E2E_PROFILE,
       players: chopped.map((view, index) => ({

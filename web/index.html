@@ -193,7 +193,6 @@
       </summary>
       <div class="server-actions">
         <button id="delegate-renewal" type="button" hidden>Delegate renewals</button>
-        <button id="join-leaderboard" type="button" hidden>Join server</button>
       </div>
       <div class="leaderboard-scroll">
         <table>
@@ -201,11 +200,11 @@
           <tbody id="leaderboard-rows"><tr><td colspan="5">No verified players yet.</td></tr></tbody>
         </table>
       </div>
-      <p class="leaderboard-note">Joining signs durable consent to publish your public player identity, verified inventory, claimed map location, and chat. Location is social state, not covenant-enforced movement. Renewal delegation is a separate signed choice.</p>
+      <p class="leaderboard-note">Creating a player automatically registers its public identity and verified inventory with this server. Claimed map location and chat are signed social state, not covenant-enforced movement. Renewal delegation remains a separate signed choice.</p>
       <div class="chat">
         <h3>Chat</h3>
         <div id="chat-status" class="muted"></div>
-        <div id="chat-messages" class="chat-messages" aria-live="polite">Join the server to chat.</div>
+        <div id="chat-messages" class="chat-messages" aria-live="polite">Create a player to use chat.</div>
         <form id="chat-form" class="chat-compose">
           <input id="chat-input" maxlength="280" autocomplete="off" placeholder="Message the woodland" aria-label="Chat message" disabled>
           <button id="send-chat" type="submit" disabled>Send</button>

@@ -5,8 +5,9 @@
 A player is one owner-specific recursive VTXO. It holds 330 sats, exactly one
 self-issued PLAYER_ID, immutable identity and position packets, numeric XP,
 harvested LOG, and earned XP. There is no carrier, PLAYER_TICKET, allocator,
-protocol registry, or player cap. A separately hosted opt-in game server can
-index public state, presence, and chat, but has no role in gameplay authorization.
+protocol registry, or player cap. When configured, the game server automatically
+indexes newly activated PLAYER_ID state, presence, and chat, but has no role in
+gameplay authorization.
 
 ```text
 player state: D sats + 1 PLAYER_ID + identity + position + numeric XP packet

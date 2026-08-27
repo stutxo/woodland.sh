@@ -165,9 +165,11 @@ and drop bit. Reject locally if any changed after refresh.
 ## Unknown Outcomes
 
 Persist the exact Ark PSBT, checkpoint PSBTs, selected state/tree outpoints,
-expected txid, and drop bit before emulator submission. A transport error after
-submission is unknown, not rejected. Query the expected state and tree outputs;
-resume the exact PSBT only when they are absent and both inputs remain current.
+expected txid, and drop bit before emulator submission. A transport failure,
+malformed success response, or HTTP 5xx after submission is unknown, not
+rejected. Query the expected outputs first; when they are absent and both inputs
+remain current, retry only the exact persisted PSBT. The reference client does
+this once immediately and then on a five-second background cadence.
 
 The reference key is `woodland.sh:web:v1:pending:<arkade-url>`.
 
