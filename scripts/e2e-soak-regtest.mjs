@@ -141,6 +141,7 @@ const driverConfigs = Array.from({ length: PLAYER_COUNT }, (_, index) => ({
 const drivers = [];
 const players = [];
 const roundReports = [];
+let recoveredUnknownOutcomes = 0;
 const startedAt = Date.now();
 
 try {
@@ -265,10 +266,13 @@ try {
       );
       return player.race(views[index].state, playerTree);
     });
-    const accepted = results
+    const reportedAccepted = results
       .map((result, index) => ({ result, index }))
       .filter(({ result }) => result.ok);
-    assert.equal(accepted.length, 1, `round ${round}: expected exactly one accepted swing`);
+    assert.ok(
+      reportedAccepted.length <= 1,
+      `round ${round}: multiple clients reported an accepted swing: ${JSON.stringify(results)}`,
+    );
     if (ROUND_DELAY_MS) await sleep(ROUND_DELAY_MS);
     views = await mapLimit(players, ACTIVATION_CONCURRENCY, async (player) => {
       const refreshed = await player.refresh();
@@ -278,21 +282,46 @@ try {
     assertConverged(views, `round ${round}`);
     const afterTree = views[0].state.trees.find((tree) => tree.treeId === targetTreeId);
     assert.notEqual(afterTree.treeOutpoint, beforeTree.treeOutpoint, `round ${round}: tree did not rotate`);
-    const changedPlayers = views.filter(
-      (view, index) => view.state.playerStateOutpoint !== beforePlayerOutpoints[index],
-    );
+    const changedPlayers = views
+      .map((view, index) => ({ view, index }))
+      .filter(
+        ({ view, index }) => view.state.playerStateOutpoint !== beforePlayerOutpoints[index],
+      );
     assert.equal(changedPlayers.length, 1, `round ${round}: player transition count`);
+    const winner = changedPlayers[0].index;
+    assert.equal(
+      changedPlayers[0].view.state.playerStateOutpoint.split(':')[0],
+      afterTree.treeOutpoint.split(':')[0],
+      `round ${round}: player and tree transitions have different transactions`,
+    );
+    if (reportedAccepted.length === 1) {
+      assert.equal(
+        reportedAccepted[0].index,
+        winner,
+        `round ${round}: reported winner differs from committed winner`,
+      );
+    } else {
+      recoveredUnknownOutcomes += 1;
+      console.warn(
+        `soak round ${round}: player ${winner + 1} committed despite a client error: `
+          + `${results[winner].message || 'unknown error'}`,
+      );
+    }
     roundReports.push({
       round,
       treeId: targetTreeId,
-      winner: accepted[0].index,
+      winner,
+      reportedAccepted: reportedAccepted.length === 1,
+      recoveryMessage: reportedAccepted.length === 0
+        ? results[winner].message || 'unknown error'
+        : null,
       drop: afterTree.health < beforeTree.health,
       conflicts: PLAYER_COUNT - 1,
       durationMs: Date.now() - roundStartedAt,
     });
     if (round % 10 === 0 || round === ROUNDS) {
       console.log(
-        `soak round ${round}/${ROUNDS}: tree ${targetTreeId}, winner ${accepted[0].index + 1}, `
+        `soak round ${round}/${ROUNDS}: tree ${targetTreeId}, winner ${winner + 1}, `
           + `${roundReports.at(-1).durationMs}ms`,
       );
     }
@@ -316,6 +345,8 @@ try {
     acceptedSwings: ROUNDS,
     conflictedSwings: ROUNDS * (PLAYER_COUNT - 1),
     drops: roundReports.filter((round) => round.drop).length,
+    reportedAcceptedSwings: ROUNDS - recoveredUnknownOutcomes,
+    recoveredUnknownOutcomes,
     totalPlayerXp: views.reduce((total, view) => total + view.state.playerXp, 0),
     totalPlayerLogs: views.reduce((total, view) => total + view.state.playerLogs, 0),
     server: health,

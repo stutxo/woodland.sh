@@ -162,10 +162,12 @@ races every player against the same tree outpoint for 30 rounds:
 ./scripts/test-regtest.sh soak
 ```
 
-Every round requires exactly one accepted swing, converged tree state, no
-pending chops, and conserved 100 LOG/XP across all players and trees. A JSON
-report including p50/p95 round latency is written to
-`regtest/_build/soak-report.json`.
+Every round requires exactly one committed player/tree transition, converged
+tree state, no pending chops, and conserved 100 LOG/XP across all players and
+trees. The runner determines the winner from reconciled outpoints rather than a
+possibly ambiguous submission response. The JSON report records both
+client-reported acceptances and recovered unknown outcomes, plus p50/p95 round
+latency, under `regtest/_build/soak-report.json`.
 
 Load and remote-facing pressure are explicit:
 
