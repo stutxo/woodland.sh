@@ -256,6 +256,13 @@ Eight-hour alternating full/soak runner with per-cycle artifacts:
 ./scripts/test-overnight.sh
 ```
 
+Four-hour 24-player burst, multi-tree fanout, browser-reload, regrowth, and full
+adversarial matrix:
+
+```bash
+./scripts/test-aggressive.sh
+```
+
 The stack builds unmodified arkd commit
 `c7c3184f5cd416e231023f717489a5b0550960cc` and uses the pinned Arkade Script
 emulator image.

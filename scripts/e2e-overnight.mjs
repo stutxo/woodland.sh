@@ -36,12 +36,70 @@ const MEMPOOL_WEB_PORT = integerSetting(
   1_024,
   65_535,
 );
+const PROFILE_CONFIGS = Object.freeze({
+  full: { runner: 'full', environment: {} },
+  soak: { runner: 'soak', environment: {} },
+  burst: {
+    runner: 'soak',
+    environment: {
+      WOODLAND_SOAK_PLAYERS: '24',
+      WOODLAND_SOAK_ROUNDS: '100',
+      WOODLAND_SOAK_ACTIVATION_CONCURRENCY: '8',
+      WOODLAND_SOAK_RACE_CONCURRENCY: '24',
+      WOODLAND_SOAK_ROUND_DELAY_MS: '0',
+      WOODLAND_SOAK_TREES_PER_ROUND: '1',
+      WOODLAND_SOAK_RELOAD_EVERY: '25',
+      WOODLAND_SOAK_RELOAD_COUNT: '6',
+    },
+  },
+  fanout: {
+    runner: 'soak',
+    environment: {
+      WOODLAND_SOAK_PLAYERS: '24',
+      WOODLAND_SOAK_ROUNDS: '80',
+      WOODLAND_SOAK_ACTIVATION_CONCURRENCY: '8',
+      WOODLAND_SOAK_RACE_CONCURRENCY: '24',
+      WOODLAND_SOAK_ROUND_DELAY_MS: '100',
+      WOODLAND_SOAK_TREES_PER_ROUND: '4',
+      WOODLAND_SOAK_RELOAD_EVERY: '20',
+      WOODLAND_SOAK_RELOAD_COUNT: '6',
+    },
+  },
+  reload: {
+    runner: 'soak',
+    environment: {
+      WOODLAND_SOAK_PLAYERS: '12',
+      WOODLAND_SOAK_ROUNDS: '100',
+      WOODLAND_SOAK_ACTIVATION_CONCURRENCY: '4',
+      WOODLAND_SOAK_RACE_CONCURRENCY: '8',
+      WOODLAND_SOAK_ROUND_DELAY_MS: '500',
+      WOODLAND_SOAK_TREES_PER_ROUND: '2',
+      WOODLAND_SOAK_RELOAD_EVERY: '20',
+      WOODLAND_SOAK_RELOAD_COUNT: '12',
+    },
+  },
+  regrowth: {
+    runner: 'soak',
+    environment: {
+      WOODLAND_SOAK_PLAYERS: '12',
+      WOODLAND_SOAK_ROUNDS: '120',
+      WOODLAND_SOAK_ACTIVATION_CONCURRENCY: '3',
+      WOODLAND_SOAK_RACE_CONCURRENCY: '4',
+      WOODLAND_SOAK_ROUND_DELAY_MS: '1000',
+      WOODLAND_SOAK_TREES_PER_ROUND: '1',
+      WOODLAND_SOAK_RELOAD_EVERY: '20',
+      WOODLAND_SOAK_RELOAD_COUNT: '4',
+    },
+  },
+});
 const PLAN = (process.env.WOODLAND_OVERNIGHT_PLAN || 'full,soak')
   .split(',')
   .map((profile) => profile.trim())
   .filter(Boolean);
-if (!PLAN.length || PLAN.some((profile) => !['full', 'soak'].includes(profile))) {
-  throw new Error('WOODLAND_OVERNIGHT_PLAN must contain only full and soak');
+if (!PLAN.length || PLAN.some((profile) => !Object.hasOwn(PROFILE_CONFIGS, profile))) {
+  throw new Error(
+    `WOODLAND_OVERNIGHT_PLAN must contain only ${Object.keys(PROFILE_CONFIGS).join(', ')}`,
+  );
 }
 
 const runId = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-');
@@ -58,6 +116,9 @@ const summary = {
   plannedHours: HOURS,
   maxCycles: MAX_CYCLES || null,
   plan: PLAN,
+  profileConfigs: Object.fromEntries(
+    [...new Set(PLAN)].map((profile) => [profile, PROFILE_CONFIGS[profile]]),
+  ),
   outputRoot,
   config: {
     soakPlayers: SOAK_PLAYERS,
@@ -124,8 +185,19 @@ async function runCycle(cycle, profile) {
   await mkdir(cycleDir, { recursive: true });
   const log = createWriteStream(logPath, { flags: 'wx' });
   const cycleStartedAt = Date.now();
+  const profileConfig = PROFILE_CONFIGS[profile];
+  const baseSoakEnvironment = {
+    WOODLAND_SOAK_PLAYERS: String(SOAK_PLAYERS),
+    WOODLAND_SOAK_ROUNDS: String(SOAK_ROUNDS),
+    WOODLAND_SOAK_ACTIVATION_CONCURRENCY: String(SOAK_ACTIVATION_CONCURRENCY),
+    WOODLAND_SOAK_RACE_CONCURRENCY: String(SOAK_RACE_CONCURRENCY),
+    WOODLAND_SOAK_ROUND_DELAY_MS: String(SOAK_ROUND_DELAY_MS),
+    WOODLAND_SOAK_TREES_PER_ROUND: '1',
+    WOODLAND_SOAK_RELOAD_EVERY: '0',
+    WOODLAND_SOAK_RELOAD_COUNT: String(Math.min(4, SOAK_PLAYERS)),
+  };
   console.log(`\n=== Overnight ${cycleName} ===`);
-  const child = spawn('./scripts/test-regtest.sh', [profile], {
+  const child = spawn('./scripts/test-regtest.sh', [profileConfig.runner], {
     cwd: ROOT,
     env: {
       ...process.env,
@@ -133,11 +205,8 @@ async function runCycle(cycle, profile) {
       WOODLAND_E2E_ARTIFACT_DIR: cycleDir,
       WOODLAND_E2E_JUNIT: junitReport,
       WOODLAND_SOAK_REPORT: soakReport,
-      WOODLAND_SOAK_PLAYERS: String(SOAK_PLAYERS),
-      WOODLAND_SOAK_ROUNDS: String(SOAK_ROUNDS),
-      WOODLAND_SOAK_ACTIVATION_CONCURRENCY: String(SOAK_ACTIVATION_CONCURRENCY),
-      WOODLAND_SOAK_RACE_CONCURRENCY: String(SOAK_RACE_CONCURRENCY),
-      WOODLAND_SOAK_ROUND_DELAY_MS: String(SOAK_ROUND_DELAY_MS),
+      ...baseSoakEnvironment,
+      ...profileConfig.environment,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -165,8 +234,8 @@ async function runCycle(cycle, profile) {
     signal: outcome.signal,
     error: outcome.error,
     logPath,
-    soak: profile === 'soak' ? await readJson(soakReport) : null,
-    junitPath: profile === 'full' ? junitReport : null,
+    soak: profileConfig.runner === 'soak' ? await readJson(soakReport) : null,
+    junitPath: profileConfig.runner === 'full' ? junitReport : null,
   };
 }
 

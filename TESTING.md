@@ -180,6 +180,9 @@ WOODLAND_SOAK_PLAYERS=32 \
 WOODLAND_SOAK_ROUNDS=200 \
 WOODLAND_SOAK_ACTIVATION_CONCURRENCY=4 \
 WOODLAND_SOAK_RACE_CONCURRENCY=4 \
+WOODLAND_SOAK_TREES_PER_ROUND=4 \
+WOODLAND_SOAK_RELOAD_EVERY=25 \
+WOODLAND_SOAK_RELOAD_COUNT=8 \
 WOODLAND_SOAK_ROUND_DELAY_MS=1000 \
 ./scripts/test-regtest.sh soak
 ```
@@ -232,17 +235,51 @@ To leave it running after the terminal closes:
 
 ```bash
 systemd-run --user --unit=woodland-overnight --collect \
-  --property=WorkingDirectory=\"$PWD\" \
+  --property=WorkingDirectory="$PWD" \
   --setenv=WOODLAND_OVERNIGHT_HOURS=8 \
-  \"$PWD/scripts/test-overnight.sh\"
+  "$PWD/scripts/test-overnight.sh"
 
 journalctl --user -fu woodland-overnight
 ```
 
 Stop it cleanly with `systemctl --user stop woodland-overnight`; the active
 regtest wrapper receives a termination signal and tears down its containers.
-Use `WOODLAND_OVERNIGHT_CYCLES=1` for orchestration checks and
-`WOODLAND_OVERNIGHT_PLAN=full` or `soak` to isolate one profile.
+Use `WOODLAND_OVERNIGHT_CYCLES=1` for orchestration checks. The plan accepts
+`full`, `soak`, `burst`, `fanout`, `reload`, and `regrowth`.
+
+## Four-Hour Aggressive Matrix
+
+The aggressive launcher uses fresh worlds and rotates five materially different
+profiles instead of repeating one load shape:
+
+```bash
+./scripts/test-aggressive.sh
+```
+
+| Profile | Load |
+| --- | --- |
+| `full` | Existing browser, adversarial covenant, renewal, recovery, and multiplayer suite |
+| `burst` | 24 players, 100 zero-delay rounds, all 24 race one tree, six rotating browser reloads every 25 rounds |
+| `fanout` | 24 players, four tree groups per round, 320 accepted and 1,600 conflicting submissions per cycle |
+| `reload` | 12 players, two tree groups, all 12 browsers reload together every 20 rounds |
+| `regrowth` | Sustained same-tree pressure with one-second spacing so maintenance regrowth crosses active refreshes |
+
+Grouped rounds require exactly one player/tree transaction per target tree.
+Browser reloads must restore the same PLAYER_ID from storage, recover any pending
+state, re-register with the server, and converge with browsers that stayed
+online. Every profile still verifies global TREE/LOG/XP supplies.
+
+The default duration is four hours and the default plan is
+`full,burst,fanout,reload,regrowth`. Both remain configurable:
+
+```bash
+WOODLAND_OVERNIGHT_HOURS=3 \
+WOODLAND_OVERNIGHT_PLAN=burst,fanout,reload \
+./scripts/test-aggressive.sh
+```
+
+It uses the overnight runner's first-failure stop, disk floor, atomic summary,
+per-cycle artifacts, and signal-safe cleanup.
 
 ## Known Gaps
 

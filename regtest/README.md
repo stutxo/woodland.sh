@@ -143,9 +143,9 @@ independently before creating irreversible assets.
 ```
 
 Smoke uses two browsers and full uses four. Soak defaults to 12 independent
-players racing one shared tree for 30 rounds; player count, rounds, activation
-concurrency, race concurrency, and inter-round delay are configurable through
-`WOODLAND_SOAK_*`. All profiles serve the bundle and API from
+players racing one shared tree for 30 rounds; player count, rounds, tree groups,
+activation/race concurrency, inter-round delay, and rotating browser reloads are
+configurable through `WOODLAND_SOAK_*`. All profiles serve the bundle and API from
 `woodland-server` on port 8090.
 
 For repeated fresh-world full and soak cycles over a fixed duration:
@@ -156,6 +156,13 @@ For repeated fresh-world full and soak cycles over a fixed duration:
 
 It stops at the first failure and writes an atomic summary plus per-cycle
 artifacts under `regtest/_build/overnight/`.
+
+For a four-hour matrix covering 24-player bursts, four simultaneous tree groups,
+browser reload recovery, and sustained regrowth:
+
+```bash
+./scripts/test-aggressive.sh
+```
 
 The profiles are destructive only to resources owned by this checkout. If port
 3000 is already in use, set `MEMPOOL_WEB_PORT` to a free host port.
