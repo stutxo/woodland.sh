@@ -195,7 +195,9 @@ Docker Compose, Firefox, and `geckodriver` for browser tests.
 Open `http://127.0.0.1:8000/`. The app and social API use that same origin.
 Deposit the displayed 330 sats from any Arkade wallet, press **Refresh**, then
 **Create player**. Click an empty tile to walk or a tree to approach and chop.
-Map movement remains locked until player activation succeeds.
+Map movement remains locked until player activation succeeds. Interactive
+chopping refreshes covenant state for each swing and starts swing animations on
+a one-second cadence.
 
 The map is a bounded Canvas 2D viewport. It draws only visible tiles, sparse
 trees, and nearby player clusters; the player remains a separate fixed overlay

@@ -64,7 +64,8 @@ const DEFAULT_MAP_WIDTH = 45;
 const DEFAULT_MAP_HEIGHT = 19;
 const WALK_STEP_MS = 45;
 const CHOP_FLASH_MS = 340;
-const CHOP_FEEDBACK_MS = 450;
+const CHOP_CADENCE_MS = 1_000;
+const CHOP_FEEDBACK_MS = 1_000;
 const LOG_FLASH_MS = 800;
 const DIRECTIONS = [[0, -1], [-1, 0], [1, 0], [0, 1]];
 const TREE_GLYPH = '🌲';
@@ -1040,6 +1041,14 @@ activateButton.addEventListener('click', () => (
 ));
 
 
+async function waitForChopCadence(startedAt) {
+  let remaining = CHOP_CADENCE_MS - (performance.now() - startedAt);
+  while (remaining > 0 && !stopChopping) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
+    remaining = CHOP_CADENCE_MS - (performance.now() - startedAt);
+  }
+}
+
 async function chopUntilLog(treeId) {
   let swings = 0;
   let success = false;
@@ -1061,12 +1070,7 @@ async function chopUntilLog(treeId) {
       }, CHOP_FEEDBACK_MS);
       let nextState;
       try {
-        nextState = await app.chopExpected(
-          treeId,
-          tree.treeOutpoint,
-          state.playerStateOutpoint,
-          tree.nextDrop,
-        );
+        nextState = await app.chop(treeId);
       } finally {
         clearInterval(feedbackTimer);
       }
@@ -1075,6 +1079,7 @@ async function chopUntilLog(treeId) {
       success = state.lastAttempt?.success === true;
       if (success) flashTree(treeId, 'log', LOG_FLASH_MS, false);
       render();
+      if (!success) await waitForChopCadence(submittedAt);
       if (success) break;
     }
     return state;

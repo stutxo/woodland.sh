@@ -312,7 +312,11 @@ async function main() {
         after.status,
         `You get a LOG and 1 XP after ${after.autoChop.swings} ${suffix}.`,
       );
-      assert.ok(after.autoChop.durationMs > 0, `${label}: chop duration was not recorded`);
+      assert.ok(
+        after.autoChop.durationMs >= (after.autoChop.swings - 1) * 900,
+        `${label}: swing animations ran faster than one-second cadence`,
+      );
+      assert.equal(after.error, '', `${label}: ${after.error}`);
       const effects = after.treeEffects
         .filter((effect) => effect.treeId === tree.treeId)
         .map((effect) => effect.type);

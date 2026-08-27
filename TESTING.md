@@ -150,6 +150,8 @@ is no shared activation reserve or finite ticket supply.
 The multiplayer stage injects one emulator submission failure after journaling,
 then requires exact-PSBT recovery, rotated state/tree outpoints, and no remaining
 pending chop.
+Continuous-chop tests require fresh-state interactive swings, a one-second
+animation cadence, and no surfaced stale-precondition error.
 
 ## Known Gaps
 
