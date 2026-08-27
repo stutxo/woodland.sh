@@ -250,6 +250,12 @@ Long configurable same-tree contention profile:
 It defaults to 12 players and 30 rounds. See [`TESTING.md`](TESTING.md) for
 bounded remote-service settings and report output.
 
+Eight-hour alternating full/soak runner with per-cycle artifacts:
+
+```bash
+./scripts/test-overnight.sh
+```
+
 The stack builds unmodified arkd commit
 `8b34e352859595cc03ba22ffa35088ab88b87fd9` and uses the pinned Arkade Script
 emulator image.

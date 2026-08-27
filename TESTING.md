@@ -194,6 +194,50 @@ node scripts/e2e-soak-regtest.mjs
 Do not point the soak profile at a shared remote service without operator
 permission. Concurrency and round delay exist to bound remote load.
 
+## Overnight Mixed Stress
+
+The overnight runner repeatedly creates a fresh world and alternates the full
+adversarial profile with the same-tree soak profile. It stops on the first
+failure and preserves that cycle's logs, screenshots, JUnit, server logs, and
+soak report.
+
+```bash
+./scripts/test-overnight.sh
+```
+
+Defaults are eight hours, plan `full,soak`, 12 soak players, and 50 contention
+rounds per soak cycle. Before every cycle it refuses to continue below 5 GiB of
+free disk. The summary is rewritten atomically after every completed cycle under
+`regtest/_build/overnight/<timestamp>/overnight-summary.json`.
+
+A larger local run:
+
+```bash
+WOODLAND_OVERNIGHT_HOURS=10 \
+WOODLAND_OVERNIGHT_PLAYERS=16 \
+WOODLAND_OVERNIGHT_ROUNDS=100 \
+WOODLAND_OVERNIGHT_ACTIVATION_CONCURRENCY=3 \
+WOODLAND_OVERNIGHT_RACE_CONCURRENCY=4 \
+WOODLAND_OVERNIGHT_ROUND_DELAY_MS=1000 \
+./scripts/test-overnight.sh
+```
+
+To leave it running after the terminal closes:
+
+```bash
+systemd-run --user --unit=woodland-overnight --collect \
+  --property=WorkingDirectory=\"$PWD\" \
+  --setenv=WOODLAND_OVERNIGHT_HOURS=8 \
+  \"$PWD/scripts/test-overnight.sh\"
+
+journalctl --user -fu woodland-overnight
+```
+
+Stop it cleanly with `systemctl --user stop woodland-overnight`; the active
+regtest wrapper receives a termination signal and tears down its containers.
+Use `WOODLAND_OVERNIGHT_CYCLES=1` for orchestration checks and
+`WOODLAND_OVERNIGHT_PLAN=full` or `soak` to isolate one profile.
+
 ## Known Gaps
 
 Tests do not prove public service availability, denial-of-service resistance,

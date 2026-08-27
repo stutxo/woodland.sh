@@ -148,6 +148,15 @@ concurrency, race concurrency, and inter-round delay are configurable through
 `WOODLAND_SOAK_*`. All profiles serve the bundle and API from
 `woodland-server` on port 8090.
 
+For repeated fresh-world full and soak cycles over a fixed duration:
+
+```bash
+./scripts/test-overnight.sh
+```
+
+It stops at the first failure and writes an atomic summary plus per-cycle
+artifacts under `regtest/_build/overnight/`.
+
 The profiles are destructive only to resources owned by this checkout. If port
 3000 is already in use, set `MEMPOOL_WEB_PORT` to a free host port.
 
