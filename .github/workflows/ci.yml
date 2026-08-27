@@ -14,6 +14,7 @@ on:
         options:
           - smoke
           - full
+          - soak
         default: smoke
 
 concurrency:
@@ -121,6 +122,7 @@ jobs:
       WOODLAND_CI_PROFILE: ${{ github.event_name == 'schedule' && 'full' || inputs.profile || 'smoke' }}
       WOODLAND_E2E_ARTIFACT_DIR: regtest/_build/ci-artifacts
       WOODLAND_E2E_JUNIT: regtest/_build/ci-artifacts/e2e-junit.xml
+      WOODLAND_SOAK_REPORT: regtest/_build/ci-artifacts/soak-report.json
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

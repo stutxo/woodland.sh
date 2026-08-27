@@ -153,6 +153,47 @@ pending chop.
 Continuous-chop tests require fresh-state interactive swings, a one-second
 animation cadence, and no surfaced stale-precondition error.
 
+## Long Contention Soak
+
+The opt-in soak profile creates 12 independent Firefox players by default and
+races every player against the same tree outpoint for 30 rounds:
+
+```bash
+./scripts/test-regtest.sh soak
+```
+
+Every round requires exactly one accepted swing, converged tree state, no
+pending chops, and conserved 100 LOG/XP across all players and trees. A JSON
+report including p50/p95 round latency is written to
+`regtest/_build/soak-report.json`.
+
+Load and remote-facing pressure are explicit:
+
+```bash
+WOODLAND_SOAK_PLAYERS=32 \
+WOODLAND_SOAK_ROUNDS=200 \
+WOODLAND_SOAK_ACTIVATION_CONCURRENCY=4 \
+WOODLAND_SOAK_RACE_CONCURRENCY=4 \
+WOODLAND_SOAK_ROUND_DELAY_MS=1000 \
+./scripts/test-regtest.sh soak
+```
+
+To target an already prepared remote-compatible world, run the Node scenario
+directly. The funding executable receives `<address> <sats>`:
+
+```bash
+WOODLAND_E2E_PROFILE=soak \
+WOODLAND_E2E_WEB_URL=https://test.example \
+WOODLAND_SOAK_FUND_COMMAND=/path/to/test-wallet-funder \
+WOODLAND_SOAK_PLAYERS=8 \
+WOODLAND_SOAK_RACE_CONCURRENCY=2 \
+WOODLAND_SOAK_ROUND_DELAY_MS=2000 \
+node scripts/e2e-soak-regtest.mjs
+```
+
+Do not point the soak profile at a shared remote service without operator
+permission. Concurrency and round delay exist to bound remote load.
+
 ## Known Gaps
 
 Tests do not prove public service availability, denial-of-service resistance,

@@ -4,10 +4,11 @@ import net from 'node:net';
 import path from 'node:path';
 
 export const E2E_PROFILE = process.env.WOODLAND_E2E_PROFILE || 'full';
-if (!['smoke', 'full'].includes(E2E_PROFILE)) {
-  throw new Error(`WOODLAND_E2E_PROFILE must be smoke or full, got ${E2E_PROFILE}`);
+if (!['smoke', 'full', 'soak'].includes(E2E_PROFILE)) {
+  throw new Error(`WOODLAND_E2E_PROFILE must be smoke, full, or soak; got ${E2E_PROFILE}`);
 }
 export const FULL_E2E = E2E_PROFILE === 'full';
+export const SOAK_E2E = E2E_PROFILE === 'soak';
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

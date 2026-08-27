@@ -139,11 +139,14 @@ independently before creating irreversible assets.
 ```bash
 ./scripts/test-regtest.sh smoke
 ./scripts/test-regtest.sh full
+./scripts/test-regtest.sh soak
 ```
 
-Both profiles serve the web bundle and API from `woodland-server` on port 8090,
-authenticate player registration/location/chat, and exercise signed renewal
-delegation. Smoke uses two browsers; full uses four.
+Smoke uses two browsers and full uses four. Soak defaults to 12 independent
+players racing one shared tree for 30 rounds; player count, rounds, activation
+concurrency, race concurrency, and inter-round delay are configurable through
+`WOODLAND_SOAK_*`. All profiles serve the bundle and API from
+`woodland-server` on port 8090.
 
 The profiles are destructive only to resources owned by this checkout. If port
 3000 is already in use, set `MEMPOOL_WEB_PORT` to a free host port.

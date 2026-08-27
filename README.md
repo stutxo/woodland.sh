@@ -241,6 +241,15 @@ Full deterministic browser, renewal, adversarial, and multiplayer profile:
 ./scripts/test-regtest.sh full
 ```
 
+Long configurable same-tree contention profile:
+
+```bash
+./scripts/test-regtest.sh soak
+```
+
+It defaults to 12 players and 30 rounds. See [`TESTING.md`](TESTING.md) for
+bounded remote-service settings and report output.
+
 The stack builds unmodified arkd commit
 `8b34e352859595cc03ba22ffa35088ab88b87fd9` and uses the pinned Arkade Script
 emulator image.

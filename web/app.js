@@ -1243,6 +1243,11 @@ async function boot() {
       await withApp(() => app.testInvalidXpTransition(treeId));
       return withApp(() => app.refresh());
     };
+    globalThis.__WOODLAND_E2E_REFRESH = async () => {
+      state = await withApp(() => app.refresh());
+      render();
+      return state;
+    };
     globalThis.__WOODLAND_E2E_INVALID_ASSET_ORDER = async (treeId) => {
       await withApp(() => app.testInvalidAssetGroupOrder(treeId));
       return withApp(() => app.refresh());

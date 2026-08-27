@@ -20,9 +20,9 @@ export WOODLAND_E2E_WEB_URL="$WOODLAND_SERVER_URL"
 PROFILE=${1:-full}
 
 case "$PROFILE" in
-  smoke|full) ;;
+  smoke|full|soak) ;;
   *)
-    printf 'usage: %s [smoke|full]\n' "$0" >&2
+    printf 'usage: %s [smoke|full|soak]\n' "$0" >&2
     exit 2
     ;;
 esac
@@ -80,4 +80,8 @@ for attempt in {1..60}; do
   fi
   sleep 1
 done
-node "$ROOT/scripts/e2e-suite.mjs"
+if [[ "$PROFILE" == soak ]]; then
+  node "$ROOT/scripts/e2e-soak-regtest.mjs"
+else
+  node "$ROOT/scripts/e2e-suite.mjs"
+fi
