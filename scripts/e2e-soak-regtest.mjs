@@ -200,6 +200,148 @@ async function fetchAssetSupply(baseUrl, assetId) {
   return supply;
 }
 
+function selectRoundTargets(shared, stickyTargetTreeId, round) {
+  if (TREES_PER_ROUND === 1) {
+    let target = stickyTargetTreeId == null
+      ? null
+      : shared.trees.find(
+        (tree) => tree.treeId === stickyTargetTreeId
+          && tree.health > 0
+          && tree.logReserveRemaining > 0,
+      );
+    if (!target) {
+      target = shared.trees.find((tree) => tree.health > 0 && tree.logReserveRemaining > 0);
+      assert.ok(target, `round ${round}: no live tree remains`);
+    }
+    return { targetTrees: [target], stickyTargetTreeId: target.treeId };
+  }
+  const liveTrees = shared.trees.filter(
+    (tree) => tree.health > 0 && tree.logReserveRemaining > 0,
+  );
+  assert.ok(
+    liveTrees.length >= TREES_PER_ROUND,
+    `round ${round}: only ${liveTrees.length} live trees for ${TREES_PER_ROUND} groups`,
+  );
+  const start = ((round - 1) * TREES_PER_ROUND) % liveTrees.length;
+  return {
+    targetTrees: Array.from(
+      { length: TREES_PER_ROUND },
+      (_, offset) => liveTrees[(start + offset) % liveTrees.length],
+    ),
+    stickyTargetTreeId,
+  };
+}
+
+function classifyRoundTransitions(round, targetTrees, beforePlayerOutpoints, views, results) {
+  const targetTreeIds = targetTrees.map((tree) => tree.treeId);
+  const beforeTrees = new Map(targetTrees.map((tree) => [tree.treeId, tree]));
+  const reportedAccepted = results
+    .map((result, index) => ({ result, index }))
+    .filter(({ result }) => result.ok);
+  assert.ok(
+    reportedAccepted.length <= targetTrees.length,
+    `round ${round}: too many accepted reports: ${JSON.stringify(results)}`,
+  );
+  const changedPlayers = views
+    .map((view, index) => ({ view, index }))
+    .filter(
+      ({ view, index }) => view.state.playerStateOutpoint !== beforePlayerOutpoints[index],
+    );
+  assert.equal(
+    changedPlayers.length,
+    targetTrees.length,
+    `round ${round}: player transition count`,
+  );
+  const winners = [];
+  let drops = 0;
+  for (const treeId of targetTreeIds) {
+    const beforeTree = beforeTrees.get(treeId);
+    const afterTree = views[0].state.trees.find((tree) => tree.treeId === treeId);
+    assert.notEqual(
+      afterTree.treeOutpoint,
+      beforeTree.treeOutpoint,
+      `round ${round}: tree ${treeId} did not rotate`,
+    );
+    const treeTxid = afterTree.treeOutpoint.split(':')[0];
+    const matchingPlayers = changedPlayers.filter(
+      ({ view }) => view.state.playerStateOutpoint.split(':')[0] === treeTxid,
+    );
+    assert.equal(
+      matchingPlayers.length,
+      1,
+      `round ${round}: tree ${treeId} has ${matchingPlayers.length} player transitions`,
+    );
+    winners.push({ treeId, index: matchingPlayers[0].index });
+    drops += Number(afterTree.health < beforeTree.health);
+  }
+  const winnerIndexes = new Set(winners.map((winner) => winner.index));
+  for (const reported of reportedAccepted) {
+    assert.equal(
+      winnerIndexes.has(reported.index),
+      true,
+      `round ${round}: reported winner ${reported.index + 1} did not commit`,
+    );
+  }
+  const reportedIndexes = new Set(reportedAccepted.map((winner) => winner.index));
+  const recoveredWinners = winners.filter((winner) => !reportedIndexes.has(winner.index));
+  for (const winner of recoveredWinners) {
+    console.warn(
+      `soak round ${round}: player ${winner.index + 1} committed tree ${winner.treeId} `
+        + `despite a client error: ${results[winner.index].message || 'unknown error'}`,
+    );
+  }
+  const recoveryMessages = recoveredWinners.map((winner) => ({
+    treeId: winner.treeId,
+    player: winner.index,
+    message: results[winner.index].message || 'unknown error',
+  }));
+  return {
+    round,
+    treeId: targetTreeIds.length === 1 ? targetTreeIds[0] : null,
+    treeIds: targetTreeIds,
+    winner: winners.length === 1 ? winners[0].index : null,
+    winners,
+    reportedAccepted: reportedAccepted.length === targetTrees.length,
+    reportedAcceptedCount: reportedAccepted.length,
+    recoveryMessage: recoveryMessages.length === 1 ? recoveryMessages[0].message : null,
+    recoveryMessages,
+    drop: drops > 0,
+    drops,
+    conflicts: PLAYER_COUNT - targetTrees.length,
+  };
+}
+
+async function reloadPlayersForRound(players, views, round) {
+  if (RELOAD_EVERY === 0 || round % RELOAD_EVERY !== 0) {
+    return { views, retries: 0, reloads: 0 };
+  }
+  const reloadEvent = round / RELOAD_EVERY - 1;
+  const start = (reloadEvent * RELOAD_COUNT) % PLAYER_COUNT;
+  const reloadIndexes = Array.from(
+    { length: RELOAD_COUNT },
+    (_, offset) => (start + offset) % PLAYER_COUNT,
+  );
+  const expectedAssets = new Map(
+    reloadIndexes.map((index) => [index, views[index].state.playerAsset]),
+  );
+  await mapLimit(reloadIndexes, ACTIVATION_CONCURRENCY, async (index) => {
+    const player = players[index];
+    await player.reload();
+    const reloaded = await waitFor(
+      `browser reload (${player.label})`,
+      player.inspect,
+      (value) => value.ready
+        && value.state?.playerActive
+        && value.serverRegistered
+        && value.state.playerAsset === expectedAssets.get(index),
+      OPERATION_TIMEOUT_MS,
+    );
+    assert.equal(reloaded.state.pendingChopTxid ?? null, null, `${player.label}: pending chop`);
+  });
+  const convergence = await refreshUntilConverged(players, `round ${round} post-reload`);
+  return { views: convergence.views, retries: convergence.retries, reloads: reloadIndexes.length };
+}
+
 const driverConfigs = Array.from({ length: PLAYER_COUNT }, (_, index) => ({
   port: DRIVER_BASE_PORT + index,
   websocketPort: DRIVER_BASE_PORT + PLAYER_COUNT + index,
@@ -320,41 +462,13 @@ try {
 
   let stickyTargetTreeId = null;
   for (let round = 1; round <= ROUNDS; round += 1) {
-    const shared = views[0].state;
-    let targetTrees;
-    if (TREES_PER_ROUND === 1) {
-      let target = stickyTargetTreeId == null
-        ? null
-        : shared.trees.find(
-          (tree) => tree.treeId === stickyTargetTreeId
-            && tree.health > 0
-            && tree.logReserveRemaining > 0,
-        );
-      if (!target) {
-        target = shared.trees.find((tree) => tree.health > 0 && tree.logReserveRemaining > 0);
-        assert.ok(target, `round ${round}: no live tree remains`);
-        stickyTargetTreeId = target.treeId;
-      }
-      targetTrees = [target];
-    } else {
-      const liveTrees = shared.trees.filter(
-        (tree) => tree.health > 0 && tree.logReserveRemaining > 0,
-      );
-      assert.ok(
-        liveTrees.length >= TREES_PER_ROUND,
-        `round ${round}: only ${liveTrees.length} live trees for ${TREES_PER_ROUND} groups`,
-      );
-      const start = ((round - 1) * TREES_PER_ROUND) % liveTrees.length;
-      targetTrees = Array.from(
-        { length: TREES_PER_ROUND },
-        (_, offset) => liveTrees[(start + offset) % liveTrees.length],
-      );
-    }
+    const selection = selectRoundTargets(views[0].state, stickyTargetTreeId, round);
+    const { targetTrees } = selection;
+    stickyTargetTreeId = selection.stickyTargetTreeId;
     const targetTreeIds = targetTrees.map((tree) => tree.treeId);
     const assignedTreeIds = players.map(
       (_, index) => targetTreeIds[index % targetTreeIds.length],
     );
-    const beforeTrees = new Map(targetTrees.map((tree) => [tree.treeId, tree]));
     const beforePlayerOutpoints = views.map((view) => view.state.playerStateOutpoint);
     const roundStartedAt = Date.now();
     const results = await mapLimit(players, RACE_CONCURRENCY, (player, index) => {
@@ -363,123 +477,27 @@ try {
       );
       return player.race(views[index].state, playerTree);
     });
-    const reportedAccepted = results
-      .map((result, index) => ({ result, index }))
-      .filter(({ result }) => result.ok);
-    assert.ok(
-      reportedAccepted.length <= targetTrees.length,
-      `round ${round}: too many accepted reports: ${JSON.stringify(results)}`,
-    );
     if (ROUND_DELAY_MS) await sleep(ROUND_DELAY_MS);
     const convergence = await refreshUntilConverged(players, `round ${round}`);
     views = convergence.views;
     convergenceRetries += convergence.retries;
-    const changedPlayers = views
-      .map((view, index) => ({ view, index }))
-      .filter(
-        ({ view, index }) => view.state.playerStateOutpoint !== beforePlayerOutpoints[index],
-      );
-    assert.equal(
-      changedPlayers.length,
-      targetTrees.length,
-      `round ${round}: player transition count`,
-    );
-    const winners = [];
-    let drops = 0;
-    for (const treeId of targetTreeIds) {
-      const beforeTree = beforeTrees.get(treeId);
-      const afterTree = views[0].state.trees.find((tree) => tree.treeId === treeId);
-      assert.notEqual(
-        afterTree.treeOutpoint,
-        beforeTree.treeOutpoint,
-        `round ${round}: tree ${treeId} did not rotate`,
-      );
-      const treeTxid = afterTree.treeOutpoint.split(':')[0];
-      const matchingPlayers = changedPlayers.filter(
-        ({ view }) => view.state.playerStateOutpoint.split(':')[0] === treeTxid,
-      );
-      assert.equal(
-        matchingPlayers.length,
-        1,
-        `round ${round}: tree ${treeId} has ${matchingPlayers.length} player transitions`,
-      );
-      winners.push({ treeId, index: matchingPlayers[0].index });
-      drops += Number(afterTree.health < beforeTree.health);
-    }
-    const winnerIndexes = new Set(winners.map((winner) => winner.index));
-    for (const reported of reportedAccepted) {
-      assert.equal(
-        winnerIndexes.has(reported.index),
-        true,
-        `round ${round}: reported winner ${reported.index + 1} did not commit`,
-      );
-    }
-    const reportedIndexes = new Set(reportedAccepted.map((winner) => winner.index));
-    const recoveredWinners = winners.filter((winner) => !reportedIndexes.has(winner.index));
-    recoveredUnknownOutcomes += recoveredWinners.length;
-    for (const winner of recoveredWinners) {
-      console.warn(
-        `soak round ${round}: player ${winner.index + 1} committed tree ${winner.treeId} `
-          + `despite a client error: ${results[winner.index].message || 'unknown error'}`,
-      );
-    }
-    const recoveryMessages = recoveredWinners.map((winner) => ({
-      treeId: winner.treeId,
-      player: winner.index,
-      message: results[winner.index].message || 'unknown error',
-    }));
-    roundReports.push({
-      round,
-      treeId: targetTreeIds.length === 1 ? targetTreeIds[0] : null,
-      treeIds: targetTreeIds,
-      winner: winners.length === 1 ? winners[0].index : null,
-      winners,
-      reportedAccepted: reportedAccepted.length === targetTrees.length,
-      reportedAcceptedCount: reportedAccepted.length,
-      recoveryMessage: recoveryMessages.length === 1 ? recoveryMessages[0].message : null,
-      recoveryMessages,
-      drop: drops > 0,
-      drops,
-      conflicts: PLAYER_COUNT - targetTrees.length,
+    const report = {
+      ...classifyRoundTransitions(round, targetTrees, beforePlayerOutpoints, views, results),
       durationMs: Date.now() - roundStartedAt,
-    });
-    if (RELOAD_EVERY > 0 && round % RELOAD_EVERY === 0) {
-      const reloadEvent = round / RELOAD_EVERY - 1;
-      const start = (reloadEvent * RELOAD_COUNT) % PLAYER_COUNT;
-      const reloadIndexes = Array.from(
-        { length: RELOAD_COUNT },
-        (_, offset) => (start + offset) % PLAYER_COUNT,
-      );
-      const expectedAssets = new Map(
-        reloadIndexes.map((index) => [index, views[index].state.playerAsset]),
-      );
-      await mapLimit(reloadIndexes, ACTIVATION_CONCURRENCY, async (index) => {
-        const player = players[index];
-        await player.reload();
-        const reloaded = await waitFor(
-          `browser reload (${player.label})`,
-          player.inspect,
-          (value) => value.ready
-            && value.state?.playerActive
-            && value.serverRegistered
-            && value.state.playerAsset === expectedAssets.get(index),
-          OPERATION_TIMEOUT_MS,
-        );
-        assert.equal(reloaded.state.pendingChopTxid ?? null, null, `${player.label}: pending chop`);
-      });
-      browserReloads += reloadIndexes.length;
-      const reloadedConvergence = await refreshUntilConverged(
-        players,
-        `round ${round} post-reload`,
-      );
-      views = reloadedConvergence.views;
-      convergenceRetries += reloadedConvergence.retries;
-    }
+    };
+    recoveredUnknownOutcomes += report.recoveryMessages.length;
+    roundReports.push(report);
+
+    const reloaded = await reloadPlayersForRound(players, views, round);
+    views = reloaded.views;
+    convergenceRetries += reloaded.retries;
+    browserReloads += reloaded.reloads;
+
     if (round % 10 === 0 || round === ROUNDS) {
       console.log(
-        `soak round ${round}/${ROUNDS}: trees ${targetTreeIds.join(',')}, winners `
-          + `${winners.map((winner) => winner.index + 1).join(',')}, `
-          + `${roundReports.at(-1).durationMs}ms`,
+        `soak round ${round}/${ROUNDS}: trees ${report.treeIds.join(',')}, winners `
+          + `${report.winners.map((winner) => winner.index + 1).join(',')}, `
+          + `${report.durationMs}ms`,
       );
     }
   }

@@ -12,6 +12,22 @@ export const SOAK_E2E = E2E_PROFILE === 'soak';
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const managedProcesses = new Set();
+const stopPromises = new WeakMap();
+let signalCleanupStarted = false;
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  const handler = () => {
+    if (signalCleanupStarted) return;
+    signalCleanupStarted = true;
+    void Promise.all([...managedProcesses].map(stopProcess)).finally(() => {
+      process.removeListener(signal, handler);
+      process.kill(process.pid, signal);
+    });
+  };
+  process.on(signal, handler);
+}
+
 export function startProcess(command, args, cwd) {
   // A dedicated process group lets stopProcess signal descendants too:
   // geckodriver's Firefox children and the web server's maintenance watcher
@@ -33,7 +49,10 @@ export function startProcess(command, args, cwd) {
     spawnError = error;
     collect(`${command} failed to start: ${error.message}\n`);
   });
-  return { child, output: () => output, spawnError: () => spawnError };
+  const managed = { child, output: () => output, spawnError: () => spawnError };
+  managedProcesses.add(managed);
+  child.once('exit', () => managedProcesses.delete(managed));
+  return managed;
 }
 
 export function assertPortAvailable(port, label) {
@@ -156,11 +175,20 @@ function signalProcess(child, signal) {
   try { child.kill(signal); } catch {}
 }
 
-export async function stopProcess(process) {
-  if (!process || process.child.exitCode !== null || process.child.signalCode !== null) return;
-  signalProcess(process.child, 'SIGTERM');
-  if (!(await waitForExit(process.child, 5_000))) {
-    signalProcess(process.child, 'SIGKILL');
-    await waitForExit(process.child, 2_000);
+export function stopProcess(managed) {
+  if (!managed || managed.child.exitCode !== null || managed.child.signalCode !== null) {
+    if (managed) managedProcesses.delete(managed);
+    return Promise.resolve();
   }
+  const existing = stopPromises.get(managed);
+  if (existing) return existing;
+  const stopping = (async () => {
+    signalProcess(managed.child, 'SIGTERM');
+    if (!(await waitForExit(managed.child, 5_000))) {
+      signalProcess(managed.child, 'SIGKILL');
+      await waitForExit(managed.child, 2_000);
+    }
+  })().finally(() => managedProcesses.delete(managed));
+  stopPromises.set(managed, stopping);
+  return stopping;
 }

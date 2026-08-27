@@ -19,6 +19,36 @@ A swing spends one player and one tree. Different players on different trees
 share no inputs. Different players targeting the same tree contend only on that
 tree. One player's sequential swings contend only on that player's state.
 
+## Runtime Multiplayer State
+
+woodland.sh has no server simulation tick. Arkade VTXOs are the authoritative
+game state, and a chop is an atomic event rather than an input integrated into a
+continuous physics simulation.
+
+State ownership stays explicit:
+
+```text
+Arkade:         player/tree lineage, inventory, XP, health, roll
+browser:        camera, walking animation, focused tree
+server durable: signed registration and renewal delegation consent
+server live:    signed presence, bounded chat, replay clocks
+derived:        leaderboard projected from registered live player VTXOs
+
+The server's entire live multiplayer state is one `MultiplayerState`: a location
+index, a 200-message chat deque, per-action replay timestamps, and the next chat
+ID. Location is last-write-wins, expires after 60 seconds, and is queried by
+viewport. It is intentionally ephemeral; a server restart can clear presence
+and chat without changing gameplay.
+
+This differs from server-authoritative room engines such as
+[Colyseus](https://docs.colyseus.io/state) or
+[Nakama](https://heroiclabs.com/docs/nakama/concepts/multiplayer/authoritative/),
+which apply client input to an in-memory room state on a fixed tick and replicate
+snapshots or patches. A second authoritative room state here would duplicate
+Arkade, create a split-brain recovery problem, and add no useful simulation.
+One-second signed HTTP presence is sufficient for the slow tile map; WebSockets,
+prediction, interpolation, and rollback remain unnecessary.
+
 ## Capacity
 
 Player count is not encoded in world asset supply. Activation consumes one

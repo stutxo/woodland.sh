@@ -559,24 +559,13 @@ async fn finalize_checkpoints(rest: &ArkadeRest, txid: Txid, checkpoints: &[Psbt
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn sleep_ms(ms: u64) {
+pub(crate) async fn sleep_ms(ms: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn sleep_ms(ms: u64) {
-    use wasm_bindgen::JsCast;
-
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        web_sys::window()
-            .expect("window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                resolve.unchecked_ref(),
-                ms as i32,
-            )
-            .expect("setTimeout");
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+pub(crate) async fn sleep_ms(ms: u64) {
+    gloo_timers::future::TimeoutFuture::new(ms.min(u64::from(u32::MAX)) as u32).await;
 }
 
 #[cfg(test)]

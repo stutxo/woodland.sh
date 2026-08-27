@@ -581,6 +581,126 @@ function flashTree(treeId, type, duration, renderNow = true) {
     renderMap();
   }, duration);
 }
+
+function drawTrees(context, visible, screenX, screenY) {
+  let standingTreeCount = 0;
+  let stumpCount = 0;
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  for (const tree of worldTrees()) {
+    if (tree.health > 0) standingTreeCount += 1;
+    else stumpCount += 1;
+    if (!visible(tree.x, tree.y)) continue;
+    const x = screenX(tree.x);
+    const y = screenY(tree.y);
+    if (treeEffect?.treeId === tree.treeId) {
+      context.fillStyle = treeEffect.type === 'log' ? '#6f8f43' : '#607d4d';
+      context.fillRect(x, y, TILE_SIZE, TILE_SIZE);
+    }
+    if (tree.treeId === lockedTreeId) {
+      context.strokeStyle = '#f2d475';
+      context.lineWidth = 2;
+      context.strokeRect(x + 1, y + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+      context.lineWidth = 1;
+    }
+    context.font = tree.health === 0 ? 'bold 14px ui-monospace' : '16px sans-serif';
+    context.fillStyle = tree.health === 0 ? '#b58654' : '#dff5d5';
+    context.fillText(
+      tree.health === 0 ? '+' : TREE_GLYPH,
+      x + TILE_SIZE / 2,
+      y + TILE_SIZE / 2,
+    );
+  }
+  return { standingTreeCount, stumpCount };
+}
+
+function drawRemotePlayers(context, visible, screenX, screenY) {
+  const playersByPosition = new Map();
+  for (const location of remoteLocations) {
+    if (location.playerAsset === state?.playerAsset || !visible(location.x, location.y)) continue;
+    const key = coordinateKey(location.x, location.y);
+    const present = playersByPosition.get(key) || [];
+    present.push(location.playerAsset);
+    playersByPosition.set(key, present);
+  }
+  for (const [key, present] of playersByPosition) {
+    const [x, y] = key.split(':').map(Number);
+    const centerX = screenX(x) + TILE_SIZE / 2;
+    const centerY = screenY(y) + TILE_SIZE / 2;
+    context.fillStyle = '#78c9e8';
+    context.beginPath();
+    context.arc(centerX, centerY, 7, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = '#091014';
+    context.font = 'bold 10px ui-monospace';
+    context.fillText(present.length === 1 ? '&' : String(present.length), centerX, centerY);
+  }
+  return playersByPosition;
+}
+
+function updateMapCamera(originX, originY) {
+  cameraPlayer.hidden = !state?.playerActive;
+  mapHud.hidden = !state?.playerActive;
+  map.classList.toggle('movement-disabled', !state?.playerActive);
+  if (state?.playerActive) {
+    cameraPlayer.title = `Player at (${player.x}, ${player.y})`;
+  }
+  const viewportBounds = mapViewport.getBoundingClientRect();
+  const playerBounds = cameraPlayer.getBoundingClientRect();
+  const camera = state?.playerActive
+    ? {
+      x: player.x,
+      y: player.y,
+      mapX: originX,
+      mapY: originY,
+      deltaX: playerBounds.left
+        + playerBounds.width / 2
+        - viewportBounds.left
+        - viewportBounds.width / 2,
+      deltaY: playerBounds.top
+        + playerBounds.height / 2
+        - viewportBounds.top
+        - viewportBounds.height / 2,
+    }
+    : null;
+  globalThis.__WOODLAND_E2E_CAMERA = camera;
+  if (camera) {
+    const trail = globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [];
+    const previous = trail.at(-1);
+    if (!previous || previous.x !== camera.x || previous.y !== camera.y) {
+      trail.push(camera);
+      globalThis.__WOODLAND_E2E_CAMERA_TRAIL = trail.slice(-100);
+    }
+  }
+}
+
+function updateMapHint(adjacent) {
+  if (!state) mapHint.textContent = 'Connecting...';
+  else if (!worldTrees().length) mapHint.textContent = 'The shared woodland is unavailable.';
+  else if (walking) {
+    mapHint.textContent = walkingTargetTreeId == null
+      ? 'Walking...'
+      : `Walking to tree #${walkingTargetTreeId}...`;
+  }
+  else if (chopping) {
+    mapHint.textContent = `Locked on tree #${lockedTreeId}. Auto-swinging until a LOG drops. Click the map to stop after this swing.`;
+  }
+  else if (state.pendingChopTxid) {
+    mapHint.textContent = `Recovering submitted swing ${state.pendingChopTxid.slice(0, 12)}...`;
+  }
+  else if (!state.playerActive) mapHint.textContent = 'Fund and activate the player.';
+  else if (!state.fundingReady) mapHint.textContent = 'Player state is reconciling.';
+  else if (adjacent?.health === 0) {
+    mapHint.textContent = adjacent.respawnInSeconds == null
+      ? `Tree #${adjacent.treeId} has exhausted its LOG and XP reserve.`
+      : `Tree #${adjacent.treeId} returns in ${adjacent.respawnInSeconds}s.`;
+  }
+  else if (adjacent) {
+    mapHint.textContent = `In range of tree #${adjacent.treeId}. Click the tree to chop until LOG.`;
+  }
+  else mapHint.textContent = 'Click a tile to walk, or click a tree to walk there and chop.';
+}
+
 function renderMap() {
   const worldWidth = state?.mapWidth || DEFAULT_MAP_WIDTH;
   const worldHeight = state?.mapHeight || DEFAULT_MAP_HEIGHT;
@@ -648,89 +768,10 @@ function renderMap() {
     );
   }
 
-  let standingTreeCount = 0;
-  let stumpCount = 0;
-  context.textAlign = 'center';
-  context.textBaseline = 'middle';
-  for (const tree of worldTrees()) {
-    if (tree.health > 0) standingTreeCount += 1;
-    else stumpCount += 1;
-    if (!visible(tree.x, tree.y)) continue;
-    const x = screenX(tree.x);
-    const y = screenY(tree.y);
-    if (treeEffect?.treeId === tree.treeId) {
-      context.fillStyle = treeEffect.type === 'log' ? '#6f8f43' : '#607d4d';
-      context.fillRect(x, y, TILE_SIZE, TILE_SIZE);
-    }
-    if (tree.treeId === lockedTreeId) {
-      context.strokeStyle = '#f2d475';
-      context.lineWidth = 2;
-      context.strokeRect(x + 1, y + 1, TILE_SIZE - 2, TILE_SIZE - 2);
-      context.lineWidth = 1;
-    }
-    context.font = tree.health === 0 ? 'bold 14px ui-monospace' : '16px sans-serif';
-    context.fillStyle = tree.health === 0 ? '#b58654' : '#dff5d5';
-    context.fillText(
-      tree.health === 0 ? '+' : TREE_GLYPH,
-      x + TILE_SIZE / 2,
-      y + TILE_SIZE / 2,
-    );
-  }
+  const { standingTreeCount, stumpCount } = drawTrees(context, visible, screenX, screenY);
+  const playersByPosition = drawRemotePlayers(context, visible, screenX, screenY);
 
-  const playersByPosition = new Map();
-  for (const location of remoteLocations) {
-    if (location.playerAsset === state?.playerAsset || !visible(location.x, location.y)) continue;
-    const key = coordinateKey(location.x, location.y);
-    const present = playersByPosition.get(key) || [];
-    present.push(location.playerAsset);
-    playersByPosition.set(key, present);
-  }
-  for (const [key, present] of playersByPosition) {
-    const [x, y] = key.split(':').map(Number);
-    const centerX = screenX(x) + TILE_SIZE / 2;
-    const centerY = screenY(y) + TILE_SIZE / 2;
-    context.fillStyle = '#78c9e8';
-    context.beginPath();
-    context.arc(centerX, centerY, 7, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = '#091014';
-    context.font = 'bold 10px ui-monospace';
-    context.fillText(present.length === 1 ? '&' : String(present.length), centerX, centerY);
-  }
-
-  cameraPlayer.hidden = !state?.playerActive;
-  mapHud.hidden = !state?.playerActive;
-  map.classList.toggle('movement-disabled', !state?.playerActive);
-  if (state?.playerActive) {
-    cameraPlayer.title = `Player at (${player.x}, ${player.y})`;
-  }
-  const viewportBounds = mapViewport.getBoundingClientRect();
-  const playerBounds = cameraPlayer.getBoundingClientRect();
-  const camera = state?.playerActive
-    ? {
-      x: player.x,
-      y: player.y,
-      mapX: originX,
-      mapY: originY,
-      deltaX: playerBounds.left
-        + playerBounds.width / 2
-        - viewportBounds.left
-        - viewportBounds.width / 2,
-      deltaY: playerBounds.top
-        + playerBounds.height / 2
-        - viewportBounds.top
-        - viewportBounds.height / 2,
-    }
-    : null;
-  globalThis.__WOODLAND_E2E_CAMERA = camera;
-  if (camera) {
-    const trail = globalThis.__WOODLAND_E2E_CAMERA_TRAIL || [];
-    const previous = trail.at(-1);
-    if (!previous || previous.x !== camera.x || previous.y !== camera.y) {
-      trail.push(camera);
-      globalThis.__WOODLAND_E2E_CAMERA_TRAIL = trail.slice(-100);
-    }
-  }
+  updateMapCamera(originX, originY);
 
   mapFrame = {
     originX,
@@ -751,28 +792,7 @@ function renderMap() {
   globalThis.__WOODLAND_E2E_MAP_FRAME = mapFrame;
 
   const adjacent = adjacentTree();
-  if (!state) mapHint.textContent = 'Connecting...';
-  else if (!worldTrees().length) mapHint.textContent = 'The shared woodland is unavailable.';
-  else if (walking) {
-    mapHint.textContent = walkingTargetTreeId == null
-      ? 'Walking...'
-      : `Walking to tree #${walkingTargetTreeId}...`;
-  }
-  else if (chopping) {
-    mapHint.textContent = `Locked on tree #${lockedTreeId}. Auto-swinging until a LOG drops. Click the map to stop after this swing.`;
-  }
-  else if (state.pendingChopTxid) {
-    mapHint.textContent = `Recovering submitted swing ${state.pendingChopTxid.slice(0, 12)}...`;
-  }
-  else if (!state.playerActive) mapHint.textContent = 'Fund and activate the player.';
-  else if (!state.fundingReady) mapHint.textContent = 'Player state is reconciling.';
-  else if (adjacent?.health === 0) {
-    mapHint.textContent = adjacent.respawnInSeconds == null
-      ? `Tree #${adjacent.treeId} has exhausted its LOG and XP reserve.`
-      : `Tree #${adjacent.treeId} returns in ${adjacent.respawnInSeconds}s.`;
-  }
-  else if (adjacent) mapHint.textContent = `In range of tree #${adjacent.treeId}. Click the tree to chop until LOG.`;
-  else mapHint.textContent = 'Click a tile to walk, or click a tree to walk there and chop.';
+  updateMapHint(adjacent);
 
   globalThis.__WOODLAND_E2E_PLAYER = { ...player };
   globalThis.__WOODLAND_E2E_ADJACENT = Boolean(adjacent);

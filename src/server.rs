@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
@@ -208,6 +208,24 @@ struct ChatMessage {
     created_at_ms: u64,
 }
 
+struct MultiplayerState {
+    locations: LocationIndex,
+    chat: VecDeque<ChatMessage>,
+    action_timestamps: BTreeMap<String, u64>,
+    next_chat_id: u64,
+}
+
+impl Default for MultiplayerState {
+    fn default() -> Self {
+        Self {
+            locations: LocationIndex::default(),
+            chat: VecDeque::new(),
+            action_timestamps: BTreeMap::new(),
+            next_chat_id: 1,
+        }
+    }
+}
+
 #[derive(Default)]
 struct RefreshStatus {
     last_refresh_at: Option<i64>,
@@ -221,10 +239,7 @@ struct AppState {
     registry_path: PathBuf,
     persist_lock: Mutex<()>,
     refresh_status: RwLock<RefreshStatus>,
-    locations: RwLock<LocationIndex>,
-    chat: RwLock<VecDeque<ChatMessage>>,
-    action_timestamps: Mutex<BTreeMap<String, u64>>,
-    next_chat_id: AtomicU64,
+    multiplayer: RwLock<MultiplayerState>,
     force_renewal_once: AtomicBool,
     refresh_cursor: AtomicUsize,
 }
@@ -698,8 +713,8 @@ async fn authorize_action(
         ));
     }
     let action_key = format!("{}:{key}", request.action);
-    let mut timestamps = state.action_timestamps.lock().await;
-    if let Some(previous) = timestamps.get(&action_key) {
+    let mut multiplayer = state.multiplayer.write().await;
+    if let Some(previous) = multiplayer.action_timestamps.get(&action_key) {
         if request.timestamp_ms <= *previous
             || request.timestamp_ms.saturating_sub(*previous) < request.minimum_interval_ms
         {
@@ -708,7 +723,9 @@ async fn authorize_action(
             ));
         }
     }
-    timestamps.insert(action_key, request.timestamp_ms);
+    multiplayer
+        .action_timestamps
+        .insert(action_key, request.timestamp_ms);
     Ok((owner, player_asset))
 }
 
@@ -741,7 +758,12 @@ async fn update_location(
         y: request.y,
         updated_at_ms: now_ms(),
     };
-    state.locations.write().await.upsert(location.clone());
+    state
+        .multiplayer
+        .write()
+        .await
+        .locations
+        .upsert(location.clone());
     Ok(Json(location))
 }
 
@@ -770,16 +792,17 @@ async fn post_chat(
         },
     )
     .await?;
+    let mut multiplayer = state.multiplayer.write().await;
     let message = ChatMessage {
-        id: state.next_chat_id.fetch_add(1, Ordering::Relaxed),
+        id: multiplayer.next_chat_id,
         player_asset: player_asset.to_string(),
         message: request.message,
         created_at_ms: now_ms(),
     };
-    let mut chat = state.chat.write().await;
-    chat.push_back(message.clone());
-    while chat.len() > MAX_CHAT_MESSAGES {
-        chat.pop_front();
+    multiplayer.next_chat_id = multiplayer.next_chat_id.wrapping_add(1);
+    multiplayer.chat.push_back(message.clone());
+    while multiplayer.chat.len() > MAX_CHAT_MESSAGES {
+        multiplayer.chat.pop_front();
     }
     Ok(Json(message))
 }
@@ -968,9 +991,11 @@ async fn presence(
             .collect::<BTreeSet<_>>()
     };
     let (locations, truncated) = {
-        let mut locations = state.locations.write().await;
-        locations.retain_active(&active, current_time.saturating_sub(PRESENCE_TTL_MS));
-        locations.query(&query)
+        let mut multiplayer = state.multiplayer.write().await;
+        multiplayer
+            .locations
+            .retain_active(&active, current_time.saturating_sub(PRESENCE_TTL_MS));
+        multiplayer.locations.query(&query)
     };
     Ok(Json(PresenceResponse {
         generated_at_ms: current_time,
@@ -982,7 +1007,14 @@ async fn presence(
 async fn chat(State(state): State<Arc<AppState>>) -> Json<ChatResponse> {
     Json(ChatResponse {
         generated_at_ms: now_ms(),
-        messages: state.chat.read().await.iter().cloned().collect(),
+        messages: state
+            .multiplayer
+            .read()
+            .await
+            .chat
+            .iter()
+            .cloned()
+            .collect(),
     })
 }
 
@@ -991,9 +1023,10 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let status = state.refresh_status.read().await;
     let cutoff = now_ms().saturating_sub(PRESENCE_TTL_MS);
     let online_players = state
-        .locations
+        .multiplayer
         .read()
         .await
+        .locations
         .by_player
         .values()
         .filter(|location| location.updated_at_ms >= cutoff)
@@ -1324,10 +1357,7 @@ pub async fn run_cli() -> Result<()> {
         registry_path,
         persist_lock: Mutex::new(()),
         refresh_status: RwLock::new(RefreshStatus::default()),
-        locations: RwLock::new(LocationIndex::default()),
-        chat: RwLock::new(VecDeque::new()),
-        action_timestamps: Mutex::new(BTreeMap::new()),
-        next_chat_id: AtomicU64::new(1),
+        multiplayer: RwLock::new(MultiplayerState::default()),
         force_renewal_once: AtomicBool::new(force_renewal_once),
         refresh_cursor: AtomicUsize::new(0),
     });

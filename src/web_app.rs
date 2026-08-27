@@ -116,7 +116,7 @@ struct ServerDelegation {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct HarnessSnapshot {
+struct AppSnapshot {
     address: String,
     server: String,
     emulator: String,
@@ -207,6 +207,129 @@ impl ChopMutation {
             "fund-extension" => Ok(Self::FundExtension),
             _ => Err(anyhow!("unknown chop mutation {name}")),
         }
+    }
+
+    fn mutate_groups(self, groups: &mut [AssetGroup], tree_asset: AssetId) {
+        match self {
+            Self::PlayerMarkerMetadata => {
+                groups[crate::protocol::PLAYER_ID_ASSET_GROUP_INDEX].metadata =
+                    Some(vec![("forged".to_owned(), "metadata".to_owned())]);
+            }
+            Self::AssetMetadata => {
+                groups[crate::protocol::LOG_ASSET_GROUP_INDEX].metadata =
+                    Some(vec![("forged".to_owned(), "metadata".to_owned())]);
+            }
+            Self::AssetControl => {
+                groups[crate::protocol::LOG_ASSET_GROUP_INDEX].control_asset =
+                    Some(AssetRef::ById(tree_asset));
+            }
+            Self::SwapWorldGroups => groups.swap(
+                crate::protocol::TREE_ASSET_GROUP_INDEX,
+                crate::protocol::LOG_ASSET_GROUP_INDEX,
+            ),
+            Self::SwapLogXpGroups => groups.swap(
+                crate::protocol::LOG_ASSET_GROUP_INDEX,
+                crate::protocol::XP_ASSET_GROUP_INDEX,
+            ),
+            Self::ReplaceXpGroup => {
+                groups[crate::protocol::XP_ASSET_GROUP_INDEX].asset_id = Some(AssetId {
+                    txid: tree_asset.txid,
+                    group_index: u16::MAX,
+                });
+            }
+            Self::DoubleTreeMarker => {
+                groups[crate::protocol::TREE_ASSET_GROUP_INDEX].outputs[0].amount = 2;
+            }
+            _ => {}
+        }
+    }
+
+    fn mutate_extensions(
+        self,
+        psbt: &mut bitcoin::Psbt,
+        success: bool,
+        previous_state: PlayerState,
+        next_state: PlayerState,
+        next_tree_roll: tree::TreeRoll,
+        map_width: u16,
+    ) -> Result<()> {
+        match self {
+            Self::InvertXp => {
+                let wrong_xp = if success {
+                    previous_state.xp
+                } else {
+                    previous_state.xp.increment()?
+                };
+                replace_extension_packet(
+                    psbt,
+                    crate::protocol::PLAYER_XP_PACKET_TYPE,
+                    &wrong_xp.encode(),
+                )?;
+            }
+            Self::NonCanonicalXp => {
+                let mut negative_zero = [0_u8; 9];
+                negative_zero[8] = 0x80;
+                replace_extension_packet(
+                    psbt,
+                    crate::protocol::PLAYER_XP_PACKET_TYPE,
+                    &negative_zero,
+                )?;
+            }
+            Self::NonCanonicalHealth => {
+                let mut negative_zero = [0_u8; 9];
+                negative_zero[8] = 0x80;
+                replace_extension_packet(
+                    psbt,
+                    crate::protocol::TREE_HEALTH_PACKET_TYPE,
+                    &negative_zero,
+                )?;
+            }
+            Self::WrongRoll => replace_extension_packet(
+                psbt,
+                crate::protocol::TREE_ROLL_PACKET_TYPE,
+                &next_tree_roll.next().encode(),
+            )?,
+            Self::WrongPlayerPosition => {
+                let mut position = next_state.position;
+                position.x = (position.x + 1) % map_width;
+                replace_extension_packet(
+                    psbt,
+                    crate::protocol::PLAYER_POSITION_PACKET_TYPE,
+                    &position.encode(),
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn mutate_outputs(self, psbt: &mut bitcoin::Psbt) -> Result<()> {
+        match self {
+            Self::ExtraOutput => {
+                psbt.unsigned_tx.output.push(TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new(),
+                });
+                psbt.outputs.push(Default::default());
+            }
+            Self::WrongAnchor => {
+                psbt.unsigned_tx.output[crate::protocol::CHOP_ANCHOR_OUTPUT_INDEX as usize]
+                    .script_pubkey = ScriptBuf::new();
+            }
+            Self::FundExtension => {
+                let state_index = crate::protocol::PLAYER_STATE_OUTPUT_INDEX as usize;
+                let extension_index = crate::protocol::CHOP_EXTENSION_OUTPUT_INDEX as usize;
+                let state_sats = psbt.unsigned_tx.output[state_index]
+                    .value
+                    .to_sat()
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("player state cannot fund extension mutation"))?;
+                psbt.unsigned_tx.output[state_index].value = Amount::from_sat(state_sats);
+                psbt.unsigned_tx.output[extension_index].value = Amount::from_sat(1);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -657,7 +780,7 @@ impl WoodlandApp {
         ))
     }
 
-    fn snapshot(&self) -> HarnessSnapshot {
+    fn snapshot(&self) -> AppSnapshot {
         let now = crate::arkade::now_unix();
         let player_xp = self
             .player_state
@@ -756,7 +879,7 @@ impl WoodlandApp {
             .any(|record| record.assets.is_empty() && record.amount_sats == activation_sats);
         let activation_ready = self.player_state.is_none() && clean_activation_funding;
         let activation_blocked_reason = None;
-        HarnessSnapshot {
+        AppSnapshot {
             address: self.address(),
             server: self.rest.base().to_string(),
             emulator: self.emulator.base().to_string(),
@@ -822,7 +945,7 @@ impl WoodlandApp {
                 Err(error) => return Err(error),
             }
             if attempt + 1 < INDEX_ATTEMPTS {
-                sleep_ms(INDEX_POLL_MS).await;
+                txbuild::sleep_ms(INDEX_POLL_MS).await;
             }
         }
         Err(last_transient
@@ -1527,39 +1650,7 @@ impl WoodlandApp {
             transfer_group(self.world.log_asset, log_inputs, log_outputs),
             transfer_group(self.world.xp_asset, xp_inputs, xp_outputs),
         ];
-        if matches!(mutation, ChopMutation::PlayerMarkerMetadata) {
-            groups[crate::protocol::PLAYER_ID_ASSET_GROUP_INDEX].metadata =
-                Some(vec![("forged".to_owned(), "metadata".to_owned())]);
-        }
-        if matches!(mutation, ChopMutation::AssetMetadata) {
-            groups[crate::protocol::LOG_ASSET_GROUP_INDEX].metadata =
-                Some(vec![("forged".to_owned(), "metadata".to_owned())]);
-        }
-        if matches!(mutation, ChopMutation::AssetControl) {
-            groups[crate::protocol::LOG_ASSET_GROUP_INDEX].control_asset =
-                Some(AssetRef::ById(self.world.tree_asset));
-        }
-        if matches!(mutation, ChopMutation::SwapWorldGroups) {
-            groups.swap(
-                crate::protocol::TREE_ASSET_GROUP_INDEX,
-                crate::protocol::LOG_ASSET_GROUP_INDEX,
-            );
-        }
-        if matches!(mutation, ChopMutation::SwapLogXpGroups) {
-            groups.swap(
-                crate::protocol::LOG_ASSET_GROUP_INDEX,
-                crate::protocol::XP_ASSET_GROUP_INDEX,
-            );
-        }
-        if matches!(mutation, ChopMutation::ReplaceXpGroup) {
-            groups[crate::protocol::XP_ASSET_GROUP_INDEX].asset_id = Some(AssetId {
-                txid: self.world.tree_asset.txid,
-                group_index: u16::MAX,
-            });
-        }
-        if matches!(mutation, ChopMutation::DoubleTreeMarker) {
-            groups[crate::protocol::TREE_ASSET_GROUP_INDEX].outputs[0].amount = 2;
-        }
+        mutation.mutate_groups(&mut groups, self.world.tree_asset);
         ark_core::asset::packet::add_asset_packet_to_psbt(&mut chop.ark_tx, &Packet { groups })
             .map_err(|error| anyhow!("attach chop asset packet: {error}"))?;
         player::attach_player_chop_context(
@@ -1571,81 +1662,18 @@ impl WoodlandApp {
             next_state,
             next_tree_roll,
         )?;
-        if matches!(mutation, ChopMutation::InvertXp) {
-            let wrong_xp = if success {
-                state.state.xp
-            } else {
-                state.state.xp.increment()?
-            };
-            replace_extension_packet(
-                &mut chop.ark_tx,
-                crate::protocol::PLAYER_XP_PACKET_TYPE,
-                &wrong_xp.encode(),
-            )?;
-        }
-        if matches!(mutation, ChopMutation::NonCanonicalXp) {
-            let mut negative_zero = [0_u8; 9];
-            negative_zero[8] = 0x80;
-            replace_extension_packet(
-                &mut chop.ark_tx,
-                crate::protocol::PLAYER_XP_PACKET_TYPE,
-                &negative_zero,
-            )?;
-        }
-        if matches!(mutation, ChopMutation::NonCanonicalHealth) {
-            let mut negative_zero = [0_u8; 9];
-            negative_zero[8] = 0x80;
-            replace_extension_packet(
-                &mut chop.ark_tx,
-                crate::protocol::TREE_HEALTH_PACKET_TYPE,
-                &negative_zero,
-            )?;
-        }
-        if matches!(mutation, ChopMutation::WrongRoll) {
-            replace_extension_packet(
-                &mut chop.ark_tx,
-                crate::protocol::TREE_ROLL_PACKET_TYPE,
-                &next_tree_roll.next().encode(),
-            )?;
-        }
-        if matches!(mutation, ChopMutation::WrongPlayerPosition) {
-            let mut position = next_state.position;
-            position.x = (position.x + 1) % self.world.manifest.map_width;
-            replace_extension_packet(
-                &mut chop.ark_tx,
-                crate::protocol::PLAYER_POSITION_PACKET_TYPE,
-                &position.encode(),
-            )?;
-        }
+        mutation.mutate_extensions(
+            &mut chop.ark_tx,
+            success,
+            state.state,
+            next_state,
+            next_tree_roll,
+            self.world.manifest.map_width,
+        )?;
         if chop.ark_tx.unsigned_tx.output.len() != crate::protocol::CHOP_OUTPUT_COUNT {
             return Err(anyhow!("chop transaction has an invalid output count"));
         }
-        match mutation {
-            ChopMutation::ExtraOutput => {
-                chop.ark_tx.unsigned_tx.output.push(TxOut {
-                    value: Amount::ZERO,
-                    script_pubkey: ScriptBuf::new(),
-                });
-                chop.ark_tx.outputs.push(Default::default());
-            }
-            ChopMutation::WrongAnchor => {
-                chop.ark_tx.unsigned_tx.output
-                    [crate::protocol::CHOP_ANCHOR_OUTPUT_INDEX as usize]
-                    .script_pubkey = ScriptBuf::new();
-            }
-            ChopMutation::FundExtension => {
-                let state_index = crate::protocol::PLAYER_STATE_OUTPUT_INDEX as usize;
-                let extension_index = crate::protocol::CHOP_EXTENSION_OUTPUT_INDEX as usize;
-                let state_sats = chop.ark_tx.unsigned_tx.output[state_index]
-                    .value
-                    .to_sat()
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow!("player state cannot fund extension mutation"))?;
-                chop.ark_tx.unsigned_tx.output[state_index].value = Amount::from_sat(state_sats);
-                chop.ark_tx.unsigned_tx.output[extension_index].value = Amount::from_sat(1);
-            }
-            _ => {}
-        }
+        mutation.mutate_outputs(&mut chop.ark_tx)?;
         sign_ark_transaction(
             |_, message| Ok(self.keys.sign_msg(&message)),
             &mut chop.ark_tx,
@@ -1700,7 +1728,7 @@ impl WoodlandApp {
                 }
                 if recoverable_submission && !definitive_rejection {
                     let submission_detail = format!("{submission_error:#}");
-                    sleep_ms(500).await;
+                    txbuild::sleep_ms(500).await;
                     return match self.resume_pending_chop_inner().await {
                         Ok(true) => Ok(success),
                         Ok(false) => Err(anyhow!(
@@ -1812,7 +1840,7 @@ async fn wait_for_complete_tree_records(
             return select_tree_records(records, world, dust_sats);
         }
         if attempt + 1 < INDEX_ATTEMPTS {
-            sleep_ms(INDEX_POLL_MS).await;
+            txbuild::sleep_ms(INDEX_POLL_MS).await;
         }
     }
     Err(anyhow!(
@@ -1906,7 +1934,7 @@ async fn wait_for_virtual_txs(
             Ok(transactions) => return Ok(transactions),
             Err(error) => last_error = Some(error),
         }
-        sleep_ms(INDEX_POLL_MS).await;
+        txbuild::sleep_ms(INDEX_POLL_MS).await;
     }
     Err(last_error
         .unwrap_or_else(|| anyhow!("virtual transaction lookup failed"))
@@ -2039,7 +2067,7 @@ async fn wait_for_vtxo(rest: &ArkadeRest, script: &str, outpoint: OutPoint) -> R
         {
             return Ok(record);
         }
-        sleep_ms(INDEX_POLL_MS).await;
+        txbuild::sleep_ms(INDEX_POLL_MS).await;
     }
     Err(anyhow!("indexer did not expose VTXO {outpoint}"))
 }
@@ -2082,18 +2110,4 @@ fn load_pending_chop(storage_key: &str) -> Result<Option<PendingChop>> {
 
 fn js_err(error: anyhow::Error) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
-}
-
-async fn sleep_ms(ms: u64) {
-    use wasm_bindgen::JsCast;
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        web_sys::window()
-            .expect("window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                resolve.unchecked_ref(),
-                ms as i32,
-            )
-            .expect("setTimeout");
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }

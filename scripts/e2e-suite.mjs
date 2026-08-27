@@ -15,6 +15,14 @@ const stages = [
   ['multiplayer convergence and races', 'scripts/e2e-multiplayer-regtest.mjs'],
 ];
 const results = [];
+let activeChild = null;
+let interrupted = false;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    interrupted = true;
+    if (activeChild && activeChild.exitCode === null) activeChild.kill(signal);
+  });
+}
 
 const escapeXml = (value) => String(value)
   .replaceAll('&', '&amp;')
@@ -31,12 +39,17 @@ function runStage(name, script) {
       env: process.env,
       stdio: 'inherit',
     });
-    child.on('error', (error) => resolve({
+    activeChild = child;
+    const finish = (result) => {
+      if (activeChild === child) activeChild = null;
+      resolve(result);
+    };
+    child.on('error', (error) => finish({
       name,
       seconds: (Date.now() - started) / 1000,
       error: error.message,
     }));
-    child.on('exit', (code, signal) => resolve({
+    child.on('exit', (code, signal) => finish({
       name,
       seconds: (Date.now() - started) / 1000,
       error: code === 0 ? null : `exited with ${signal || `status ${code}`}`,
@@ -45,6 +58,7 @@ function runStage(name, script) {
 }
 
 for (const [name, script] of stages) {
+  if (interrupted) break;
   const result = await runStage(name, script);
   results.push(result);
   if (result.error) break;
@@ -69,3 +83,4 @@ await mkdir(path.dirname(reportPath), { recursive: true });
 await writeFile(reportPath, report);
 
 if (failures) process.exitCode = 1;
+if (interrupted) process.exitCode = 1;

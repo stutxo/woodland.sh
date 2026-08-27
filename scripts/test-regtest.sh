@@ -31,13 +31,14 @@ esac
 export WOODLAND_E2E_PROFILE=$PROFILE
 SERVER_PID=
 WATCHER_PID=
+E2E_PID=
 SERVER_LOG="${WOODLAND_E2E_ARTIFACT_DIR:-$ROOT/regtest/_build/ci-artifacts}/server.log"
 WATCHER_LOG="${WOODLAND_E2E_ARTIFACT_DIR:-$ROOT/regtest/_build/ci-artifacts}/watcher.log"
 
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
-  for pid in "$SERVER_PID" "$WATCHER_PID"; do
+  for pid in "$E2E_PID" "$SERVER_PID" "$WATCHER_PID"; do
     [[ -n "$pid" ]] || continue
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -82,7 +83,14 @@ for attempt in {1..60}; do
   sleep 1
 done
 if [[ "$PROFILE" == soak ]]; then
-  node "$ROOT/scripts/e2e-soak-regtest.mjs"
+  node "$ROOT/scripts/e2e-soak-regtest.mjs" &
 else
-  node "$ROOT/scripts/e2e-suite.mjs"
+  node "$ROOT/scripts/e2e-suite.mjs" &
 fi
+E2E_PID=$!
+set +e
+wait "$E2E_PID"
+status=$?
+set -e
+E2E_PID=
+exit "$status"
