@@ -21,6 +21,23 @@ use wasm_bindgen::prelude::*;
 const INDEX_ATTEMPTS: usize = 80;
 const INDEX_POLL_MS: u64 = 250;
 
+// Spendable-only queries can briefly expose both sides of a just-committed
+// transition. Retry that snapshot, but keep persistent forks fail-closed.
+#[derive(Debug)]
+struct TransientIndexSnapshot(String);
+
+impl std::fmt::Display for TransientIndexSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TransientIndexSnapshot {}
+
+fn transient_index_snapshot(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TransientIndexSnapshot(detail.into()))
+}
+
 #[derive(Clone)]
 struct World {
     manifest: WorldManifest,
@@ -795,6 +812,25 @@ impl WoodlandApp {
     }
 
     async fn sync(&mut self) -> Result<()> {
+        let mut last_transient = None;
+        for attempt in 0..INDEX_ATTEMPTS {
+            match self.sync_once().await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.downcast_ref::<TransientIndexSnapshot>().is_some() => {
+                    last_transient = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+            if attempt + 1 < INDEX_ATTEMPTS {
+                sleep_ms(INDEX_POLL_MS).await;
+            }
+        }
+        Err(last_transient
+            .unwrap_or_else(|| transient_index_snapshot("index snapshot did not converge"))
+            .context("index did not converge to one spendable lineage"))
+    }
+
+    async fn sync_once(&mut self) -> Result<()> {
         let wallet = player_vtxo(&self.keys, &self.params)?;
         let wallet_script = wallet.script_pubkey().to_hex_string();
         let tree_script = self.world.contract.vtxo.script_pubkey().to_hex_string();
@@ -870,11 +906,10 @@ impl WoodlandApp {
                 return Err(anyhow!("current tree record has an invalid lineage"));
             }
             if let Some(competing) = seen_states.insert(state, record.outpoint) {
-                return Err(anyhow!(
+                return Err(transient_index_snapshot(format!(
                     "tree {} exposes competing spendable lineages {competing} and {}",
-                    state.tree_id,
-                    record.outpoint
-                ));
+                    state.tree_id, record.outpoint
+                )));
             }
             discovered.push(LiveTree {
                 state,
@@ -889,7 +924,9 @@ impl WoodlandApp {
             });
         }
         if seen_states.len() != self.world.declared_trees.len() {
-            return Err(anyhow!("not all world trees are currently discoverable"));
+            return Err(transient_index_snapshot(
+                "not all world trees are currently discoverable",
+            ));
         }
         discovered.sort_by_key(|tree| {
             self.world
@@ -1853,7 +1890,9 @@ fn select_player_state_record(
     match candidates.as_slice() {
         [] => Ok(None),
         [record] => Ok(Some(record.clone())),
-        _ => Err(anyhow!("PLAYER_ID has multiple recursive state VTXOs")),
+        _ => Err(transient_index_snapshot(
+            "PLAYER_ID has multiple recursive state VTXOs",
+        )),
     }
 }
 
