@@ -91,9 +91,12 @@ let lockedTreeId = null;
 let lastChopRun = null;
 let copyResetTimer = null;
 let focusedTreeId = null;
+let leaderboardTotal = 0;
 let appQueue = Promise.resolve();
 let leaderboardPlayers = [];
 let leaderboardJoined = false;
+let delegatedPlayerAssets = [];
+let presenceTruncated = false;
 let serverRegistrationSyncing = false;
 let serverRegistrationOutpoint = null;
 let serverRegistrationRetryAfter = 0;
@@ -198,24 +201,101 @@ function renderChat() {
   }
 }
 
-async function refreshSocial() {
-  if (!SERVER_URL) return;
+function publishSocialSnapshot() {
+  globalThis.__WOODLAND_E2E_LEADERBOARD = leaderboardPlayers;
+  globalThis.__WOODLAND_E2E_SOCIAL = {
+    locations: remoteLocations,
+    messages: chatMessages,
+    delegatedPlayerAssets,
+    delegationAvailable,
+    truncated: presenceTruncated,
+  };
+}
+
+function nearbyPlayerCount() {
+  return remoteLocations.filter((location) => location.playerAsset !== state?.playerAsset).length;
+}
+
+function updateServerStatus() {
+  const nearby = `${nearbyPlayerCount()}${presenceTruncated ? '+' : ''} nearby`;
+  leaderboardStatus.textContent = `${leaderboardTotal} verified · ${nearby}`;
+}
+
+function currentPresenceBounds() {
+  if (!state) return null;
+  const halfWidth = Math.ceil((map.clientWidth || mapViewport.clientWidth) / TILE_SIZE / 2) + 4;
+  const halfHeight = Math.ceil((map.clientHeight || mapViewport.clientHeight) / TILE_SIZE / 2) + 4;
+  const focusX = state.playerActive ? player.x : Math.floor(state.mapWidth / 2);
+  const focusY = state.playerActive ? player.y : Math.floor(state.mapHeight / 2);
+  return {
+    minX: Math.max(0, focusX - halfWidth),
+    minY: Math.max(0, focusY - halfHeight),
+    maxX: Math.min(state.mapWidth - 1, focusX + halfWidth),
+    maxY: Math.min(state.mapHeight - 1, focusY + halfHeight),
+  };
+}
+
+async function refreshPresence() {
+  if (!SERVER_URL || !state) return;
+  const bounds = currentPresenceBounds();
+  const query = new URLSearchParams(bounds);
   try {
-    const response = await fetch(`${SERVER_URL}/v1/social`, {
+    const response = await fetch(`${SERVER_URL}/v1/presence?${query}`, {
       cache: 'no-store',
       mode: 'cors',
     });
-    if (!response.ok) throw new Error(`server returned ${response.status}`);
+    if (!response.ok) throw new Error(`presence returned ${response.status}`);
+    const payload = await response.json();
+    remoteLocations = Array.isArray(payload.locations) ? payload.locations : [];
+    presenceTruncated = payload.truncated === true;
+    updateServerStatus();
+    publishSocialSnapshot();
+    renderMap();
+    hudOnline.textContent = String(nearbyPlayerCount());
+  } catch (error) {
+    remoteLocations = [];
+    presenceTruncated = false;
+    publishSocialSnapshot();
+    renderMap();
+    leaderboardStatus.textContent = `Presence unavailable: ${error}`;
+  }
+}
+
+async function refreshChat() {
+  if (!SERVER_URL) return;
+  try {
+    const response = await fetch(`${SERVER_URL}/v1/chat`, {
+      cache: 'no-store',
+      mode: 'cors',
+    });
+    if (!response.ok) throw new Error(`chat returned ${response.status}`);
+    const payload = await response.json();
+    chatMessages = Array.isArray(payload.messages) ? payload.messages : [];
+    publishSocialSnapshot();
+    renderChat();
+  } catch (error) {
+    chatStatus.textContent = `Chat unavailable: ${error}`;
+  }
+}
+
+async function refreshLeaderboard() {
+  if (!SERVER_URL) return;
+  try {
+    const response = await fetch(`${SERVER_URL}/v1/leaderboard?limit=100`, {
+      cache: 'no-store',
+      mode: 'cors',
+    });
+    if (!response.ok) throw new Error(`leaderboard returned ${response.status}`);
     const payload = await response.json();
     leaderboardPlayers = Array.isArray(payload.players) ? payload.players : [];
-    remoteLocations = Array.isArray(payload.locations) ? payload.locations : [];
-    chatMessages = Array.isArray(payload.messages) ? payload.messages : [];
+    leaderboardTotal = Number(payload.total) || leaderboardPlayers.length;
     delegationAvailable = payload.delegationAvailable === true;
-    delegatedRenewal = Array.isArray(payload.delegatedPlayerAssets)
-      && payload.delegatedPlayerAssets.includes(state?.playerAsset);
-    leaderboardStatus.textContent = `${leaderboardPlayers.length} verified · ${remoteLocations.length} online`;
-    globalThis.__WOODLAND_E2E_LEADERBOARD = leaderboardPlayers;
-    globalThis.__WOODLAND_E2E_SOCIAL = payload;
+    delegatedPlayerAssets = Array.isArray(payload.delegatedPlayerAssets)
+      ? payload.delegatedPlayerAssets
+      : [];
+    delegatedRenewal = delegatedPlayerAssets.includes(state?.playerAsset);
+    updateServerStatus();
+    publishSocialSnapshot();
     render();
   } catch (error) {
     delegationAvailable = false;
@@ -253,7 +333,7 @@ async function syncServerRegistration(force = false) {
       genesisTxid: state.genesisTxid,
       playerAsset: state.playerAsset,
     }));
-    await refreshSocial();
+    await Promise.all([refreshLeaderboard(), refreshPresence(), refreshChat()]);
     await publishLocation(true);
     serverRegistrationRetryAfter = 0;
   } finally {
@@ -301,7 +381,7 @@ async function submitChat(message) {
     await postServerAction('/v1/chat', chatRequest);
     chatInput.value = '';
     chatStatus.textContent = '';
-    await refreshSocial();
+    await refreshChat();
   } catch (error) {
     chatStatus.textContent = String(error);
   } finally {
@@ -330,7 +410,7 @@ async function updateDelegation() {
     chatStatus.textContent = enabled
       ? 'Server renewal delegation enabled.'
       : 'Server renewal delegation disabled.';
-    await refreshSocial();
+    await refreshLeaderboard();
   } catch (error) {
     chatStatus.textContent = String(error);
   } finally {
@@ -772,7 +852,7 @@ function render() {
   hudLevel.textContent = String(state.playerLevel);
   hudXp.textContent = String(state.playerXp);
   hudLogs.textContent = String(state.playerLogs || 0);
-  hudOnline.textContent = String(remoteLocations.length);
+  hudOnline.textContent = String(nearbyPlayerCount());
 
   onboarding.hidden = playerActive;
   dashboard.classList.toggle('player-active', playerActive);
@@ -1157,7 +1237,7 @@ async function boot() {
     if (!state.pendingChopTxid) status.textContent = 'Ready';
     appendLog('Connected to woodland.sh');
     restoreServerRegistration();
-    await refreshSocial();
+    await Promise.all([refreshLeaderboard(), refreshPresence(), refreshChat()]);
     if (leaderboardJoined) {
       await syncServerRegistration(true).catch((error) => {
         leaderboardStatus.textContent = `Server registration failed: ${error}`;
@@ -1187,6 +1267,10 @@ async function boot() {
     globalThis.__WOODLAND_E2E_INVALID_ASSET_ORDER = async (treeId) => {
       await withApp(() => app.testInvalidAssetGroupOrder(treeId));
       return withApp(() => app.refresh());
+    };
+    globalThis.__WOODLAND_E2E_SET_REMOTE_LOCATIONS = (locations) => {
+      remoteLocations = Array.isArray(locations) ? locations : [];
+      renderMap();
     };
     globalThis.__WOODLAND_E2E_INVALID_XP_GROUP = async (treeId) => {
       await withApp(() => app.testInvalidXpGroup(treeId));
@@ -1270,6 +1354,14 @@ setInterval(async () => {
 window.addEventListener('resize', renderMap);
 
 setInterval(() => {
-  void refreshSocial();
+  void refreshPresence();
   void publishLocation();
+}, 1_000);
+
+setInterval(() => {
+  void refreshChat();
 }, 2_000);
+
+setInterval(() => {
+  void refreshLeaderboard();
+}, 15_000);

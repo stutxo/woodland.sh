@@ -205,8 +205,9 @@ public origin serves `/`, static bundle files, and:
 
 ```text
 GET  /health.json
-GET  /v1/leaderboard
-GET  /v1/social
+GET  /v1/presence?minX=&minY=&maxX=&maxY=
+GET  /v1/chat
+GET  /v1/leaderboard?limit=&offset=
 POST /v1/players
 POST /v1/location
 POST /v1/chat

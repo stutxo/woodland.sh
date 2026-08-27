@@ -12,7 +12,7 @@ use crate::watchtower::{self, WatchtowerServices};
 use crate::world::{ValidatedWorld, WorldManifest, GAME_ID, PROTOCOL_VERSION};
 use anyhow::{anyhow, bail, Context, Result};
 use ark_core::asset::AssetId;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{
     header::{CACHE_CONTROL, CONTENT_TYPE},
     HeaderValue, Method, StatusCode,
@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
@@ -39,8 +39,14 @@ const DEFAULT_BIND: &str = "127.0.0.1:8090";
 const DEFAULT_REFRESH_SECS: u64 = 15;
 const MAX_REGISTERED_PLAYERS: usize = 10_000;
 const VERIFY_CONCURRENCY: usize = 8;
+const VERIFY_BATCH_SIZE: usize = 256;
 const MAX_CHAT_MESSAGES: usize = 200;
 const PRESENCE_TTL_MS: u64 = 60_000;
+const PRESENCE_CHUNK_SIZE: u16 = 32;
+const MAX_PRESENCE_QUERY_SPAN: u16 = 128;
+const MAX_PRESENCE_RESULTS: usize = 2_000;
+const DEFAULT_LEADERBOARD_LIMIT: usize = 100;
+const MAX_LEADERBOARD_LIMIT: usize = 200;
 const ACTION_CLOCK_SKEW_MS: u64 = 300_000;
 const LOCATION_INTERVAL_MS: u64 = 500;
 const CHAT_INTERVAL_MS: u64 = 2_000;
@@ -69,6 +75,7 @@ struct RegisteredPlayer {
     delegated_renewal: bool,
     #[serde(default)]
     delegation_updated_at_ms: u64,
+    #[serde(skip)]
     state: Option<LeaderboardPlayer>,
 }
 
@@ -113,6 +120,85 @@ struct PlayerLocation {
     updated_at_ms: u64,
 }
 
+#[derive(Default)]
+struct LocationIndex {
+    by_player: BTreeMap<String, PlayerLocation>,
+    chunks: BTreeMap<(u16, u16), BTreeSet<String>>,
+}
+
+impl LocationIndex {
+    fn chunk(x: u16, y: u16) -> (u16, u16) {
+        (x / PRESENCE_CHUNK_SIZE, y / PRESENCE_CHUNK_SIZE)
+    }
+
+    fn remove(&mut self, player_asset: &str) {
+        let Some(previous) = self.by_player.remove(player_asset) else {
+            return;
+        };
+        let chunk = Self::chunk(previous.x, previous.y);
+        if let Some(players) = self.chunks.get_mut(&chunk) {
+            players.remove(player_asset);
+            if players.is_empty() {
+                self.chunks.remove(&chunk);
+            }
+        }
+    }
+
+    fn upsert(&mut self, location: PlayerLocation) {
+        let player_asset = location.player_asset.clone();
+        self.remove(&player_asset);
+        self.chunks
+            .entry(Self::chunk(location.x, location.y))
+            .or_default()
+            .insert(player_asset.clone());
+        self.by_player.insert(player_asset, location);
+    }
+
+    fn retain_active(&mut self, active: &BTreeSet<String>, cutoff: u64) {
+        let stale = self
+            .by_player
+            .iter()
+            .filter(|(player_asset, location)| {
+                !active.contains(*player_asset) || location.updated_at_ms < cutoff
+            })
+            .map(|(player_asset, _)| player_asset.clone())
+            .collect::<Vec<_>>();
+        for player_asset in stale {
+            self.remove(&player_asset);
+        }
+    }
+
+    fn query(&self, query: &PresenceQuery) -> (Vec<PlayerLocation>, bool) {
+        let min_chunk = Self::chunk(query.min_x, query.min_y);
+        let max_chunk = Self::chunk(query.max_x, query.max_y);
+        let mut locations = Vec::new();
+        for chunk_y in min_chunk.1..=max_chunk.1 {
+            for chunk_x in min_chunk.0..=max_chunk.0 {
+                let Some(players) = self.chunks.get(&(chunk_x, chunk_y)) else {
+                    continue;
+                };
+                for player_asset in players {
+                    let Some(location) = self.by_player.get(player_asset) else {
+                        continue;
+                    };
+                    if location.x < query.min_x
+                        || location.x > query.max_x
+                        || location.y < query.min_y
+                        || location.y > query.max_y
+                    {
+                        continue;
+                    }
+                    if locations.len() == MAX_PRESENCE_RESULTS {
+                        return (locations, true);
+                    }
+                    locations.push(location.clone());
+                }
+            }
+        }
+        (locations, false)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatMessage {
@@ -135,11 +221,12 @@ struct AppState {
     registry_path: PathBuf,
     persist_lock: Mutex<()>,
     refresh_status: RwLock<RefreshStatus>,
-    locations: RwLock<BTreeMap<String, PlayerLocation>>,
+    locations: RwLock<LocationIndex>,
     chat: RwLock<VecDeque<ChatMessage>>,
     action_timestamps: Mutex<BTreeMap<String, u64>>,
     next_chat_id: AtomicU64,
     force_renewal_once: AtomicBool,
+    refresh_cursor: AtomicUsize,
 }
 
 #[derive(Deserialize)]
@@ -181,22 +268,45 @@ struct DelegationRequest {
     signature: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LeaderboardResponse {
-    generated_at: i64,
-    players: Vec<LeaderboardPlayer>,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PresenceQuery {
+    min_x: u16,
+    min_y: u16,
+    max_x: u16,
+    max_y: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LeaderboardQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SocialResponse {
-    generated_at_ms: u64,
+struct LeaderboardResponse {
+    generated_at: i64,
+    total: usize,
     players: Vec<LeaderboardPlayer>,
-    locations: Vec<PlayerLocation>,
-    messages: Vec<ChatMessage>,
     delegated_player_assets: Vec<String>,
     delegation_available: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PresenceResponse {
+    generated_at_ms: u64,
+    locations: Vec<PlayerLocation>,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatResponse {
+    generated_at_ms: u64,
+    messages: Vec<ChatMessage>,
 }
 
 #[derive(Serialize)]
@@ -483,11 +593,6 @@ fn validate_registry_consents(registry: &RegistryFile, verifier: &Verifier) -> R
         verifier
             .verify_registration_signature(owner, player_asset, signature)
             .with_context(|| format!("verify registration consent for {key}"))?;
-        if entry.state.as_ref().is_some_and(|state| {
-            state.owner != entry.owner || state.player_asset != entry.player_asset
-        }) {
-            bail!("cached verified state does not match its registration");
-        }
     }
     Ok(())
 }
@@ -561,21 +666,30 @@ async fn authorize_action(
         )
         .map_err(|_| ApiError::bad_request("signature does not authorize this server action"))?;
     let key = player_asset.to_string();
-    {
+    let (registered_at, active) = {
         let registry = state.registry.read().await;
-        let registered = registry.players.get(&key).is_some_and(|entry| {
-            entry.owner == owner.to_string()
-                && entry.state.as_ref().is_some_and(|player| {
-                    player.active
-                        && player
-                            .expires_at
-                            .is_none_or(|expires_at| expires_at > now_unix())
-                })
+        let entry = registry
+            .players
+            .get(&key)
+            .filter(|entry| entry.owner == owner.to_string())
+            .ok_or_else(|| ApiError::not_found("player is not registered with this server"))?;
+        let active = entry.state.as_ref().is_some_and(|player| {
+            player.active
+                && player
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at > now_unix())
         });
-        if !registered {
-            return Err(ApiError::not_found(
-                "player is not active and registered with this server",
-            ));
+        (entry.registered_at, active)
+    };
+    if !active {
+        let verified = state
+            .verifier
+            .verify(owner, player_asset, registered_at)
+            .await
+            .map_err(ApiError::upstream)?
+            .ok_or_else(|| ApiError::not_found("player has no live registered state"))?;
+        if let Some(entry) = state.registry.write().await.players.get_mut(&key) {
+            entry.state = Some(verified);
         }
     }
     if now_ms().abs_diff(request.timestamp_ms) > ACTION_CLOCK_SKEW_MS {
@@ -627,11 +741,7 @@ async fn update_location(
         y: request.y,
         updated_at_ms: now_ms(),
     };
-    state
-        .locations
-        .write()
-        .await
-        .insert(player_asset.to_string(), location.clone());
+    state.locations.write().await.upsert(location.clone());
     Ok(Json(location))
 }
 
@@ -805,49 +915,74 @@ fn leaderboard_players(registry: &RegistryFile) -> Vec<LeaderboardPlayer> {
     players
 }
 
-async fn leaderboard(State(state): State<Arc<AppState>>) -> Json<LeaderboardResponse> {
+async fn leaderboard(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LeaderboardQuery>,
+) -> Json<LeaderboardResponse> {
     let registry = state.registry.read().await;
     let players = leaderboard_players(&registry);
+    let total = players.len();
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_LEADERBOARD_LIMIT)
+        .clamp(1, MAX_LEADERBOARD_LIMIT);
+    let players = players.into_iter().skip(offset).take(limit).collect();
+    let delegated_player_assets = registry
+        .players
+        .values()
+        .filter(|entry| entry.delegated_renewal)
+        .map(|entry| entry.player_asset.clone())
+        .collect();
     Json(LeaderboardResponse {
         generated_at: now_unix(),
+        total,
         players,
+        delegated_player_assets,
+        delegation_available: state.rollover_keys.is_some(),
     })
 }
 
-async fn social(State(state): State<Arc<AppState>>) -> Json<SocialResponse> {
-    let (players, delegated_player_assets) = {
-        let registry = state.registry.read().await;
-        let players = leaderboard_players(&registry);
-        let delegated = registry
-            .players
-            .values()
-            .filter(|entry| entry.delegated_renewal)
-            .map(|entry| entry.player_asset.clone())
-            .collect::<Vec<_>>();
-        (players, delegated)
-    };
-    let active = players
-        .iter()
-        .filter(|player| player.active)
-        .map(|player| player.player_asset.clone())
-        .collect::<BTreeSet<_>>();
+async fn presence(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PresenceQuery>,
+) -> Result<Json<PresenceResponse>, ApiError> {
+    if query.min_x > query.max_x
+        || query.min_y > query.max_y
+        || query.max_x >= state.verifier.map_width
+        || query.max_y >= state.verifier.map_height
+        || query.max_x - query.min_x + 1 > MAX_PRESENCE_QUERY_SPAN
+        || query.max_y - query.min_y + 1 > MAX_PRESENCE_QUERY_SPAN
+    {
+        return Err(ApiError::bad_request(
+            "presence viewport is invalid or too large",
+        ));
+    }
     let current_time = now_ms();
-    let locations = {
-        let mut locations = state.locations.write().await;
-        locations.retain(|player_asset, location| {
-            active.contains(player_asset)
-                && current_time.saturating_sub(location.updated_at_ms) <= PRESENCE_TTL_MS
-        });
-        locations.values().cloned().collect()
+    let active = {
+        let registry = state.registry.read().await;
+        leaderboard_players(&registry)
+            .into_iter()
+            .filter(|player| player.active)
+            .map(|player| player.player_asset)
+            .collect::<BTreeSet<_>>()
     };
-    let messages = state.chat.read().await.iter().cloned().collect();
-    Json(SocialResponse {
+    let (locations, truncated) = {
+        let mut locations = state.locations.write().await;
+        locations.retain_active(&active, current_time.saturating_sub(PRESENCE_TTL_MS));
+        locations.query(&query)
+    };
+    Ok(Json(PresenceResponse {
         generated_at_ms: current_time,
-        players,
         locations,
-        messages,
-        delegated_player_assets,
-        delegation_available: state.rollover_keys.is_some(),
+        truncated,
+    }))
+}
+
+async fn chat(State(state): State<Arc<AppState>>) -> Json<ChatResponse> {
+    Json(ChatResponse {
+        generated_at_ms: now_ms(),
+        messages: state.chat.read().await.iter().cloned().collect(),
     })
 }
 
@@ -859,6 +994,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         .locations
         .read()
         .await
+        .by_player
         .values()
         .filter(|location| location.updated_at_ms >= cutoff)
         .count();
@@ -872,8 +1008,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     })
 }
 
-async fn refresh_all(state: Arc<AppState>) -> Result<()> {
-    let registrations = state
+async fn refresh_batch(state: Arc<AppState>) -> Result<()> {
+    let all_registrations = state
         .registry
         .read()
         .await
@@ -881,6 +1017,23 @@ async fn refresh_all(state: Arc<AppState>) -> Result<()> {
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    let mut selected = BTreeMap::new();
+    if !all_registrations.is_empty() {
+        let batch_len = VERIFY_BATCH_SIZE.min(all_registrations.len());
+        let start =
+            state.refresh_cursor.fetch_add(batch_len, Ordering::Relaxed) % all_registrations.len();
+        for offset in 0..batch_len {
+            let entry = all_registrations[(start + offset) % all_registrations.len()].clone();
+            selected.insert(entry.player_asset.clone(), entry);
+        }
+        for entry in all_registrations
+            .into_iter()
+            .filter(|entry| entry.delegated_renewal)
+        {
+            selected.insert(entry.player_asset.clone(), entry);
+        }
+    }
+    let registrations = selected.into_values().collect::<Vec<_>>();
     let verifier = state.verifier.clone();
     let results = stream::iter(registrations)
         .map(|entry| {
@@ -928,7 +1081,6 @@ async fn refresh_all(state: Arc<AppState>) -> Result<()> {
             }
         }
     }
-    persist(&state).await?;
     let mut status = state.refresh_status.write().await;
     status.last_refresh_at = Some(now);
     status.last_error = first_error;
@@ -1163,11 +1315,8 @@ pub async fn run_cli() -> Result<()> {
         map_width,
         map_height,
     });
-    let mut registry = load_registry(&registry_path)?;
+    let registry = load_registry(&registry_path)?;
     validate_registry_consents(&registry, &verifier)?;
-    for entry in registry.players.values_mut() {
-        entry.state = None;
-    }
     let state = Arc::new(AppState {
         verifier,
         rollover_keys,
@@ -1175,13 +1324,14 @@ pub async fn run_cli() -> Result<()> {
         registry_path,
         persist_lock: Mutex::new(()),
         refresh_status: RwLock::new(RefreshStatus::default()),
-        locations: RwLock::new(BTreeMap::new()),
+        locations: RwLock::new(LocationIndex::default()),
         chat: RwLock::new(VecDeque::new()),
         action_timestamps: Mutex::new(BTreeMap::new()),
         next_chat_id: AtomicU64::new(1),
         force_renewal_once: AtomicBool::new(force_renewal_once),
+        refresh_cursor: AtomicUsize::new(0),
     });
-    if let Err(error) = refresh_all(state.clone()).await {
+    if let Err(error) = refresh_batch(state.clone()).await {
         eprintln!("woodland.sh server initial refresh: {error:#}");
     }
     if let Err(error) = renew_delegated_players(state.clone()).await {
@@ -1194,7 +1344,7 @@ pub async fn run_cli() -> Result<()> {
         interval.tick().await;
         loop {
             interval.tick().await;
-            if let Err(error) = refresh_all(refresh_state.clone()).await {
+            if let Err(error) = refresh_batch(refresh_state.clone()).await {
                 eprintln!("woodland.sh server refresh: {error:#}");
             }
             if let Err(error) = renew_delegated_players(refresh_state.clone()).await {
@@ -1208,10 +1358,10 @@ pub async fn run_cli() -> Result<()> {
     let app = Router::new()
         .route("/health.json", get(health))
         .route("/v1/leaderboard", get(leaderboard))
-        .route("/v1/social", get(social))
+        .route("/v1/presence", get(presence))
+        .route("/v1/chat", get(chat).post(post_chat))
         .route("/v1/players", post(register_player))
         .route("/v1/location", post(update_location))
-        .route("/v1/chat", post(post_chat))
         .route("/v1/delegation", post(set_delegation))
         .layer(DefaultBodyLimit::max(4096))
         .layer(
@@ -1372,6 +1522,46 @@ mod tests {
     }
 
     #[test]
+    fn location_index_moves_players_between_viewport_chunks() {
+        let mut index = LocationIndex::default();
+        index.upsert(PlayerLocation {
+            player_asset: "a".to_owned(),
+            x: 1,
+            y: 2,
+            updated_at_ms: 100,
+        });
+        index.upsert(PlayerLocation {
+            player_asset: "b".to_owned(),
+            x: 40,
+            y: 2,
+            updated_at_ms: 100,
+        });
+        let first_chunk = PresenceQuery {
+            min_x: 0,
+            min_y: 0,
+            max_x: 31,
+            max_y: 31,
+        };
+        assert_eq!(index.query(&first_chunk).0[0].player_asset, "a");
+        index.upsert(PlayerLocation {
+            player_asset: "a".to_owned(),
+            x: 41,
+            y: 3,
+            updated_at_ms: 200,
+        });
+        assert!(index.query(&first_chunk).0.is_empty());
+        let second_chunk = PresenceQuery {
+            min_x: 32,
+            min_y: 0,
+            max_x: 63,
+            max_y: 31,
+        };
+        assert_eq!(index.query(&second_chunk).0.len(), 2);
+        index.retain_active(&BTreeSet::from(["a".to_owned()]), 150);
+        assert_eq!(index.query(&second_chunk).0[0].player_asset, "a");
+    }
+
+    #[test]
     fn registry_round_trips_atomically() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1393,7 +1583,12 @@ mod tests {
             },
         );
         save_registry(&path, &registry).unwrap();
-        assert_eq!(load_registry(&path).unwrap().players.len(), 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("\"state\""));
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded.players.len(), 1);
+        assert!(loaded.players["player"].state.is_none());
+        assert!(loaded.players["player"].delegated_renewal);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

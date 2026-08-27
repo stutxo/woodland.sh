@@ -490,6 +490,20 @@ async function main() {
     assertLogSupply(deployed.state, 100, 'activated player');
     assertXpAccounting(deployed.state, 100, 'activated player');
     assertTreeValue(deployed.state, 'activated player');
+    const denseLocations = Array.from({ length: 500 }, (_, index) => ({
+      playerAsset: `synthetic-${index}`,
+      x: 4,
+      y: 17,
+      updatedAtMs: Date.now(),
+    }));
+    const denseFrame = await execute(`
+      globalThis.__WOODLAND_E2E_SET_REMOTE_LOCATIONS(arguments[0]);
+      return globalThis.__WOODLAND_E2E_MAP_FRAME;
+    `, [denseLocations]);
+    assert.equal(denseFrame.remotePlayerCount, 500);
+    assert.equal(denseFrame.clusterCount, 1);
+    assert.ok(denseFrame.visibleTileCount > 0);
+    await execute(`globalThis.__WOODLAND_E2E_SET_REMOTE_LOCATIONS([]);`);
     await clickCanvasPoint(4, 17);
     await waitFor(
       'canvas coordinate movement',

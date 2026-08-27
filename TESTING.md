@@ -62,6 +62,9 @@ Both mobile and desktop checks require the player overlay to remain exactly
 centered across every sampled frame while only the Canvas camera changes. Tests
 also require viewport-only tile rendering, zero per-tile DOM nodes, real canvas
 coordinate input, and movement rejection before activation.
+The primary browser also renders 500 synthetic nearby players as one Canvas
+cluster. Multiplayer profiles verify viewport-bounded presence after players
+move into different spatial regions.
 
 The same `dist/` layout can alternatively deploy to GitHub Pages. The artifact
 contains a manifest-specific CSP, `.nojekyll`, and an explicit 404. Gameplay

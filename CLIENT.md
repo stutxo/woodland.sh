@@ -120,6 +120,18 @@ registered players, a five-minute clock window, and increasing action
 timestamps. Delegated renewal uses the rollover leaf and preserves player state
 exactly; it never gives the server the player key.
 
+Read APIs are deliberately split by update rate:
+
+```text
+GET /v1/presence?minX=&minY=&maxX=&maxY=
+GET /v1/chat
+GET /v1/leaderboard?limit=&offset=
+```
+
+Presence bounds must fit within the declared map and span at most 128 tiles per
+axis. Responses contain at most 2,000 nearby players and report truncation.
+Leaderboard limits are capped at 200.
+
 ## Build a Swing
 
 Refresh state immediately before construction. Require player and tree inputs

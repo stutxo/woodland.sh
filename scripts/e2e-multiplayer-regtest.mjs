@@ -453,15 +453,18 @@ async function main() {
       browserPlayer.inspect,
       (value) => {
         if (!value.mapFrame) return false;
-        const visibleOthers = selectedTrees.filter((tree, index) => (
-          index !== viewerIndex
-          && tree.x >= value.mapFrame?.minX
-          && tree.x <= value.mapFrame?.maxX
-          && tree.y + 1 >= value.mapFrame?.minY
-          && tree.y + 1 <= value.mapFrame?.maxY
-        )).length;
+        const visibleIndexes = selectedTrees
+          .map((tree, index) => ({ tree, index }))
+          .filter(({ tree }) => (
+            tree.x >= value.mapFrame.minX
+            && tree.x <= value.mapFrame.maxX
+            && tree.y + 1 >= value.mapFrame.minY
+            && tree.y + 1 <= value.mapFrame.maxY
+          ));
+        const visibleOthers = visibleIndexes.filter(({ index }) => index !== viewerIndex).length;
         return value.remotePlayers === visibleOthers
-          && selectedTrees.every((tree, index) => value.social?.locations?.some((location) => (
+          && value.social?.truncated === false
+          && visibleIndexes.every(({ tree, index }) => value.social.locations.some((location) => (
             location.playerAsset === playerAssets[index]
             && location.x === tree.x
             && location.y === tree.y + 1

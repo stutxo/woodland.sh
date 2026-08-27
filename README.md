@@ -162,10 +162,11 @@ The server independently verifies:
   identity;
 - numeric XP against the XP asset held by the same state.
 
-It publishes the verified leaderboard and a two-second combined social snapshot.
-Claimed map locations expire after 60 seconds and are not covenant-enforced
-movement. Chat accepts one signed line of at most 280 characters every two
-seconds and retains only the newest 200 messages in memory.
+The browser polls viewport-bounded `/v1/presence` once per second, bounded chat
+every two seconds, and a paginated leaderboard every 15 seconds. Presence is
+indexed in 32×32 map chunks, expires after 60 seconds, and is capped per response.
+Chat accepts one signed line of at most 280 characters every two seconds and
+retains only the newest 200 messages in memory.
 
 Players can separately enable or revoke delegated renewal. When configured with
 the manifest's rollover key, the server renews opted-in state near expiry through

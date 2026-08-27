@@ -86,11 +86,15 @@ Tree discovery remains one shared-script query followed by packet-based lineage
 selection for ten declared trees.
 
 The optional game server is deliberately outside this state machine. Its
-registry is capped at 10,000 signed opt-ins and refreshes owner-specific scripts
-with bounded concurrency. That scan is $O(N)$ in registered players and can be
-sharded independently without changing covenant contention. Presence expires
-after 60 seconds, chat is bounded to 200 in-memory messages, and one combined
-snapshot serves the browser's two-second social poll.
+registry is capped at 10,000 signed opt-ins. Verification is staggered in
+256-player batches with bounded concurrency; delegated players and signed
+actions are verified on demand instead of waiting for their batch.
+
+Presence uses a 32×32 spatial chunk index. Clients query only their Canvas
+viewport plus a small margin, with a 2,000-player response cap. Canvas rendering
+touches visible tiles and nearby clusters rather than allocating one DOM node
+per world tile or player. Chat is bounded to 200 in-memory messages, and the
+leaderboard is paginated to at most 200 rows per request.
 
 BIP340 consent prevents third parties from opting in another owner or forging
 their location, chat, or delegation payload. It does not rate-limit arbitrary
