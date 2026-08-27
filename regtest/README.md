@@ -57,7 +57,7 @@ LOG and XP remain in that state; numeric XP must equal held XP.
 The wrapper checks out unmodified commit:
 
 ```text
-8b34e352859595cc03ba22ffa35088ab88b87fd9
+c7c3184f5cd416e231023f717489a5b0550960cc
 ```
 
 The source defaults to `.cache/arkd-stock`. Startup verifies expected image tags

@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REGTEST="$ROOT/regtest/regtest.mjs"
-ARKD_COMMIT=8b34e352859595cc03ba22ffa35088ab88b87fd9
-ARKD_IMAGE=arkd-local:8b34e35-forest-v1-stock
-ARKD_WALLET_IMAGE=arkd-wallet-local:8b34e35-forest-v1-stock
+ARKD_COMMIT=c7c3184f5cd416e231023f717489a5b0550960cc
+ARKD_IMAGE=arkd-local:c7c3184-forest-v1-stock
+ARKD_WALLET_IMAGE=arkd-wallet-local:c7c3184-forest-v1-stock
 export ARKD_IMAGE ARKD_WALLET_IMAGE
 OWNER_VOLUME=dark-forest-regtest-owner
 LOCK_FILE=/tmp/dark-forest-regtest.lock

@@ -63,7 +63,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: actions/setup-go@v6
         with:
-          go-version: 1.26.5
+          go-version: 1.26.6
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
@@ -151,7 +151,7 @@ jobs:
         run: ./scripts/regtest.sh build-images
       - name: Archive stock arkd images
         if: steps.arkd-images.outputs.cache-hit != 'true'
-        run: docker save arkd-local:8b34e35-forest-v1-stock arkd-wallet-local:8b34e35-forest-v1-stock | zstd --threads=0 --fast=3 > "$RUNNER_TEMP/woodland-arkd-images.tar.zst"
+        run: docker save arkd-local:c7c3184-forest-v1-stock arkd-wallet-local:c7c3184-forest-v1-stock | zstd --threads=0 --fast=3 > "$RUNNER_TEMP/woodland-arkd-images.tar.zst"
       - name: Run functional profile
         timeout-minutes: 12
         run: |

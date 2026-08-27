@@ -39,7 +39,8 @@ node scripts/test-assemble-web.mjs
 ## Stock arkd Boundary
 
 The regtest wrapper builds unmodified arkd commit
-`8b34e352859595cc03ba22ffa35088ab88b87fd9`. Protocol v1 uses ordinary Asset V1
+`c7c3184f5cd416e231023f717489a5b0550960cc`, including the upstream atomic
+offchain-spend fix. Protocol v1 uses ordinary Asset V1
 validity. TREE, LOG, XP, and each PLAYER_ID have no control asset; a fresh
 issuance creates a different AssetId rather than reissuing an existing one. No
 custom arkd patch is part of the protocol.
@@ -163,11 +164,12 @@ races every player against the same tree outpoint for 30 rounds:
 ```
 
 Every round requires exactly one committed player/tree transition, converged
-tree state, no pending chops, and conserved 100 LOG/XP across all players and
-trees. The runner determines the winner from reconciled outpoints rather than a
-possibly ambiguous submission response. The JSON report records both
-client-reported acceptances and recovered unknown outcomes, plus p50/p95 round
-latency, under `regtest/_build/soak-report.json`.
+tree state, no pending chops, conserved 100 LOG/XP across all players and trees,
+and indexed supplies of 10 TREE, 100 LOG, and 100 XP. The runner determines the
+winner from reconciled outpoints rather than a possibly ambiguous submission
+response. The JSON report records client-reported acceptances, recovered unknown
+outcomes, indexed supplies, and p50/p95 round latency under
+`regtest/_build/soak-report.json`.
 
 Load and remote-facing pressure are explicit:
 

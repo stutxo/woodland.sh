@@ -257,7 +257,7 @@ Eight-hour alternating full/soak runner with per-cycle artifacts:
 ```
 
 The stack builds unmodified arkd commit
-`8b34e352859595cc03ba22ffa35088ab88b87fd9` and uses the pinned Arkade Script
+`c7c3184f5cd416e231023f717489a5b0550960cc` and uses the pinned Arkade Script
 emulator image.
 
 ## Operator Commands

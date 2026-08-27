@@ -134,6 +134,19 @@ function percentile(values, ratio) {
   return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))];
 }
 
+async function fetchAssetSupply(baseUrl, assetId) {
+  const response = await fetch(
+    `${baseUrl.replace(/\/$/, '')}/v1/indexer/asset/${assetId}`,
+    { signal: AbortSignal.timeout(20_000) },
+  );
+  assert.equal(response.ok, true, `asset ${assetId} returned ${response.status}`);
+  const details = await response.json();
+  assert.equal(details.assetId, assetId, 'asset-details response changed asset ID');
+  const supply = Number(details.supply);
+  assert.ok(Number.isSafeInteger(supply) && supply >= 0, `asset ${assetId} has invalid supply`);
+  return supply;
+}
+
 const driverConfigs = Array.from({ length: PLAYER_COUNT }, (_, index) => ({
   port: DRIVER_BASE_PORT + index,
   websocketPort: DRIVER_BASE_PORT + PLAYER_COUNT + index,
@@ -329,6 +342,15 @@ try {
 
   const durations = roundReports.map((round) => round.durationMs);
   const health = await fetch(`${WEB_URL}/health.json`).then((response) => response.json());
+  const [treeMarkers, logs, xp] = await Promise.all([
+    fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.treeAsset),
+    fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.logAsset),
+    fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.xpAsset),
+  ]);
+  const indexedAssetSupplies = { treeMarkers, logs, xp };
+  assert.equal(treeMarkers, views[0].state.trees.length, 'indexed TREE supply changed');
+  assert.equal(logs, 100, 'indexed LOG supply changed');
+  assert.equal(xp, 100, 'indexed XP supply changed');
   const report = {
     profile: 'soak',
     webUrl: WEB_URL,
@@ -349,6 +371,7 @@ try {
     recoveredUnknownOutcomes,
     totalPlayerXp: views.reduce((total, view) => total + view.state.playerXp, 0),
     totalPlayerLogs: views.reduce((total, view) => total + view.state.playerLogs, 0),
+    indexedAssetSupplies,
     server: health,
     roundReports,
   };

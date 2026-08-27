@@ -102,6 +102,14 @@ The deployment machine temporarily needs all three children because the final
 manifest commits the maintenance and rollover public keys. It never needs either
 root mnemonic.
 
+The Arkade service must include upstream arkd commit
+`c7c3184f5cd416e231023f717489a5b0550960cc` or its equivalent offchain
+cache/DB projection fix. Older builds can accept concurrent spends of one VTXO
+after finalization removes its live reservation but before DB projection marks
+it spent. The Woodland contention soak reproduced permanent TREE, LOG, and XP
+supply inflation on the older pinned build. Verify this fix independently in
+the provider's exact version before funding.
+
 Follow the deployment sequence in the repository `README.md`:
 
 1. run `woodland-operator status` before funding;
