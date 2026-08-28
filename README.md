@@ -1,8 +1,8 @@
 # woodland.sh
 
 woodland.sh is an Arkade woodcutting protocol with recursive player and tree
-state. Ten trees use one shared covenant template but occupy independent VTXOs,
-so unrelated players and trees do not share a mutable input.
+state. Its 2,100 trees use one shared covenant template but occupy independent
+VTXOs, so unrelated players and trees do not share a mutable input.
 
 The reference browser is a client, not an authority. Arkade Script, fixed Asset
 V1 supplies, indexed lineage, and the schema 1 world manifest define the game.
@@ -18,9 +18,9 @@ One genesis transaction creates three uncontrolled, fixed-supply assets:
 
 | Genesis group | Asset | Supply | Initial allocation |
 | --- | --- | ---: | --- |
-| 0 | TREE | 10 | one per tree |
-| 1 | LOG | 100 | ten per tree |
-| 2 | XP | 100 | ten per tree |
+| 0 | TREE | 2,100 | one per tree |
+| 1 | LOG | 21,000 | ten per tree |
+| 2 | XP | 21,000 | ten per tree |
 
 Genesis metadata commits `game=woodland.sh`, `protocol=1`, and the asset name.
 All groups have `control_asset=None`; stock arkd rejects reissuance.
@@ -36,9 +36,9 @@ initial tree: 1 TREE + 10 LOG + 10 XP + health 5 + fixed 6D (1,980 sats)
 Numeric XP is not independently forgeable: it must equal the XP held by
 the recursive player state. A successful swing transfers one LOG and one
 XP from the selected tree into player state and increments XP by one. A
-miss transfers nothing. Total LOG and XP remain 100.
-The current 100-XP world cannot reach the level-10 chance bonus; higher
-probability tiers are forward-compatible policy, not active Season 1 balance.
+miss transfers nothing. Total LOG and XP remain 21,000. Base LOG chance is 25%,
+rising by one percentage point at levels 10, 20, 30, 40, and 50 to a 30% cap.
+The expanded XP supply makes the lower bonus tiers reachable.
 
 ## Atomic Swing
 

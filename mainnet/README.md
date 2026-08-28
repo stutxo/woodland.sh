@@ -116,7 +116,7 @@ Follow the deployment sequence in the repository `README.md`:
 2. fund the exact Arkade address and amount it reports;
 3. run `woodland-operator ensure` until complete;
 4. require `woodland-operator status` to report `ready`;
-5. verify ten tree VTXOs and fixed asset supplies;
+5. verify 2,100 tree VTXOs and fixed asset supplies;
 6. back up and commit the public manifest.
 
 After verification, remove `WOODLAND_DEPLOYER_SECRET` from online systems. If

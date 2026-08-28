@@ -86,11 +86,25 @@ function renewAsync(...args) {
 }
 
 async function indexerVtxos(params) {
-  const query = new URLSearchParams(params);
-  const response = await fetch(`${ARKD}/v1/indexer/vtxos?${query}`);
-  if (!response.ok) throw new Error(`indexer query failed: ${await response.text()}`);
-  const payload = await response.json();
-  return payload.vtxos || [];
+  const records = [];
+  const visited = new Set();
+  let pageIndex = 1;
+  while (!visited.has(pageIndex)) {
+    visited.add(pageIndex);
+    const query = new URLSearchParams({
+      ...params,
+      'page.size': '500',
+      'page.index': String(pageIndex),
+    });
+    const response = await fetch(`${ARKD}/v1/indexer/vtxos?${query}`);
+    if (!response.ok) throw new Error(`indexer query failed: ${await response.text()}`);
+    const payload = await response.json();
+    records.push(...(payload.vtxos || []));
+    const next = Number(payload.page?.next || 0);
+    if (next <= pageIndex) break;
+    pageIndex = next;
+  }
+  return records;
 }
 
 async function virtualTxBytes(txid) {
@@ -152,10 +166,10 @@ async function main() {
   assert.equal(manifest.gameId, 'woodland.sh');
   assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');
   assert.equal(manifest.maxPlayerLevel, 99);
-  assert.equal(manifest.baseLogDropBasisPoints, 1_000);
+  assert.equal(manifest.baseLogDropBasisPoints, 2_500);
   assert.equal(manifest.levelLogDropBonusBasisPoints, 100);
   assert.deepEqual(manifest.levelLogDropXpThresholds, [1_154, 4_470, 13_363, 37_224, 101_333]);
-  assert.equal(manifest.maxLevelLogDropBasisPoints, 1_500);
+  assert.equal(manifest.maxLevelLogDropBasisPoints, 3_000);
   assert.equal(manifest.activeLogsPerTree, 5);
   assert.equal(manifest.logReservePerTree, 10);
   assert.equal(manifest.xpPerTree, 10);
@@ -204,11 +218,18 @@ async function main() {
   assert.equal(logAssetInfo.controlAsset || '', '');
   assert.equal(xpAssetInfo.controlAsset || '', '');
   const worldBefore = await indexerVtxos({ scripts: treeScript, spendableOnly: 'true' });
-  assert.equal(worldBefore.length, 10, 'all ten trees must be live before renewal');
+  assert.equal(
+    worldBefore.length,
+    manifest.trees.length,
+    'all declared trees must be live before renewal',
+  );
   const totalsBefore = worldAssetTotals(worldBefore, treeAsset, logAsset, xpAsset);
-  assert.equal(totalsBefore.trees, 10);
+  assert.equal(totalsBefore.trees, manifest.trees.length);
   assert.equal(totalsBefore.logs, totalsBefore.xp);
-  assert.ok(totalsBefore.logs > 0 && totalsBefore.logs <= 100);
+  assert.ok(
+    totalsBefore.logs > 0
+      && totalsBefore.logs <= manifest.logReservePerTree * manifest.trees.length,
+  );
 
   // Join two renewals to the same batch. Each topic-filtered client receives
   // its own path while parent chunks retain omitted sibling references.
@@ -275,7 +296,7 @@ async function main() {
 
   // World-wide conservation is untouched by both renewals.
   const world = await indexerVtxos({ scripts: treeScript, spendableOnly: 'true' });
-  assert.equal(world.length, 10, 'all ten trees remain live');
+  assert.equal(world.length, manifest.trees.length, 'all declared trees remain live');
   const totals = worldAssetTotals(world, treeAsset, logAsset, xpAsset);
   assert.deepEqual(
     totals,

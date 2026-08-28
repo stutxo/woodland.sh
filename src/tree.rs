@@ -31,10 +31,10 @@ use bitcoin::{Network, Psbt, ScriptBuf, Sequence, Transaction, XOnlyPublicKey};
 
 pub const LOGS_PER_TREE: u64 = 5;
 pub const CHOP_ROLL_BASIS_POINTS: u64 = 10_000;
-pub const BASE_LOG_DROP_BASIS_POINTS: u64 = 1_000;
+pub const BASE_LOG_DROP_BASIS_POINTS: u64 = 2_500;
 pub const LEVEL_LOG_DROP_BONUS_BASIS_POINTS: u64 = 100;
 pub const LEVEL_LOG_DROP_XP_THRESHOLDS: [u64; 5] = [1_154, 4_470, 13_363, 37_224, 101_333];
-pub const MAX_LEVEL_LOG_DROP_BASIS_POINTS: u64 = 1_500;
+pub const MAX_LEVEL_LOG_DROP_BASIS_POINTS: u64 = 3_000;
 pub const RESPAWN_MIN_SECS: i64 = 20;
 pub const RESPAWN_MAX_SECS: i64 = 40;
 
@@ -1798,16 +1798,16 @@ mod tests {
             [10, 20, 30, 40, 50].map(|level| crate::player::xp_for_level(level).unwrap())
         );
         for (xp, basis_points) in [
-            (0, 1_000),
-            (1_153, 1_000),
-            (1_154, 1_100),
-            (4_469, 1_100),
-            (4_470, 1_200),
-            (13_363, 1_300),
-            (37_224, 1_400),
-            (101_332, 1_400),
-            (101_333, 1_500),
-            (u64::MAX, 1_500),
+            (0, 2_500),
+            (1_153, 2_500),
+            (1_154, 2_600),
+            (4_469, 2_600),
+            (4_470, 2_700),
+            (13_363, 2_800),
+            (37_224, 2_900),
+            (101_332, 2_900),
+            (101_333, 3_000),
+            (u64::MAX, 3_000),
         ] {
             assert_eq!(log_drop_basis_points(xp), basis_points, "XP {xp}");
         }
@@ -1827,7 +1827,7 @@ mod tests {
     #[cfg(feature = "regtest-e2e")]
     #[test]
     fn respawn_delays_are_bounded_and_staggered() {
-        let delays = crate::world::TREE_STATES
+        let delays = crate::world::tree_states()
             .into_iter()
             .enumerate()
             .map(|(index, state)| {

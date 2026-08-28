@@ -52,6 +52,6 @@ SERVER_PID=$!
 
 printf '\nwoodland.sh: http://127.0.0.1:%s/\n' "$PORT"
 printf 'Static app, leaderboard, presence, chat, and delegation share this origin.\n'
-printf 'Every LOG drop gives 1 XP. LOG chance rises from 10%% to 15%% at woodland levels 10, 20, 30, 40, and 50.\n'
+printf 'Every LOG drop gives 1 XP. LOG chance rises from 25%% to 30%% at woodland levels 10, 20, 30, 40, and 50.\n'
 printf 'Renewable stumps return after 20-40 seconds; exhausted trees stay depleted.\n\n'
 wait -n "$WATCHER_PID" "$SERVER_PID"

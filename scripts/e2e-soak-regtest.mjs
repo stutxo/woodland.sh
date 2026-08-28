@@ -39,6 +39,9 @@ const RELOAD_COUNT = setting(
   1,
   PLAYER_COUNT,
 );
+const SOAK_VIEWPORT_MAX = 64;
+let expectedLogSupply = 0;
+let expectedXpSupply = 0;
 const ROUND_DELAY_MS = setting('WOODLAND_SOAK_ROUND_DELAY_MS', 500, 0, 60_000);
 const DRIVER_BASE_PORT = setting('WOODLAND_SOAK_DRIVER_PORT', 15_500, 1_024, 60_000);
 const OPERATION_TIMEOUT_MS = setting('WOODLAND_SOAK_TIMEOUT_MS', 240_000, 30_000, 900_000);
@@ -149,8 +152,8 @@ function assertConverged(views, label) {
   const treeXp = views[0].state.trees.reduce((total, tree) => total + tree.xpRemaining, 0);
   const playerLogs = views.reduce((total, view) => total + view.state.playerLogs, 0);
   const playerXp = views.reduce((total, view) => total + view.state.playerXp, 0);
-  assert.equal(treeLogs + playerLogs, 100, `${label}: LOG supply changed`);
-  assert.equal(treeXp + playerXp, 100, `${label}: XP supply changed`);
+  assert.equal(treeLogs + playerLogs, expectedLogSupply, `${label}: LOG supply changed`);
+  assert.equal(treeXp + playerXp, expectedXpSupply, `${label}: XP supply changed`);
 }
 
 async function refreshUntilConverged(players, label) {
@@ -216,7 +219,10 @@ function selectRoundTargets(shared, stickyTargetTreeId, round) {
     return { targetTrees: [target], stickyTargetTreeId: target.treeId };
   }
   const liveTrees = shared.trees.filter(
-    (tree) => tree.health > 0 && tree.logReserveRemaining > 0,
+    (tree) => tree.x <= SOAK_VIEWPORT_MAX
+      && tree.y <= SOAK_VIEWPORT_MAX
+      && tree.health > 0
+      && tree.logReserveRemaining > 0,
   );
   assert.ok(
     liveTrees.length >= TREES_PER_ROUND,
@@ -362,6 +368,8 @@ try {
     throw new Error(`world manifest returned ${manifestResponse.status}`);
   }
   const manifest = await manifestResponse.json();
+  expectedLogSupply = manifest.logReservePerTree * manifest.trees.length;
+  expectedXpSupply = manifest.xpPerTree * manifest.trees.length;
   const arkadeHost = new URL(manifest.arkadeServiceUrl).hostname;
   const localFunding = ['127.0.0.1', 'localhost'].includes(arkadeHost);
   if (!localFunding && !FUND_COMMAND) {
@@ -433,6 +441,14 @@ try {
       OPERATION_TIMEOUT_MS,
     );
   });
+
+  await mapLimit(players, ACTIVATION_CONCURRENCY, (player) => player.execute(
+    `globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT(0, 0, arguments[0], arguments[1]);`,
+    [
+      Math.min(SOAK_VIEWPORT_MAX, manifest.mapWidth - 1),
+      Math.min(SOAK_VIEWPORT_MAX, manifest.mapHeight - 1),
+    ],
+  ));
 
   let views = await mapLimit(players, ACTIVATION_CONCURRENCY, async (player) => {
     const refreshed = await player.refresh();
@@ -511,8 +527,8 @@ try {
   ]);
   const indexedAssetSupplies = { treeMarkers, logs, xp };
   assert.equal(treeMarkers, views[0].state.trees.length, 'indexed TREE supply changed');
-  assert.equal(logs, 100, 'indexed LOG supply changed');
-  assert.equal(xp, 100, 'indexed XP supply changed');
+  assert.equal(logs, expectedLogSupply, 'indexed LOG supply changed');
+  assert.equal(xp, expectedXpSupply, 'indexed XP supply changed');
   const report = {
     profile: 'soak',
     webUrl: WEB_URL,

@@ -11,14 +11,14 @@ Every manifest field is mandatory; incomplete or unknown manifests fail closed.
 One transaction creates three fixed-supply Asset V1 groups:
 
 ```text
-group 0:  10 TREE
-group 1: 100 LOG
-group 2: 100 XP
+group 0:  2,100 TREE
+group 1: 21,000 LOG
+group 2: 21,000 XP
 ```
 
-All groups are uncontrolled. Ten deployment transactions place one TREE, ten
-LOG, ten XP, and 1,980 sats into each shared tree contract. World bootstrap
-therefore needs 19,800 sats; no player reserve exists.
+All groups are uncontrolled. A deterministic 2,100-transaction deployment places
+one TREE, ten LOG, ten XP, and 1,980 sats into each shared tree contract. World
+bootstrap therefore needs 4,158,000 sats; no player reserve exists.
 
 ## Tree State
 
@@ -45,8 +45,8 @@ outputs: player, tree, merged extension, anchor
 groups:  PLAYER_ID, TREE, LOG, XP
 ```
 
-For input player XP `X`, the LOG threshold is 1,000 basis points plus 100 at
-each canonical level boundary 10, 20, 30, 40, and 50, capped at 1,500. Let `G`
+For input player XP `X`, the LOG threshold is 2,500 basis points plus 100 at
+each canonical level boundary 10, 20, 30, 40, and 50, capped at 3,000. Let `G`
 be the resulting public drop bit.
 
 The tree covenant enforces atomically:

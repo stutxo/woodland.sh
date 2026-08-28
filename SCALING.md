@@ -33,6 +33,7 @@ browser:        camera, walking animation, focused tree
 server durable: signed registration and renewal delegation consent
 server live:    signed presence, bounded chat, replay clocks
 derived:        leaderboard projected from registered live player VTXOs
+```
 
 The server's entire live multiplayer state is one `MultiplayerState`: a location
 index, a 200-message chat deque, per-action replay timestamps, and the next chat
@@ -56,11 +57,11 @@ user-owned 330-sat VTXO, issues one unique uncontrolled marker, and creates one
 owner-specific state. Capacity is bounded by Arkade throughput and
 client/indexer resources, not a protocol ticket count.
 
-Season rewards remain fixed:
+Season rewards remain fixed for the expanded world:
 
 ```text
-100 LOG
-100 XP
+21,000 LOG
+21,000 XP
 ```
 
 XP moves into player state rather than disappearing, so supply conservation
@@ -112,8 +113,11 @@ gameplay input.
 Player contracts are owner-specific P2TR scripts. A browser queries its own
 script and selects only a state carrying its profile's exact PLAYER_ID, so
 public lookalikes do not create ambiguous state. It does not scan all players.
-Tree discovery remains one shared-script query followed by packet-based lineage
-selection for ten declared trees.
+Tree discovery starts from the 2,100 manifest-pinned deployment outpoints and
+follows each exact indexed successor. Shared-script pagination is not on the
+browser path. Creating transactions are fetched in bounded parallel chunks only
+for changed lineages, while snapshots serialize dynamic state for the current
+viewport and merge it with the static manifest layout.
 
 The optional game server is deliberately outside this state machine. Its
 registry is capped at 10,000 automatically registered players. Verification is

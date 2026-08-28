@@ -712,6 +712,8 @@ mod tests {
             expires_at: Some(i64::MAX),
             is_preconfirmed: false,
             is_swept: false,
+            spent_by: None,
+            settled_by: None,
             is_unrolled: false,
             is_spent: false,
         }

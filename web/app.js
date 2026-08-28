@@ -60,8 +60,8 @@ const sendChatButton = element('send-chat');
 const chatMessagesElement = element('chat-messages');
 const chatStatus = element('chat-status');
 
-const DEFAULT_MAP_WIDTH = 45;
-const DEFAULT_MAP_HEIGHT = 19;
+const DEFAULT_MAP_WIDTH = 425;
+const DEFAULT_MAP_HEIGHT = 425;
 const WALK_STEP_MS = 45;
 const CHOP_FLASH_MS = 340;
 const CHOP_CADENCE_MS = 1_000;
@@ -70,7 +70,7 @@ const LOG_FLASH_MS = 800;
 const DIRECTIONS = [[0, -1], [-1, 0], [1, 0], [0, 1]];
 const TREE_GLYPH = '🌲';
 const TILE_SIZE = 20;
-const PATH_NODE_LIMIT = 4096;
+const MAX_PATH_NODES = 262_144;
 const player = { x: 3, y: 17 };
 
 let app;
@@ -108,10 +108,19 @@ let locationPosting = false;
 let lastPublishedLocation = null;
 let lastRenderedChatId = null;
 let mapFrame = null;
+let worldManifest = null;
+let treeLayout = [];
+const treeViews = new Map();
+let treeViewportOverride = null;
 
 let pendingRetryAfter = 0;
+let nextWorldRefreshAt = 0;
 function withApp(action) {
-  const operation = appQueue.then(action, action);
+  const invoke = () => {
+    syncAppTreeViewport();
+    return action();
+  };
+  const operation = appQueue.then(invoke, invoke);
   appQueue = operation.catch(() => {});
   return operation;
 }
@@ -213,17 +222,31 @@ function updateServerStatus() {
 }
 
 function currentPresenceBounds() {
-  if (!state) return null;
+  const mapWidth = state?.mapWidth || worldManifest?.mapWidth;
+  const mapHeight = state?.mapHeight || worldManifest?.mapHeight;
+  if (!mapWidth || !mapHeight) return null;
   const halfWidth = Math.ceil((map.clientWidth || mapViewport.clientWidth) / TILE_SIZE / 2) + 4;
   const halfHeight = Math.ceil((map.clientHeight || mapViewport.clientHeight) / TILE_SIZE / 2) + 4;
-  const focusX = state.playerActive ? player.x : Math.floor(state.mapWidth / 2);
-  const focusY = state.playerActive ? player.y : Math.floor(state.mapHeight / 2);
+  const focusX = state?.playerActive ? player.x : Math.floor(mapWidth / 2);
+  const focusY = state?.playerActive ? player.y : Math.floor(mapHeight / 2);
   return {
     minX: Math.max(0, focusX - halfWidth),
     minY: Math.max(0, focusY - halfHeight),
-    maxX: Math.min(state.mapWidth - 1, focusX + halfWidth),
-    maxY: Math.min(state.mapHeight - 1, focusY + halfHeight),
+    maxX: Math.min(mapWidth - 1, focusX + halfWidth),
+    maxY: Math.min(mapHeight - 1, focusY + halfHeight),
   };
+}
+
+function syncAppTreeViewport() {
+  const bounds = treeViewportOverride || currentPresenceBounds();
+  if (app && bounds) app.setTreeViewport(bounds.minX, bounds.minY, bounds.maxX, bounds.maxY);
+}
+
+function adoptState(nextState) {
+  for (const tree of nextState.trees || []) treeViews.set(tree.treeId, tree);
+  nextState.trees = treeLayout.map((tree) => treeViews.get(tree.treeId) || tree);
+  state = nextState;
+  return state;
 }
 
 async function refreshPresence() {
@@ -430,7 +453,9 @@ function findWalkPath(targets) {
   let foundKey = null;
   for (
     let index = 0;
-    index < queue.length && foundKey == null && previous.size < PATH_NODE_LIMIT;
+    index < queue.length
+      && foundKey == null
+      && previous.size < Math.min(state.mapWidth * state.mapHeight, MAX_PATH_NODES);
     index += 1
   ) {
     const current = queue[index];
@@ -975,7 +1000,7 @@ async function run(label, action, completion = () => 'Success') {
   setBusy(true, label);
   appendLog(label);
   try {
-    state = await withApp(action);
+    adoptState(await withApp(action));
     status.classList.remove('error');
     const message = completion(state);
     status.textContent = message;
@@ -1038,6 +1063,12 @@ async function renewPlayer() {
   return app.renewPlayer();
 }
 
+async function refreshWorld() {
+  const nextState = await app.refreshWorld();
+  nextWorldRefreshAt = Date.now() + 60_000;
+  return nextState;
+}
+
 
 async function activatePlayer() {
   return app.activate();
@@ -1094,7 +1125,7 @@ async function chopUntilLog(treeId) {
       } finally {
         clearInterval(feedbackTimer);
       }
-      state = nextState;
+      adoptState(nextState);
       swings += 1;
       success = state.lastAttempt?.success === true;
       if (success) flashTree(treeId, 'log', LOG_FLASH_MS, false);
@@ -1209,6 +1240,24 @@ async function boot() {
     }
     const world = await worldResponse.text();
     const manifest = JSON.parse(world);
+    worldManifest = manifest;
+    treeLayout = manifest.trees.map(({ state: tree, deploymentTxid }) => ({
+      treeId: tree.treeId,
+      x: tree.x,
+      y: tree.y,
+      health: manifest.activeLogsPerTree,
+      logReserveRemaining: manifest.logReservePerTree,
+      xpRemaining: manifest.xpPerTree,
+      valueSats: manifest.dustSats * (manifest.activeLogsPerTree + 1),
+      treeOutpoint: `${deploymentTxid}:0`,
+      deploymentTxid,
+      lastAttemptTxid: null,
+      nextRollBucket: null,
+      nextDrop: false,
+      expiresInSeconds: null,
+      respawnAt: null,
+      respawnInSeconds: null,
+    }));
     pendingStorageKey = `woodland.sh:web:v1:pending:${manifest.arkadeServiceUrl.replace(/\/+$/, '')}`;
     app = await WoodlandApp.init(
       manifest.arkadeServiceUrl,
@@ -1218,13 +1267,14 @@ async function boot() {
       localStorage.getItem(PROFILE) || undefined,
     );
     localStorage.setItem(KEY, app.exportKey());
-    state = await app.refresh();
+    syncAppTreeViewport();
+    adoptState(await refreshWorld());
     persistProfile();
     restorePosition();
     if (state.pendingChopTxid) {
       appendLog(`Resuming pending swing ${state.pendingChopTxid}...`);
       try {
-        state = await app.resumePendingChop();
+        adoptState(await app.resumePendingChop());
         appendLog('Pending swing reconciled.');
       } catch (error) {
         const message = `Pending swing remains unresolved: ${error}`;
@@ -1237,8 +1287,11 @@ async function boot() {
     if (!state.pendingChopTxid) status.textContent = 'Ready';
     appendLog('Connected to woodland.sh');
     globalThis.__WOODLAND_E2E_READY = true;
+    globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT = (minX, minY, maxX, maxY) => {
+      treeViewportOverride = { minX, minY, maxX, maxY };
+    };
     globalThis.__WOODLAND_E2E_SUBMISSION_RECOVERY = async (treeId) => {
-      state = await withApp(() => app.testSubmissionRecovery(treeId));
+      adoptState(await withApp(() => app.testSubmissionRecovery(treeId)));
       render();
       return state;
     };
@@ -1261,10 +1314,15 @@ async function boot() {
     );
     globalThis.__WOODLAND_E2E_INVALID_XP = async (treeId) => {
       await withApp(() => app.testInvalidXpTransition(treeId));
-      return withApp(() => app.refresh());
+      return withApp(refreshWorld);
     };
     globalThis.__WOODLAND_E2E_REFRESH = async () => {
-      state = await withApp(() => app.refresh());
+      adoptState(await withApp(() => app.refresh()));
+      render();
+      return state;
+    };
+    globalThis.__WOODLAND_E2E_REFRESH_WORLD = async () => {
+      adoptState(await withApp(refreshWorld));
       render();
       return state;
     };
@@ -1290,7 +1348,7 @@ async function boot() {
     };
     globalThis.__WOODLAND_E2E_CHOP_EXPECTED = async (...args) => {
       try {
-        state = await withApp(() => app.chopExpected(...args));
+        adoptState(await withApp(() => app.chopExpected(...args)));
         render();
         return { ok: true, state };
       } catch (error) {
@@ -1298,12 +1356,12 @@ async function boot() {
       }
     };
     globalThis.__WOODLAND_E2E_RESUME_PENDING = async () => {
-      state = await withApp(() => app.resumePendingChop());
+      adoptState(await withApp(() => app.resumePendingChop()));
       render();
       return state;
     };
     globalThis.__WOODLAND_E2E_RENEW_PLAYER = async () => {
-      state = await withApp(renewPlayer);
+      adoptState(await withApp(renewPlayer));
       render();
       return state;
     };
@@ -1342,9 +1400,12 @@ setInterval(async () => {
     const resumePending = Boolean(state?.pendingChopTxid)
       && Date.now() >= pendingRetryAfter;
     if (resumePending) pendingRetryAfter = Date.now() + 5_000;
-    state = await withApp(() => (
-      resumePending ? app.resumePendingChop() : app.refresh()
-    ));
+    const refreshWorld = !resumePending && Date.now() >= nextWorldRefreshAt;
+    adoptState(await withApp(() => {
+      if (resumePending) return app.resumePendingChop();
+      return refreshWorld ? app.refreshWorld() : app.refresh();
+    }));
+    if (refreshWorld) nextWorldRefreshAt = Date.now() + 60_000;
     if (resumePending && !state.pendingChopTxid) {
       pendingRetryAfter = 0;
       status.textContent = 'Pending swing recovered.';
@@ -1358,7 +1419,7 @@ setInterval(async () => {
       && !delegatedRenewal
     ) {
       status.textContent = 'Rolling player state into a fresh Arkade batch...';
-      state = await renewPlayer();
+      adoptState(await renewPlayer());
     }
     persistProfile();
     render();
@@ -1368,7 +1429,7 @@ setInterval(async () => {
   } catch {}
   finally { polling = false; }
 
-}, 1000);
+}, 10_000);
 window.addEventListener('resize', renderMap);
 
 setInterval(() => {

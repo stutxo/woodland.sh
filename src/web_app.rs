@@ -14,6 +14,7 @@ use ark_core::send::{
     build_offchain_transactions, sign_ark_transaction, sign_checkpoint_transaction, SendReceiver,
     VtxoInput,
 };
+use ark_core::Asset;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -57,7 +58,7 @@ struct LiveTree {
     health: TreeHealth,
     deployment_txid: Txid,
     record: VtxoRecord,
-    previous_tx: Transaction,
+    previous_tx: Option<Transaction>,
     last_attempt_txid: Option<Txid>,
 }
 
@@ -164,6 +165,23 @@ struct ExpectedChop {
     tree_outpoint: String,
     player_state_outpoint: String,
     drop: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TreeViewport {
+    min_x: u16,
+    min_y: u16,
+    max_x: u16,
+    max_y: u16,
+}
+
+impl TreeViewport {
+    fn contains(self, state: TreeState) -> bool {
+        state.x >= self.min_x
+            && state.x <= self.max_x
+            && state.y >= self.min_y
+            && state.y <= self.max_y
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,6 +396,7 @@ pub struct WoodlandApp {
     info: ark_core::server::Info,
     world: World,
     trees: Vec<LiveTree>,
+    tree_viewport: TreeViewport,
     profile: PlayerProfile,
     player_state: Option<LivePlayerState>,
     wallet_records: Vec<VtxoRecord>,
@@ -475,6 +494,12 @@ impl WoodlandApp {
             },
         };
         let info = txbuild::server_info(&params);
+        let tree_viewport = TreeViewport {
+            min_x: 0,
+            min_y: 0,
+            max_x: manifest.map_width.saturating_sub(1).min(64),
+            max_y: manifest.map_height.saturating_sub(1).min(64),
+        };
         Ok(Self {
             keys,
             rest,
@@ -493,6 +518,7 @@ impl WoodlandApp {
                 declared_trees,
             },
             trees: Vec::new(),
+            tree_viewport,
             profile,
             player_state: None,
             wallet_records: Vec::new(),
@@ -507,6 +533,30 @@ impl WoodlandApp {
             .expect("validated player VTXO")
             .to_ark_address()
             .encode()
+    }
+
+    #[wasm_bindgen(js_name = setTreeViewport)]
+    pub fn set_tree_viewport(
+        &mut self,
+        min_x: u16,
+        min_y: u16,
+        max_x: u16,
+        max_y: u16,
+    ) -> Result<(), JsValue> {
+        if min_x > max_x
+            || min_y > max_y
+            || max_x >= self.world.manifest.map_width
+            || max_y >= self.world.manifest.map_height
+        {
+            return Err(JsValue::from_str("tree viewport is outside the world map"));
+        }
+        self.tree_viewport = TreeViewport {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        };
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = exportKey)]
@@ -650,9 +700,22 @@ impl WoodlandApp {
         self.renew_player_inner().await.map_err(js_err)?;
         self.refresh().await
     }
-
     pub async fn refresh(&mut self) -> Result<JsValue, JsValue> {
+        self.sync_player().await.map_err(js_err)?;
+        serde_wasm_bindgen::to_value(&self.snapshot())
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = refreshWorld)]
+    pub async fn refresh_world(&mut self) -> Result<JsValue, JsValue> {
         self.sync().await.map_err(js_err)?;
+        serde_wasm_bindgen::to_value(&self.snapshot())
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = refreshPlayer)]
+    pub async fn refresh_player(&mut self) -> Result<JsValue, JsValue> {
+        self.sync_player().await.map_err(js_err)?;
         serde_wasm_bindgen::to_value(&self.snapshot())
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -815,6 +878,7 @@ impl WoodlandApp {
         let trees = self
             .trees
             .iter()
+            .filter(|tree| self.tree_viewport.contains(tree.state))
             .map(|tree| {
                 let logs = tree.record.asset_amount(self.world.log_asset).unwrap_or(0);
                 let xp_balance = tree.record.asset_amount(self.world.xp_asset).unwrap_or(0);
@@ -935,10 +999,15 @@ impl WoodlandApp {
     }
 
     async fn sync(&mut self) -> Result<()> {
+        let mut initialized_trees = !self.trees.is_empty();
         let mut last_transient = None;
         for attempt in 0..INDEX_ATTEMPTS {
             match self.sync_once().await {
-                Ok(()) => return Ok(()),
+                Ok(()) if initialized_trees => return Ok(()),
+                Ok(()) => {
+                    initialized_trees = true;
+                    continue;
+                }
                 Err(error) if error.downcast_ref::<TransientIndexSnapshot>().is_some() => {
                     last_transient = Some(error);
                 }
@@ -956,16 +1025,27 @@ impl WoodlandApp {
     async fn sync_once(&mut self) -> Result<()> {
         let wallet = player_vtxo(&self.keys, &self.params)?;
         let wallet_script = wallet.script_pubkey().to_hex_string();
-        let tree_script = self.world.contract.vtxo.script_pubkey().to_hex_string();
         let player_contract = self.player_contract()?;
         let player_asset = self.player_asset()?;
-        let tree_records = wait_for_complete_tree_records(
-            &self.rest,
-            &tree_script,
-            &self.world,
-            self.world.manifest.dust_sats,
-        )
-        .await?;
+        let initializing_trees = self.trees.is_empty();
+        let trees_to_refresh = self
+            .trees
+            .iter()
+            .filter(|tree| self.tree_viewport.contains(tree.state))
+            .cloned()
+            .collect::<Vec<_>>();
+        let expected_tree_count = if initializing_trees {
+            self.world.declared_trees.len()
+        } else {
+            trees_to_refresh.len()
+        };
+        let tree_records = if initializing_trees {
+            load_current_tree_records(&self.rest, &self.world, &[]).await?
+        } else if trees_to_refresh.is_empty() {
+            Vec::new()
+        } else {
+            load_current_tree_records(&self.rest, &self.world, &trees_to_refresh).await?
+        };
         let wallet_records = self.rest.get_vtxos(&wallet_script, "spendableOnly").await?;
         let player_state_record = match player_asset {
             Some(player_asset) => {
@@ -981,17 +1061,88 @@ impl WoodlandApp {
             None => None,
         };
 
-        let mut txids: Vec<_> = tree_records
+        let declared_by_state = self
+            .world
+            .declared_trees
             .iter()
-            .map(|record| record.outpoint.txid)
-            .collect();
-        if let Some(record) = &player_state_record {
-            txids.push(record.outpoint.txid);
-        }
-        let transactions = wait_for_virtual_txs(&self.rest, &txids).await?;
+            .map(|tree| (tree.state, *tree))
+            .collect::<std::collections::HashMap<_, _>>();
+        let declared_by_deployment = self
+            .world
+            .declared_trees
+            .iter()
+            .map(|tree| (tree.deployment_txid, *tree))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut cached_by_outpoint = trees_to_refresh
+            .into_iter()
+            .map(|tree| (tree.record.outpoint, tree))
+            .collect::<std::collections::HashMap<_, _>>();
         let mut discovered = Vec::with_capacity(tree_records.len());
+        let mut uncached_records = Vec::new();
         let mut seen_states = std::collections::HashMap::new();
         for record in tree_records {
+            if let Some(mut cached) = cached_by_outpoint.remove(&record.outpoint) {
+                if let Some(previous_tx) = cached.previous_tx.as_ref() {
+                    record.validate_creating_transaction(previous_tx)?;
+                } else {
+                    validate_initial_tree_record(
+                        &record,
+                        &self.world,
+                        cached.state,
+                        cached.deployment_txid,
+                    )?;
+                }
+                if let Some(competing) = seen_states.insert(cached.state, record.outpoint) {
+                    return Err(transient_index_snapshot(format!(
+                        "tree {} exposes competing spendable lineages {competing} and {}",
+                        cached.state.tree_id, record.outpoint
+                    )));
+                }
+                cached.record = record;
+                discovered.push(cached);
+            } else if let Some(declared) = declared_by_deployment.get(&record.outpoint.txid) {
+                validate_initial_tree_record(
+                    &record,
+                    &self.world,
+                    declared.state,
+                    declared.deployment_txid,
+                )?;
+                if let Some(competing) = seen_states.insert(declared.state, record.outpoint) {
+                    return Err(transient_index_snapshot(format!(
+                        "tree {} exposes competing spendable lineages {competing} and {}",
+                        declared.state.tree_id, record.outpoint
+                    )));
+                }
+                discovered.push(LiveTree {
+                    state: declared.state,
+                    roll: tree::TreeRoll::initial(declared.state),
+                    health: tree::TreeHealth::new(self.world.manifest.active_logs_per_tree)?,
+                    deployment_txid: declared.deployment_txid,
+                    record,
+                    previous_tx: None,
+                    last_attempt_txid: None,
+                });
+            } else {
+                uncached_records.push(record);
+            }
+        }
+
+        let cached_player = self.player_state.clone().filter(|cached| {
+            player_state_record
+                .as_ref()
+                .is_some_and(|record| record.outpoint == cached.record.outpoint)
+        });
+        let mut txids = uncached_records
+            .iter()
+            .map(|record| record.outpoint.txid)
+            .collect::<Vec<_>>();
+        if cached_player.is_none() {
+            if let Some(record) = &player_state_record {
+                txids.push(record.outpoint.txid);
+            }
+        }
+        let transactions = wait_for_virtual_txs(&self.rest, &txids).await?;
+        for record in uncached_records {
             let previous_tx = transactions
                 .get(&record.outpoint.txid)
                 .cloned()
@@ -1003,11 +1154,8 @@ impl WoodlandApp {
                 .ok_or_else(|| anyhow!("current tree transaction has no roll packet"))?;
             let health = tree::tree_health_from_tx(&previous_tx)?
                 .ok_or_else(|| anyhow!("current tree transaction has no health packet"))?;
-            let declared = self
-                .world
-                .declared_trees
-                .iter()
-                .find(|tree| tree.state == state)
+            let declared = declared_by_state
+                .get(&state)
                 .copied()
                 .ok_or_else(|| anyhow!("current tree has an unknown world identity"))?;
             let is_deployment = record.outpoint.txid == declared.deployment_txid;
@@ -1043,58 +1191,208 @@ impl WoodlandApp {
                     && previous_tx.input.len() == crate::protocol::CHOP_INPUT_COUNT)
                     .then_some(record.outpoint.txid),
                 record,
-                previous_tx,
+                previous_tx: Some(previous_tx),
             });
         }
-        if seen_states.len() != self.world.declared_trees.len() {
+        if seen_states.len() != expected_tree_count {
             return Err(transient_index_snapshot(
-                "not all world trees are currently discoverable",
+                "not all viewport trees are currently discoverable",
             ));
         }
-        discovered.sort_by_key(|tree| {
-            self.world
-                .declared_trees
-                .iter()
-                .position(|declared| declared.state == tree.state)
-                .unwrap_or(usize::MAX)
-        });
-        self.trees = discovered;
+        discovered.sort_by_key(|tree| tree.state.tree_id);
+        if initializing_trees {
+            self.trees = discovered;
+        } else {
+            let mut updates = discovered
+                .into_iter()
+                .map(|tree| (tree.state, tree))
+                .collect::<std::collections::HashMap<_, _>>();
+            for tree in &mut self.trees {
+                if let Some(update) = updates.remove(&tree.state) {
+                    *tree = update;
+                }
+            }
+            if !updates.is_empty() {
+                return Err(anyhow!("viewport contains an unknown tree identity"));
+            }
+        }
 
         self.player_state = match player_state_record {
             Some(record) => {
-                let previous_tx = transactions
-                    .get(&record.outpoint.txid)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("missing current player-state transaction"))?;
-                record.validate_creating_transaction(&previous_tx)?;
-                let state = player::player_state_from_tx(&previous_tx)?
-                    .ok_or_else(|| anyhow!("current player VTXO has no state packets"))?;
-                player::validate_player_state_record(
-                    &record,
-                    &player_contract,
-                    player_asset.expect("state selection requires PLAYER_ID"),
-                )?;
+                if let Some(mut cached) = cached_player {
+                    record.validate_creating_transaction(&cached.previous_tx)?;
+                    cached.record = record;
+                    Some(cached)
+                } else {
+                    let previous_tx = transactions
+                        .get(&record.outpoint.txid)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("missing current player-state transaction"))?;
+                    record.validate_creating_transaction(&previous_tx)?;
+                    let state = player::player_state_from_tx(&previous_tx)?
+                        .ok_or_else(|| anyhow!("current player VTXO has no state packets"))?;
+                    player::validate_player_state_record(
+                        &record,
+                        &player_contract,
+                        player_asset.expect("state selection requires PLAYER_ID"),
+                    )?;
 
-                let expected_identity =
-                    player::derive_player_identity(self.keys.owner_pk(), self.world.genesis_txid);
-                let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
-                if state.identity != expected_identity || state.xp.value() != xp_balance {
-                    return Err(anyhow!(
-                        "current player state has invalid identity or XP backing"
-                    ));
+                    let expected_identity = player::derive_player_identity(
+                        self.keys.owner_pk(),
+                        self.world.genesis_txid,
+                    );
+                    let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
+                    if state.identity != expected_identity || state.xp.value() != xp_balance {
+                        return Err(anyhow!(
+                            "current player state has invalid identity or XP backing"
+                        ));
+                    }
+                    Some(LivePlayerState {
+                        contract: player_contract,
+                        state,
+                        record,
+                        previous_tx,
+                    })
                 }
-                Some(LivePlayerState {
-                    contract: player_contract,
-                    state,
-                    record,
-                    previous_tx,
-                })
             }
             None => None,
         };
         self.wallet_records = wallet_records;
         self.reconcile_pending_chop()?;
         Ok(())
+    }
+
+    async fn sync_tree(&mut self, tree_id: u32) -> Result<()> {
+        let tree_index = self
+            .trees
+            .iter()
+            .position(|tree| tree.state.tree_id == tree_id)
+            .ok_or_else(|| anyhow!("tree {tree_id} is not part of this world"))?;
+        let current = self.trees[tree_index].clone();
+        let mut records =
+            load_current_tree_records(&self.rest, &self.world, std::slice::from_ref(&current))
+                .await?;
+        let record = records
+            .pop()
+            .ok_or_else(|| anyhow!("selected tree is not indexed"))?;
+        if record.outpoint == current.record.outpoint {
+            if let Some(previous_tx) = current.previous_tx.as_ref() {
+                record.validate_creating_transaction(previous_tx)?;
+            } else {
+                validate_initial_tree_record(
+                    &record,
+                    &self.world,
+                    current.state,
+                    current.deployment_txid,
+                )?;
+            }
+            self.trees[tree_index].record = record;
+            return Ok(());
+        }
+        let transactions = wait_for_virtual_txs(&self.rest, &[record.outpoint.txid]).await?;
+        let previous_tx = transactions
+            .get(&record.outpoint.txid)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing selected tree transaction"))?;
+        record.validate_creating_transaction(&previous_tx)?;
+        let state = tree::tree_state_from_tx(&previous_tx)?
+            .ok_or_else(|| anyhow!("selected tree transaction has no state packet"))?;
+        if state != current.state {
+            return Err(anyhow!("selected tree successor changed identity"));
+        }
+        let roll = tree::tree_roll_from_tx(&previous_tx)?
+            .ok_or_else(|| anyhow!("selected tree transaction has no roll packet"))?;
+        let health = tree::tree_health_from_tx(&previous_tx)?
+            .ok_or_else(|| anyhow!("selected tree transaction has no health packet"))?;
+        let expected_vout = match previous_tx.input.len() {
+            1 => u32::from(crate::protocol::RENEWAL_STATE_OUTPUT_INDEX),
+            crate::protocol::CHOP_INPUT_COUNT => u32::from(crate::protocol::TREE_OUTPUT_INDEX),
+            _ => return Err(anyhow!("selected tree transaction has an invalid shape")),
+        };
+        if record.outpoint.vout != expected_vout {
+            return Err(anyhow!("selected tree successor has an invalid output"));
+        }
+        self.trees[tree_index] = LiveTree {
+            state,
+            roll,
+            health,
+            deployment_txid: current.deployment_txid,
+            last_attempt_txid: (previous_tx.input.len() == crate::protocol::CHOP_INPUT_COUNT)
+                .then_some(record.outpoint.txid),
+            record,
+            previous_tx: Some(previous_tx),
+        };
+        Ok(())
+    }
+
+    async fn sync_player(&mut self) -> Result<()> {
+        let wallet = player_vtxo(&self.keys, &self.params)?;
+        let wallet_records = self
+            .rest
+            .get_vtxos(&wallet.script_pubkey().to_hex_string(), "spendableOnly")
+            .await?;
+        let player_contract = self.player_contract()?;
+        let player_asset = self.player_asset()?;
+        let player_state_record = match player_asset {
+            Some(player_asset) => {
+                let records = self
+                    .rest
+                    .get_vtxos(
+                        &player_contract.vtxo.script_pubkey().to_hex_string(),
+                        "spendableOnly",
+                    )
+                    .await?;
+                select_player_state_record(&records, &player_contract, player_asset)?
+            }
+            None => None,
+        };
+        self.player_state = match player_state_record {
+            Some(record) => {
+                if let Some(mut cached) = self
+                    .player_state
+                    .clone()
+                    .filter(|cached| cached.record.outpoint == record.outpoint)
+                {
+                    record.validate_creating_transaction(&cached.previous_tx)?;
+                    cached.record = record;
+                    Some(cached)
+                } else {
+                    let transactions =
+                        wait_for_virtual_txs(&self.rest, &[record.outpoint.txid]).await?;
+                    let previous_tx = transactions
+                        .get(&record.outpoint.txid)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("missing current player-state transaction"))?;
+                    record.validate_creating_transaction(&previous_tx)?;
+                    let state = player::player_state_from_tx(&previous_tx)?
+                        .ok_or_else(|| anyhow!("current player VTXO has no state packets"))?;
+                    player::validate_player_state_record(
+                        &record,
+                        &player_contract,
+                        player_asset.expect("state selection requires PLAYER_ID"),
+                    )?;
+                    let expected_identity = player::derive_player_identity(
+                        self.keys.owner_pk(),
+                        self.world.genesis_txid,
+                    );
+                    let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
+                    if state.identity != expected_identity || state.xp.value() != xp_balance {
+                        return Err(anyhow!(
+                            "current player state has invalid identity or XP backing"
+                        ));
+                    }
+                    Some(LivePlayerState {
+                        contract: player_contract,
+                        state,
+                        record,
+                        previous_tx,
+                    })
+                }
+            }
+            None => None,
+        };
+        self.wallet_records = wallet_records;
+        self.reconcile_pending_chop()
     }
 
     fn player_contract(&self) -> Result<PlayerContract> {
@@ -1259,7 +1557,7 @@ impl WoodlandApp {
     }
 
     async fn activate_inner(&mut self) -> Result<()> {
-        self.sync().await?;
+        self.sync_player().await?;
         if self.player_state.is_some() {
             return Ok(());
         }
@@ -1360,14 +1658,14 @@ impl WoodlandApp {
             },
         )
         .await?;
-        self.sync().await?;
+        self.sync_player().await?;
         if self.player_state.is_none() {
             return Err(anyhow!("activated player state was not discovered"));
         }
         Ok(())
     }
     async fn renew_player_inner(&mut self) -> Result<()> {
-        self.sync().await?;
+        self.sync_player().await?;
         let state = self
             .player_state
             .clone()
@@ -1425,7 +1723,7 @@ impl WoodlandApp {
                 "player renewal did not extend expiry ({old_expires_at} -> {new_expires_at})"
             ));
         }
-        self.sync().await?;
+        self.sync_player().await?;
         Ok(())
     }
 
@@ -1486,7 +1784,7 @@ impl WoodlandApp {
         mutation: ChopMutation,
         expected: Option<ExpectedChop>,
     ) -> Result<bool> {
-        self.sync().await?;
+        self.sync_tree(tree_id).await?;
         if let Some(pending) = &self.pending_chop {
             return Err(anyhow!(
                 "pending chop {} must reconcile before another swing",
@@ -1503,7 +1801,17 @@ impl WoodlandApp {
             .iter()
             .position(|tree| tree.state.tree_id == tree_id)
             .ok_or_else(|| anyhow!("tree {tree_id} is not part of this world"))?;
-        let tree = self.trees[tree_index].clone();
+        let mut tree = self.trees[tree_index].clone();
+        if tree.previous_tx.is_none() {
+            let transactions =
+                wait_for_virtual_txs(&self.rest, &[tree.record.outpoint.txid]).await?;
+            let previous_tx = transactions
+                .get(&tree.record.outpoint.txid)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing selected tree transaction"))?;
+            tree.record.validate_creating_transaction(&previous_tx)?;
+            tree.previous_tx = Some(previous_tx);
+        }
         let player_logs_before = state.record.asset_amount(self.world.log_asset).unwrap_or(0);
         let player_xp_balance_before = state.record.asset_amount(self.world.xp_asset).unwrap_or(0);
         if state.state.xp.value() != player_xp_balance_before {
@@ -1658,7 +1966,12 @@ impl WoodlandApp {
             &chop.checkpoint_txs,
             &state.contract,
             &self.world.contract,
-            [&state.previous_tx, &tree.previous_tx],
+            [
+                &state.previous_tx,
+                tree.previous_tx
+                    .as_ref()
+                    .expect("selected tree transaction was loaded"),
+            ],
             next_state,
             next_tree_roll,
         )?;
@@ -1807,7 +2120,7 @@ impl WoodlandApp {
                 .ok_or_else(|| anyhow!("accepted chop omitted tree health"))?,
             deployment_txid: tree.deployment_txid,
             record: tree_record,
-            previous_tx: chop_tx.clone(),
+            previous_tx: Some(chop_tx.clone()),
             last_attempt_txid: Some(chop_txid),
         };
         self.player_state = Some(LivePlayerState {
@@ -1823,35 +2136,175 @@ impl WoodlandApp {
     }
 }
 
-async fn wait_for_complete_tree_records(
-    rest: &ArkadeRest,
-    script: &str,
+fn validate_initial_tree_record(
+    record: &VtxoRecord,
     world: &World,
-    dust_sats: u64,
+    state: TreeState,
+    deployment_txid: Txid,
+) -> Result<()> {
+    if record.outpoint
+        != (OutPoint {
+            txid: deployment_txid,
+            vout: 0,
+        })
+        || record.script != world.contract.vtxo.script_pubkey()
+        || record.amount_sats != tree::full_tree_value_sats(world.manifest.dust_sats)?
+        || record.assets.len() != 3
+    {
+        return Err(anyhow!(
+            "initial tree {} record does not match its deployment",
+            state.tree_id
+        ));
+    }
+    require_asset_amount(record, world.tree_asset, 1, "tree marker")?;
+    require_asset_amount(
+        record,
+        world.log_asset,
+        world.manifest.log_reserve_per_tree,
+        "tree LOG reserve",
+    )?;
+    require_asset_amount(
+        record,
+        world.xp_asset,
+        world.manifest.xp_per_tree,
+        "tree XP reserve",
+    )
+}
+
+async fn load_current_tree_records(
+    rest: &ArkadeRest,
+    world: &World,
+    cached: &[LiveTree],
 ) -> Result<Vec<VtxoRecord>> {
-    let expected = world.declared_trees.len();
-    for attempt in 0..INDEX_ATTEMPTS {
-        let records = rest.get_vtxos(script, "spendableOnly").await?;
-        let exposed = records
+    if cached.is_empty() {
+        let value = tree::full_tree_value_sats(world.manifest.dust_sats)?;
+        return Ok(world
+            .declared_trees
             .iter()
-            .filter(|record| record.asset_amount(world.tree_asset).is_some())
-            .count();
-        if exposed >= expected {
-            return select_tree_records(records, world, dust_sats);
+            .map(|tree| VtxoRecord {
+                outpoint: OutPoint {
+                    txid: tree.deployment_txid,
+                    vout: 0,
+                },
+                script: world.contract.vtxo.script_pubkey(),
+                amount_sats: value,
+                assets: vec![
+                    Asset {
+                        asset_id: world.tree_asset,
+                        amount: 1,
+                    },
+                    Asset {
+                        asset_id: world.log_asset,
+                        amount: world.manifest.log_reserve_per_tree,
+                    },
+                    Asset {
+                        asset_id: world.xp_asset,
+                        amount: world.manifest.xp_per_tree,
+                    },
+                ],
+                created_at: None,
+                expires_at: None,
+                is_preconfirmed: false,
+                is_swept: false,
+                spent_by: None,
+                settled_by: None,
+                is_unrolled: false,
+                is_spent: false,
+            })
+            .collect());
+    }
+    let expected = cached.len();
+    let mut lineage_states = cached
+        .iter()
+        .map(|tree| (tree.record.outpoint, tree.state))
+        .collect::<std::collections::HashMap<_, _>>();
+    let outpoints = cached
+        .iter()
+        .map(|tree| tree.record.outpoint)
+        .collect::<Vec<_>>();
+    let mut current = rest.get_vtxos_by_outpoints(&outpoints).await?;
+    if current.len() != expected {
+        return Err(transient_index_snapshot(format!(
+            "index returned {} of {expected} exact tree lineages",
+            current.len()
+        )));
+    }
+    let mut visited = current
+        .iter()
+        .map(|record| record.outpoint)
+        .collect::<std::collections::HashSet<_>>();
+    let tree_script = world.contract.vtxo.script_pubkey();
+    loop {
+        if current
+            .iter()
+            .any(|record| record.is_swept || record.is_unrolled)
+        {
+            return Err(anyhow!(
+                "a tree lineage is no longer cooperatively spendable"
+            ));
         }
-        if attempt + 1 < INDEX_ATTEMPTS {
-            txbuild::sleep_ms(INDEX_POLL_MS).await;
+        let spent = current
+            .iter()
+            .filter(|record| record.is_spent)
+            .cloned()
+            .collect::<Vec<_>>();
+        if spent.is_empty() {
+            return select_tree_records(current, world, world.manifest.dust_sats, expected);
+        }
+        let candidates = rest
+            .get_vtxo_successor_candidates(&spent, &tree_script, world.tree_asset)
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("successor is not indexed yet") {
+                    transient_index_snapshot(error.to_string())
+                } else {
+                    error
+                }
+            })?;
+        let mut successors = Vec::with_capacity(candidates.len());
+        for (record, transaction) in candidates {
+            let state = tree::tree_state_from_tx(&transaction)?
+                .ok_or_else(|| anyhow!("tree successor has no identity packet"))?;
+            successors.push((state, record));
+        }
+        for record in &mut current {
+            if !record.is_spent {
+                continue;
+            }
+            let state = lineage_states
+                .remove(&record.outpoint)
+                .ok_or_else(|| anyhow!("tree lineage lost its identity"))?;
+            let direct_txid = record.spent_by;
+            let mut matching = successors
+                .iter()
+                .enumerate()
+                .filter(|(_, (candidate_state, candidate))| {
+                    *candidate_state == state
+                        && direct_txid.is_none_or(|txid| candidate.outpoint.txid == txid)
+                })
+                .map(|(index, _)| index);
+            let index = matching
+                .next()
+                .ok_or_else(|| transient_index_snapshot("tree successor is not indexed yet"))?;
+            if matching.next().is_some() {
+                return Err(anyhow!("tree has multiple indexed successors"));
+            }
+            drop(matching);
+            let (_, successor) = successors.swap_remove(index);
+            if !visited.insert(successor.outpoint) {
+                return Err(anyhow!("tree lineage contains a cycle"));
+            }
+            lineage_states.insert(successor.outpoint, state);
+            *record = successor;
         }
     }
-    Err(anyhow!(
-        "woodland.sh index did not expose all {expected} trees"
-    ))
 }
 
 fn select_tree_records(
     records: Vec<VtxoRecord>,
     world: &World,
     dust_sats: u64,
+    expected: usize,
 ) -> Result<Vec<VtxoRecord>> {
     let mut trees = Vec::new();
     for record in records {
@@ -1893,11 +2346,10 @@ fn select_tree_records(
         }
         trees.push(record);
     }
-    if trees.len() < world.declared_trees.len() {
+    if trees.len() != expected {
         return Err(anyhow!(
-            "woodland.sh exposes {} of {} trees",
-            trees.len(),
-            world.declared_trees.len()
+            "woodland.sh exposes {} of {expected} requested trees",
+            trees.len()
         ));
     }
     Ok(trees)

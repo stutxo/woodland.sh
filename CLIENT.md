@@ -13,8 +13,8 @@ schemaVersion = 1
 protocolVersion = 1
 gameId = woodland.sh
 dustSats = 330
-mapWidth = 45
-mapHeight = 19
+mapWidth = 425
+mapHeight = 425
 activeLogsPerTree = 5
 logReservePerTree = 10
 xpPerTree = 10
@@ -36,8 +36,8 @@ Recompute the three asset IDs from the genesis txid:
 ```
 
 Fetch indexed metadata and require `game=woodland.sh`, `protocol=1`, the exact
-asset label, no control asset, and supply no greater than 10, 100, and 100.
-Recompute the tree contract and compare every committed script in the manifest.
+asset label, no control asset, and supply no greater than 2,100, 21,000, and
+21,000. Recompute the tree contract and compare every committed script in the manifest.
 
 The manifest must contain the reconstructed `treeScript`,
 `treeChopArkadeScript`, `treeRegrowArkadeScript`, and
@@ -45,8 +45,11 @@ The manifest must contain the reconstructed `treeScript`,
 
 ## Discover Trees
 
-Query spendable VTXOs for `treeScript`. For each declared tree packet, require
-exactly one lineage carrying:
+Start from every manifest-pinned deployment outpoint and fetch exact indexed
+records. Follow direct Ark transaction successors or settlement-batch leaves
+until each lineage reaches one unspent VTXO. Bind a batch leaf back to its tree
+with the creating transaction's immutable identity packet; never infer identity
+from result order. For each declared tree, require exactly one lineage carrying:
 
 - one TREE;
 - zero through ten LOG;

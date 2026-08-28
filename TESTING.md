@@ -81,14 +81,14 @@ A clean deployment verifies:
 
 - schema 1 and protocol 1;
 - one genesis txid with TREE group 0, LOG group 1, and XP group 2;
-- supplies 10, 100, and 100;
+- supplies 2,100, 21,000, and 21,000;
 - metadata `game=woodland.sh`, `protocol=1`, and the exact label;
 - exact `treeScript`, `treeChopArkadeScript`, `treeRegrowArkadeScript`, and
   `treeRenewalArkadeScript` commitments;
 - no control asset;
-- ten tree VTXOs with one TREE, ten LOG, ten XP, health five, and
+- 2,100 tree VTXOs with one TREE, ten LOG, ten XP, health five, and
   1,980 sats;
-- total world funding 19,800 sats;
+- total world funding 4,158,000 sats;
 - no player reserve or allocator signer.
 
 ## Browser Coverage
@@ -164,9 +164,9 @@ races every player against the same tree outpoint for 30 rounds:
 ```
 
 Every round requires exactly one committed player/tree transition, converged
-tree state, no pending chops, conserved 100 LOG/XP across all players and trees,
-and indexed supplies of 10 TREE, 100 LOG, and 100 XP. The runner determines the
-winner from reconciled outpoints rather than a possibly ambiguous submission
+tree state, no pending chops, conserved manifest-declared LOG/XP across all
+players and trees, and exact indexed TREE/LOG/XP supplies. The runner determines
+the winner from reconciled outpoints rather than a possibly ambiguous submission
 response. It polls for convergence because independent browser refreshes can
 straddle a legitimate maintenance regrowth. The JSON report records
 client-reported acceptances, recovered unknown outcomes, convergence retries,

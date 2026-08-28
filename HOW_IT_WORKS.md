@@ -15,9 +15,9 @@ The browser calls the manifest-pinned Arkade and emulator services directly.
 Protocol v1 creates:
 
 ```text
-10 TREE
-100 LOG
-100 XP
+2,100 TREE
+21,000 LOG
+21,000 XP
 ```
 
 Each initial tree owns one TREE, ten LOG, ten XP, health five, a public roll,
@@ -59,7 +59,7 @@ equal player-held XP. XP is fixed supply with no control asset. Every
 successful swing moves one unit from tree to player; misses move none. Thus:
 
 ```text
-sum(tree XP) + sum(player XP) = 100
+sum(tree XP) + sum(player XP) = 21,000
 ```
 
 LOG obeys the same conservation equation.
@@ -67,7 +67,7 @@ LOG obeys the same conservation equation.
 ## Public Roll
 
 Each tree has a 32-byte roll. Every swing publishes its SHA-256 successor. The
-first eight bytes modulo 10,000 form a bucket. Input XP selects a 1,000-1,500
+first eight bytes modulo 10,000 form a bucket. Input XP selects a 2,500-3,000
 basis-point threshold. This is deterministic public randomness, not hidden luck.
 
 ## Reciprocal Covenants

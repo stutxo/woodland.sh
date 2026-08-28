@@ -5,8 +5,8 @@ use crate::keys::Keys;
 use crate::tree;
 use crate::txbuild;
 use crate::world::{
-    WorldManifest, ACTIVE_LOGS_PER_TREE, GAME_ID, LOG_RESERVE_PER_TREE, MANIFEST_SCHEMA_VERSION,
-    PROTOCOL_DUST_SATS, PROTOCOL_VERSION, TREE_STATES, XP_PER_TREE,
+    tree_states, WorldManifest, ACTIVE_LOGS_PER_TREE, GAME_ID, LOG_RESERVE_PER_TREE,
+    MANIFEST_SCHEMA_VERSION, PROTOCOL_DUST_SATS, PROTOCOL_VERSION, TREE_COUNT, XP_PER_TREE,
 };
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::packet::{AssetGroup, AssetInput, AssetOutput, Packet};
@@ -42,6 +42,7 @@ const INDEX_POLL_MS: u64 = 250;
 /// would refuse it.
 const TREE_ROLLOVER_CHECK_SECS: u64 = 60;
 const MAINTENANCE_CONCURRENCY: usize = 4;
+const DEPLOYMENT_SHARD_SIZE: usize = 50;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -54,13 +55,23 @@ struct PlannedDeployment {
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlannedShard {
+    source_outpoint: String,
+    tree_count: u64,
+    deployments: Vec<PlannedDeployment>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BootstrapPlan {
     manifest: WorldManifest,
     deployer_script: String,
     funding_outpoint: String,
     issuance_ark: String,
     issuance_checkpoints: Vec<String>,
-    deployments: Vec<PlannedDeployment>,
+    distribution_ark: String,
+    distribution_checkpoints: Vec<String>,
+    shards: Vec<PlannedShard>,
 }
 
 struct Services {
@@ -552,7 +563,7 @@ async fn ensure_world(
 
 fn world_funding_sats(params: &ServerParams) -> Result<u64> {
     tree::full_tree_value_sats(params.dust_sats)?
-        .checked_mul(TREE_STATES.len() as u64)
+        .checked_mul(TREE_COUNT as u64)
         .ok_or_else(|| anyhow!("world tree funding amount overflow"))
 }
 
@@ -565,6 +576,8 @@ fn build_plan(
     funding: VtxoRecord,
 ) -> Result<BootstrapPlan> {
     let address = deployer.to_ark_address();
+    let tree_states = tree_states();
+    let tree_count = tree_states.len();
     let funding_sats = world_funding_sats(&services.params)?;
     let receivers = [SendReceiver::bitcoin(
         address,
@@ -596,9 +609,9 @@ fn build_plan(
         &mut issuance.ark_tx,
         &Packet {
             groups: vec![
-                genesis_group("TREE", TREE_STATES.len() as u64),
-                genesis_group("LOG", LOG_RESERVE_PER_TREE * TREE_STATES.len() as u64),
-                genesis_group("XP", XP_PER_TREE * TREE_STATES.len() as u64),
+                genesis_group("TREE", tree_count as u64),
+                genesis_group("LOG", LOG_RESERVE_PER_TREE * tree_count as u64),
+                genesis_group("XP", XP_PER_TREE * tree_count as u64),
             ],
         },
     )
@@ -649,112 +662,192 @@ fn build_plan(
         .to_vec()
     };
 
-    let mut deployments = Vec::with_capacity(TREE_STATES.len());
-    let mut manifest_deployments = Vec::with_capacity(TREE_STATES.len());
-    let mut treasury_record = Some(VtxoRecord {
+    let shard_counts = tree_states
+        .chunks(DEPLOYMENT_SHARD_SIZE)
+        .map(|states| states.len() as u64)
+        .collect::<Vec<_>>();
+    let issuance_record = VtxoRecord {
         outpoint: OutPoint {
             txid: genesis_txid,
             vout: 0,
         },
         script: deployer.script_pubkey(),
         amount_sats: funding_sats,
-        assets: treasury_assets(TREE_STATES.len() as u64),
+        assets: treasury_assets(tree_count as u64),
         created_at: Some(1),
         expires_at: Some(i64::MAX),
         is_preconfirmed: false,
         is_swept: false,
+        spent_by: None,
+        settled_by: None,
         is_unrolled: false,
         is_spent: false,
-    });
-    for (index, state) in TREE_STATES.iter().copied().enumerate() {
-        let remaining_before = (TREE_STATES.len() - index) as u64;
-        let remaining_after = remaining_before - 1;
-        let current = treasury_record
-            .take()
-            .ok_or_else(|| anyhow!("world treasury exhausted before final tree"))?;
-        let source_outpoint = current.outpoint;
-        let deployment_inputs = [txbuild::vtxo_input(&current, deployer)?];
-        let treasury_sats = full_tree_value
-            .checked_mul(remaining_after)
-            .ok_or_else(|| anyhow!("treasury amount overflow"))?;
-        let mut receivers = vec![SendReceiver::bitcoin(
-            contract.vtxo.to_ark_address(),
-            Amount::from_sat(full_tree_value),
-        )];
-        if remaining_after > 0 {
-            receivers.push(SendReceiver::bitcoin(
-                address,
-                Amount::from_sat(treasury_sats),
-            ));
-        }
-        let mut deployment = build_offchain_transactions(
-            &receivers,
-            &address,
-            &deployment_inputs,
-            &txbuild::server_info(&services.params),
-        )
-        .map_err(|error| anyhow!("build world tree {} deployment: {error}", state.tree_id))?;
+    };
+    let distribution_receivers = shard_counts
+        .iter()
+        .map(|count| {
+            full_tree_value
+                .checked_mul(*count)
+                .map(|sats| SendReceiver::bitcoin(address, Amount::from_sat(sats)))
+                .ok_or_else(|| anyhow!("deployment shard amount overflow"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut distribution = build_offchain_transactions(
+        &distribution_receivers,
+        &address,
+        &[txbuild::vtxo_input(&issuance_record, deployer)?],
+        &txbuild::server_info(&services.params),
+    )
+    .map_err(|error| anyhow!("build world treasury distribution: {error}"))?;
+    let shard_outputs = |scale: u64| {
+        shard_counts
+            .iter()
+            .enumerate()
+            .map(|(index, count)| (index as u16, scale * count))
+            .collect::<Vec<_>>()
+    };
+    ark_core::asset::packet::add_asset_packet_to_psbt(
+        &mut distribution.ark_tx,
+        &Packet {
+            groups: vec![
+                transfer_group(tree_asset, vec![(0, tree_count as u64)], shard_outputs(1)),
+                transfer_group(
+                    log_asset,
+                    vec![(0, LOG_RESERVE_PER_TREE * tree_count as u64)],
+                    shard_outputs(LOG_RESERVE_PER_TREE),
+                ),
+                transfer_group(
+                    xp_asset,
+                    vec![(0, XP_PER_TREE * tree_count as u64)],
+                    shard_outputs(XP_PER_TREE),
+                ),
+            ],
+        },
+    )
+    .map_err(|error| anyhow!("attach world treasury distribution assets: {error}"))?;
+    let distribution_txid = distribution.ark_tx.unsigned_tx.compute_txid();
 
-        let mut tree_outputs = vec![(0, 1)];
-        let mut log_outputs = vec![(0, LOG_RESERVE_PER_TREE)];
-        let mut xp_outputs = vec![(0, XP_PER_TREE)];
-        if remaining_after > 0 {
-            tree_outputs.push((1, remaining_after));
-            log_outputs.push((1, LOG_RESERVE_PER_TREE * remaining_after));
-            xp_outputs.push((1, XP_PER_TREE * remaining_after));
-        }
-        let groups = vec![
-            transfer_group(tree_asset, vec![(0, remaining_before)], tree_outputs),
-            transfer_group(
-                log_asset,
-                vec![(0, LOG_RESERVE_PER_TREE * remaining_before)],
-                log_outputs,
-            ),
-            transfer_group(
-                xp_asset,
-                vec![(0, XP_PER_TREE * remaining_before)],
-                xp_outputs,
-            ),
-        ];
-        ark_core::asset::packet::add_asset_packet_to_psbt(
-            &mut deployment.ark_tx,
-            &Packet { groups },
-        )
-        .map_err(|error| anyhow!("attach world tree {} assets: {error}", state.tree_id))?;
-        tree::attach_tree_state_packet(&mut deployment.ark_tx, state)?;
-        tree::attach_tree_roll_packet(&mut deployment.ark_tx, tree::TreeRoll::initial(state))?;
-        tree::attach_tree_health_packet(
-            &mut deployment.ark_tx,
-            tree::TreeHealth::new(ACTIVE_LOGS_PER_TREE)?,
-        )?;
-        let deployment_txid = deployment.ark_tx.unsigned_tx.compute_txid();
-        manifest_deployments.push((state, deployment_txid));
-        deployments.push(PlannedDeployment {
-            state,
-            source_outpoint: source_outpoint.to_string(),
-            ark: encode_psbt(&deployment.ark_tx),
-            checkpoints: deployment.checkpoint_txs.iter().map(encode_psbt).collect(),
+    let mut shards = Vec::with_capacity(shard_counts.len());
+    let mut manifest_deployments = Vec::with_capacity(tree_count);
+    for (shard_index, states) in tree_states.chunks(DEPLOYMENT_SHARD_SIZE).enumerate() {
+        let shard_count = states.len();
+        let shard_sats = full_tree_value
+            .checked_mul(shard_count as u64)
+            .ok_or_else(|| anyhow!("deployment shard amount overflow"))?;
+        let shard_source = OutPoint {
+            txid: distribution_txid,
+            vout: shard_index as u32,
+        };
+        let mut treasury_record = Some(VtxoRecord {
+            outpoint: shard_source,
+            script: deployer.script_pubkey(),
+            amount_sats: shard_sats,
+            assets: treasury_assets(shard_count as u64),
+            created_at: Some(1),
+            expires_at: Some(i64::MAX),
+            is_preconfirmed: false,
+            is_swept: false,
+            spent_by: None,
+            settled_by: None,
+            is_unrolled: false,
+            is_spent: false,
         });
-        if remaining_after > 0 {
-            treasury_record = Some(VtxoRecord {
-                outpoint: OutPoint {
-                    txid: deployment_txid,
-                    vout: 1,
-                },
-                script: deployer.script_pubkey(),
-                amount_sats: treasury_sats,
-                assets: treasury_assets(remaining_after),
-                created_at: Some(1),
-                expires_at: Some(i64::MAX),
-                is_preconfirmed: false,
-                is_swept: false,
-                is_unrolled: false,
-                is_spent: false,
+        let mut deployments = Vec::with_capacity(shard_count);
+        for (index, state) in states.iter().copied().enumerate() {
+            let remaining_before = (shard_count - index) as u64;
+            let remaining_after = remaining_before - 1;
+            let current = treasury_record
+                .take()
+                .ok_or_else(|| anyhow!("deployment shard exhausted before final tree"))?;
+            let source_outpoint = current.outpoint;
+            let treasury_sats = full_tree_value
+                .checked_mul(remaining_after)
+                .ok_or_else(|| anyhow!("treasury amount overflow"))?;
+            let mut receivers = vec![SendReceiver::bitcoin(
+                contract.vtxo.to_ark_address(),
+                Amount::from_sat(full_tree_value),
+            )];
+            if remaining_after > 0 {
+                receivers.push(SendReceiver::bitcoin(
+                    address,
+                    Amount::from_sat(treasury_sats),
+                ));
+            }
+            let mut deployment = build_offchain_transactions(
+                &receivers,
+                &address,
+                &[txbuild::vtxo_input(&current, deployer)?],
+                &txbuild::server_info(&services.params),
+            )
+            .map_err(|error| anyhow!("build world tree {} deployment: {error}", state.tree_id))?;
+            let mut tree_outputs = vec![(0, 1)];
+            let mut log_outputs = vec![(0, LOG_RESERVE_PER_TREE)];
+            let mut xp_outputs = vec![(0, XP_PER_TREE)];
+            if remaining_after > 0 {
+                tree_outputs.push((1, remaining_after));
+                log_outputs.push((1, LOG_RESERVE_PER_TREE * remaining_after));
+                xp_outputs.push((1, XP_PER_TREE * remaining_after));
+            }
+            let groups = vec![
+                transfer_group(tree_asset, vec![(0, remaining_before)], tree_outputs),
+                transfer_group(
+                    log_asset,
+                    vec![(0, LOG_RESERVE_PER_TREE * remaining_before)],
+                    log_outputs,
+                ),
+                transfer_group(
+                    xp_asset,
+                    vec![(0, XP_PER_TREE * remaining_before)],
+                    xp_outputs,
+                ),
+            ];
+            ark_core::asset::packet::add_asset_packet_to_psbt(
+                &mut deployment.ark_tx,
+                &Packet { groups },
+            )
+            .map_err(|error| anyhow!("attach world tree {} assets: {error}", state.tree_id))?;
+            tree::attach_tree_state_packet(&mut deployment.ark_tx, state)?;
+            tree::attach_tree_roll_packet(&mut deployment.ark_tx, tree::TreeRoll::initial(state))?;
+            tree::attach_tree_health_packet(
+                &mut deployment.ark_tx,
+                tree::TreeHealth::new(ACTIVE_LOGS_PER_TREE)?,
+            )?;
+            let deployment_txid = deployment.ark_tx.unsigned_tx.compute_txid();
+            manifest_deployments.push((state, deployment_txid));
+            deployments.push(PlannedDeployment {
+                state,
+                source_outpoint: source_outpoint.to_string(),
+                ark: encode_psbt(&deployment.ark_tx),
+                checkpoints: deployment.checkpoint_txs.iter().map(encode_psbt).collect(),
             });
+            if remaining_after > 0 {
+                treasury_record = Some(VtxoRecord {
+                    outpoint: OutPoint {
+                        txid: deployment_txid,
+                        vout: 1,
+                    },
+                    script: deployer.script_pubkey(),
+                    amount_sats: treasury_sats,
+                    assets: treasury_assets(remaining_after),
+                    created_at: Some(1),
+                    expires_at: Some(i64::MAX),
+                    is_preconfirmed: false,
+                    is_swept: false,
+                    spent_by: None,
+                    settled_by: None,
+                    is_unrolled: false,
+                    is_spent: false,
+                });
+            }
         }
-    }
-    if treasury_record.is_some() {
-        return Err(anyhow!("world treasury remains after final tree"));
+        if treasury_record.is_some() {
+            return Err(anyhow!("deployment shard retains a treasury output"));
+        }
+        shards.push(PlannedShard {
+            source_outpoint: shard_source.to_string(),
+            tree_count: shard_count as u64,
+            deployments,
+        });
     }
     let manifest = WorldManifest::new(
         &services.params,
@@ -776,7 +869,13 @@ fn build_plan(
         funding_outpoint: funding.outpoint.to_string(),
         issuance_ark: encode_psbt(&issuance.ark_tx),
         issuance_checkpoints: issuance.checkpoint_txs.iter().map(encode_psbt).collect(),
-        deployments,
+        distribution_ark: encode_psbt(&distribution.ark_tx),
+        distribution_checkpoints: distribution
+            .checkpoint_txs
+            .iter()
+            .map(encode_psbt)
+            .collect(),
+        shards,
     })
 }
 
@@ -795,8 +894,13 @@ async fn execute_plan(
             .validate(&deployer_keys.secp, &services.params, &services.emulator)?;
     require_world_service_keys(maintenance_signer, rollover_signer, &world)?;
     let deployer = txbuild::player_vtxo(deployer_keys, &services.params)?;
+    let planned_count = plan
+        .shards
+        .iter()
+        .map(|shard| shard.deployments.len())
+        .sum::<usize>();
     if plan.deployer_script != deployer.script_pubkey().to_hex_string()
-        || plan.deployments.len() != world.trees.len()
+        || planned_count != world.trees.len()
     {
         return Err(anyhow!("bootstrap plan keys or deployment count mismatch"));
     }
@@ -805,55 +909,105 @@ async fn execute_plan(
             "bootstrap issuance transaction does not match its world manifest"
         ));
     }
-    let mut expected_source = OutPoint {
+    let distribution = decode_psbt(&plan.distribution_ark)?;
+    let distribution_txid = distribution.unsigned_tx.compute_txid();
+    let distribution_checkpoints = decode_psbts(&plan.distribution_checkpoints)?;
+    let genesis_outpoint = OutPoint {
         txid: world.genesis_txid,
         vout: 0,
     };
-    for (planned, expected) in plan.deployments.iter().zip(&world.trees) {
-        let txid = decode_psbt(&planned.ark)?.unsigned_tx.compute_txid();
-        let source = OutPoint::from_str(&planned.source_outpoint)
-            .context("parse planned treasury source")?;
-        if planned.state != expected.state
-            || txid != expected.deployment_txid
-            || source != expected_source
+    if !distribution_checkpoints.iter().any(|checkpoint| {
+        checkpoint
+            .unsigned_tx
+            .input
+            .first()
+            .is_some_and(|input| input.previous_output == genesis_outpoint)
+    }) {
+        return Err(anyhow!(
+            "bootstrap distribution does not spend world genesis"
+        ));
+    }
+    let mut world_index = 0;
+    for (shard_index, shard) in plan.shards.iter().enumerate() {
+        let shard_source =
+            OutPoint::from_str(&shard.source_outpoint).context("parse planned shard source")?;
+        if shard_source
+            != (OutPoint {
+                txid: distribution_txid,
+                vout: shard_index as u32,
+            })
+            || shard.tree_count != shard.deployments.len() as u64
         {
-            return Err(anyhow!("bootstrap plan does not match its world manifest"));
+            return Err(anyhow!("bootstrap shard does not match its distribution"));
         }
-        expected_source = OutPoint { txid, vout: 1 };
+        let mut expected_source = shard_source;
+        for planned in &shard.deployments {
+            let expected = world
+                .trees
+                .get(world_index)
+                .ok_or_else(|| anyhow!("bootstrap plan has too many trees"))?;
+            world_index += 1;
+            let txid = decode_psbt(&planned.ark)?.unsigned_tx.compute_txid();
+            let source = OutPoint::from_str(&planned.source_outpoint)
+                .context("parse planned treasury source")?;
+            if planned.state != expected.state
+                || txid != expected.deployment_txid
+                || source != expected_source
+            {
+                return Err(anyhow!("bootstrap plan does not match its world manifest"));
+            }
+            expected_source = OutPoint { txid, vout: 1 };
+        }
     }
 
-    let mut deployed = Vec::with_capacity(world.trees.len());
-    for expected in &world.trees {
-        deployed.push(
-            find_vtxo(
-                &services.rest,
-                &plan.manifest.tree_script,
-                OutPoint {
-                    txid: expected.deployment_txid,
-                    vout: 0,
-                },
-            )
-            .await?
-            .is_some(),
-        );
-    }
-    let deployer_records = services
-        .rest
-        .get_vtxos(&plan.deployer_script, "spendableOnly")
-        .await?;
-    let has_issuance_output = deployer_records
+    let deployment_outpoints = world
+        .trees
         .iter()
-        .any(|record| record.outpoint.txid == world.genesis_txid);
-    if !deployed.iter().any(|value| *value) && !has_issuance_output {
+        .map(|tree| OutPoint {
+            txid: tree.deployment_txid,
+            vout: 0,
+        })
+        .collect::<Vec<_>>();
+    let deployed_records = services
+        .rest
+        .get_vtxos_by_outpoints(&deployment_outpoints)
+        .await?;
+    let deployed = deployed_records
+        .iter()
+        .filter(|record| {
+            !record.is_spent
+                && record.script == world.contract.vtxo.script_pubkey()
+                && record.asset_amount(world.tree_asset) == Some(1)
+        })
+        .map(|record| record.outpoint.txid)
+        .collect::<std::collections::HashSet<_>>();
+
+    let issuance_outpoint = OutPoint {
+        txid: world.genesis_txid,
+        vout: 0,
+    };
+    let mut issuance = services
+        .rest
+        .get_vtxos_by_outpoints(&[issuance_outpoint])
+        .await?
+        .into_iter()
+        .next();
+    if issuance.is_none() && deployed.is_empty() {
         let funding_outpoint = OutPoint::from_str(&plan.funding_outpoint)
             .context("parse bootstrap funding outpoint")?;
-        if !deployer_records
-            .iter()
-            .any(|record| record.outpoint == funding_outpoint)
-        {
-            return Err(anyhow!(
-                "world bootstrap inputs are pending or missing; retry shortly or run ./scripts/regtest.sh clean --force"
-            ));
+        let funding = services
+            .rest
+            .get_vtxos_by_outpoints(&[funding_outpoint])
+            .await?
+            .into_iter()
+            .find(|record| !record.is_spent)
+            .ok_or_else(|| {
+                anyhow!(
+                    "world bootstrap funding is pending or missing; retry shortly or clean regtest"
+                )
+            })?;
+        if funding.amount_sats != world_funding_sats(&services.params)? {
+            return Err(anyhow!("world bootstrap funding amount is invalid"));
         }
         submit_direct(
             deployer_keys,
@@ -862,70 +1016,75 @@ async fn execute_plan(
             decode_psbts(&plan.issuance_checkpoints)?,
         )
         .await?;
+        issuance = Some(wait_for_exact_vtxo(&services.rest, issuance_outpoint).await?);
     }
+    let issuance =
+        issuance.ok_or_else(|| anyhow!("world issuance is missing after bootstrap submission"))?;
+    require_asset_amount(
+        &issuance,
+        world.tree_asset,
+        world.trees.len() as u64,
+        "world TREE",
+    )?;
 
-    for (index, ((planned, expected), is_deployed)) in plan
-        .deployments
+    let shard_outpoints = plan
+        .shards
         .iter()
-        .zip(&world.trees)
-        .zip(deployed)
-        .enumerate()
-    {
-        let deployment_outpoint = OutPoint {
-            txid: expected.deployment_txid,
-            vout: 0,
-        };
-        if !is_deployed {
-            let issuance_outpoint = OutPoint::from_str(&planned.source_outpoint)
-                .context("parse deployment treasury source")?;
-            let asset_record =
-                wait_for_vtxo(&services.rest, &plan.deployer_script, issuance_outpoint).await?;
-            let remaining = (world.trees.len() - index) as u64;
-            let expected_treasury_value = tree::full_tree_value_sats(services.params.dust_sats)?
-                .checked_mul(remaining)
-                .ok_or_else(|| anyhow!("world treasury value overflow"))?;
-            if asset_record.amount_sats != expected_treasury_value {
-                return Err(anyhow!("world treasury BTC value is invalid"));
-            }
-            require_asset_amount(&asset_record, world.tree_asset, remaining, "world TREE")?;
-            require_asset_amount(
-                &asset_record,
-                world.log_asset,
-                LOG_RESERVE_PER_TREE * remaining,
-                "world LOG",
-            )?;
-            require_asset_amount(
-                &asset_record,
-                world.xp_asset,
-                XP_PER_TREE * remaining,
-                "world XP",
-            )?;
-            submit_direct(
-                deployer_keys,
-                &services.rest,
-                decode_psbt(&planned.ark)?,
-                decode_psbts(&planned.checkpoints)?,
-            )
-            .await?;
+        .map(|shard| OutPoint::from_str(&shard.source_outpoint))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parse deployment shard outpoint")?;
+    let mut distributed = services
+        .rest
+        .get_vtxos_by_outpoints(&shard_outpoints)
+        .await?;
+    if distributed.len() != plan.shards.len() {
+        if issuance.is_spent {
+            return Err(anyhow!("world distribution outputs are incomplete"));
         }
-
-        let tree_record = wait_for_vtxo(
+        submit_direct(
+            deployer_keys,
             &services.rest,
-            &plan.manifest.tree_script,
-            deployment_outpoint,
+            distribution,
+            distribution_checkpoints,
         )
         .await?;
-        if tree_record.amount_sats != tree::full_tree_value_sats(services.params.dust_sats)? {
-            return Err(anyhow!("deployed tree fixed BTC value is invalid"));
+        distributed.clear();
+        for outpoint in &shard_outpoints {
+            distributed.push(wait_for_exact_vtxo(&services.rest, *outpoint).await?);
         }
-        require_asset_amount(&tree_record, world.tree_asset, 1, "deployed TREE")?;
+    }
+    for (record, shard) in distributed.iter().zip(&plan.shards) {
+        require_asset_amount(record, world.tree_asset, shard.tree_count, "shard TREE")?;
         require_asset_amount(
-            &tree_record,
+            record,
             world.log_asset,
-            LOG_RESERVE_PER_TREE,
-            "deployed LOG reserve",
+            LOG_RESERVE_PER_TREE * shard.tree_count,
+            "shard LOG",
         )?;
-        require_asset_amount(&tree_record, world.xp_asset, XP_PER_TREE, "deployed XP")?;
+        require_asset_amount(
+            record,
+            world.xp_asset,
+            XP_PER_TREE * shard.tree_count,
+            "shard XP",
+        )?;
+    }
+
+    let results = stream::iter(plan.shards.iter().map(|shard| {
+        execute_deployment_shard(
+            deployer_keys,
+            services,
+            &world,
+            &plan.deployer_script,
+            shard,
+            &deployed,
+        )
+    }))
+    .buffer_unordered(MAINTENANCE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut submitted = 0;
+    for result in results {
+        submitted += result?;
     }
     world.verify_indexed_assets(&services.rest).await?;
 
@@ -934,11 +1093,73 @@ async fn execute_plan(
         std::fs::remove_file(pending_path).context("remove completed bootstrap plan")?;
     }
     println!(
-        "woodland.sh world deployed: {} trees from {}",
+        "woodland.sh world deployed: {} trees from {} ({submitted} submitted)",
         plan.manifest.trees.len(),
         plan.manifest.genesis_txid
     );
     Ok(())
+}
+
+async fn execute_deployment_shard(
+    deployer_keys: &Keys,
+    services: &Services,
+    world: &crate::world::ValidatedWorld,
+    deployer_script: &str,
+    shard: &PlannedShard,
+    deployed: &std::collections::HashSet<Txid>,
+) -> Result<usize> {
+    let mut submitted = 0;
+    for (index, planned) in shard.deployments.iter().enumerate() {
+        let deployment = decode_psbt(&planned.ark)?;
+        let txid = deployment.unsigned_tx.compute_txid();
+        if deployed.contains(&txid) {
+            continue;
+        }
+        let source = OutPoint::from_str(&planned.source_outpoint)
+            .context("parse deployment treasury source")?;
+        let asset_record = wait_for_exact_vtxo(&services.rest, source).await?;
+        if asset_record.is_spent || asset_record.script.to_hex_string() != deployer_script {
+            return Err(anyhow!("deployment shard treasury is not spendable"));
+        }
+        let remaining = (shard.deployments.len() - index) as u64;
+        let expected_value = tree::full_tree_value_sats(services.params.dust_sats)?
+            .checked_mul(remaining)
+            .ok_or_else(|| anyhow!("deployment shard value overflow"))?;
+        if asset_record.amount_sats != expected_value {
+            return Err(anyhow!("deployment shard BTC value is invalid"));
+        }
+        require_asset_amount(&asset_record, world.tree_asset, remaining, "shard TREE")?;
+        require_asset_amount(
+            &asset_record,
+            world.log_asset,
+            LOG_RESERVE_PER_TREE * remaining,
+            "shard LOG",
+        )?;
+        require_asset_amount(
+            &asset_record,
+            world.xp_asset,
+            XP_PER_TREE * remaining,
+            "shard XP",
+        )?;
+        submit_direct(
+            deployer_keys,
+            &services.rest,
+            deployment,
+            decode_psbts(&planned.checkpoints)?,
+        )
+        .await?;
+        let tree_record = wait_for_exact_vtxo(&services.rest, OutPoint { txid, vout: 0 }).await?;
+        require_asset_amount(&tree_record, world.tree_asset, 1, "deployed TREE")?;
+        require_asset_amount(
+            &tree_record,
+            world.log_asset,
+            LOG_RESERVE_PER_TREE,
+            "deployed LOG reserve",
+        )?;
+        require_asset_amount(&tree_record, world.xp_asset, XP_PER_TREE, "deployed XP")?;
+        submitted += 1;
+    }
+    Ok(submitted)
 }
 
 async fn require_current_trees(
@@ -967,6 +1188,100 @@ async fn wait_for_current_trees(
     Err(last_error.unwrap_or_else(|| anyhow!("tree index reconciliation failed")))
 }
 
+async fn load_exact_tree_records(
+    rest: &ArkadeRest,
+    world: &crate::world::ValidatedWorld,
+) -> Result<Vec<VtxoRecord>> {
+    load_exact_tree_records_for(rest, world, &world.trees).await
+}
+
+async fn load_exact_tree_records_for(
+    rest: &ArkadeRest,
+    world: &crate::world::ValidatedWorld,
+    declared: &[crate::world::ValidatedTree],
+) -> Result<Vec<VtxoRecord>> {
+    let outpoints = declared
+        .iter()
+        .map(|tree| OutPoint {
+            txid: tree.deployment_txid,
+            vout: 0,
+        })
+        .collect::<Vec<_>>();
+    let mut current = rest.get_vtxos_by_outpoints(&outpoints).await?;
+    if current.len() != declared.len() {
+        return Err(anyhow!(
+            "index returned {} of {} exact tree lineages",
+            current.len(),
+            declared.len()
+        ));
+    }
+    let mut lineage_states = declared
+        .iter()
+        .map(|tree| {
+            (
+                OutPoint {
+                    txid: tree.deployment_txid,
+                    vout: 0,
+                },
+                tree.state,
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut visited = current
+        .iter()
+        .map(|record| record.outpoint)
+        .collect::<std::collections::HashSet<_>>();
+    let tree_script = world.contract.vtxo.script_pubkey();
+    loop {
+        let spent = current
+            .iter()
+            .filter(|record| record.is_spent)
+            .cloned()
+            .collect::<Vec<_>>();
+        if spent.is_empty() {
+            return Ok(current);
+        }
+        let candidates = rest
+            .get_vtxo_successor_candidates(&spent, &tree_script, world.tree_asset)
+            .await?;
+        let mut successors = Vec::with_capacity(candidates.len());
+        for (record, transaction) in candidates {
+            let state = tree::tree_state_from_tx(&transaction)?
+                .ok_or_else(|| anyhow!("tree successor has no identity packet"))?;
+            successors.push((state, record));
+        }
+        for record in &mut current {
+            if !record.is_spent {
+                continue;
+            }
+            let state = lineage_states
+                .remove(&record.outpoint)
+                .ok_or_else(|| anyhow!("tree lineage lost its identity"))?;
+            let direct_txid = record.spent_by;
+            let mut matching = successors
+                .iter()
+                .enumerate()
+                .filter(|(_, (candidate_state, candidate))| {
+                    *candidate_state == state
+                        && direct_txid.is_none_or(|txid| candidate.outpoint.txid == txid)
+                })
+                .map(|(index, _)| index);
+            let index = matching
+                .next()
+                .ok_or_else(|| anyhow!("tree successor is not indexed yet"))?;
+            if matching.next().is_some() {
+                return Err(anyhow!("tree has multiple indexed successors"));
+            }
+            drop(matching);
+            let (_, successor) = successors.swap_remove(index);
+            if !visited.insert(successor.outpoint) {
+                return Err(anyhow!("tree lineage contains a cycle"));
+            }
+            lineage_states.insert(successor.outpoint, state);
+            *record = successor;
+        }
+    }
+}
 async fn load_current_trees(
     rest: &ArkadeRest,
     manifest: &WorldManifest,
@@ -977,20 +1292,7 @@ async fn load_current_trees(
     let log_asset = world.log_asset;
     let xp_asset = world.xp_asset;
     let declared_trees = &world.trees;
-    let records = rest
-        .get_vtxos(&manifest.tree_script, "spendableOnly")
-        .await?;
-    let trees: Vec<_> = records
-        .into_iter()
-        .filter(|record| record.asset_amount(tree_asset).is_some())
-        .collect();
-    if trees.len() < manifest.trees.len() {
-        return Err(anyhow!(
-            "woodland.sh exposes {} of {} trees",
-            trees.len(),
-            manifest.trees.len()
-        ));
-    }
+    let trees = load_exact_tree_records(rest, world).await?;
     let txids: Vec<_> = trees.iter().map(|record| record.outpoint.txid).collect();
     let transactions = rest.get_virtual_txs(&txids).await?;
     let mut seen_states = std::collections::HashMap::new();
@@ -1425,6 +1727,21 @@ async fn wait_for_vtxo(rest: &ArkadeRest, script: &str, outpoint: OutPoint) -> R
     Err(anyhow!("indexer did not expose VTXO {outpoint}"))
 }
 
+async fn wait_for_exact_vtxo(rest: &ArkadeRest, outpoint: OutPoint) -> Result<VtxoRecord> {
+    for _ in 0..INDEX_ATTEMPTS {
+        if let Some(record) = rest
+            .get_vtxos_by_outpoints(&[outpoint])
+            .await?
+            .into_iter()
+            .next()
+        {
+            return Ok(record);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(INDEX_POLL_MS)).await;
+    }
+    Err(anyhow!("indexer did not expose exact VTXO {outpoint}"))
+}
+
 async fn submit_direct(
     keys: &Keys,
     rest: &ArkadeRest,
@@ -1683,33 +2000,27 @@ async fn renew_tree(
     let manifest = read_manifest(path)?;
     let world = manifest.validate(&rollover_keys.secp, &services.params, &services.emulator)?;
     require_rollover_key(rollover_keys, &world)?;
-    let tree_script = world.contract.vtxo.script_pubkey().to_hex_string();
-    let records = services
+    let declared = world
+        .trees
+        .iter()
+        .find(|tree| tree.state.tree_id == tree_id)
+        .ok_or_else(|| anyhow!("no declared tree {tree_id} in this world"))?;
+    let mut records =
+        load_exact_tree_records_for(&services.rest, &world, std::slice::from_ref(declared)).await?;
+    let record = records
+        .pop()
+        .ok_or_else(|| anyhow!("no live tree {tree_id} in this world"))?;
+    let previous_tx = services
         .rest
-        .get_vtxos(&tree_script, "spendableOnly")
-        .await?;
-
-    // Identify the requested tree by decoding each live candidate's state.
-    let mut selected = None;
-    for record in records {
-        if record.asset_amount(world.tree_asset) != Some(1) {
-            continue;
-        }
-        let previous = services
-            .rest
-            .get_virtual_txs(&[record.outpoint.txid])
-            .await?
-            .remove(&record.outpoint.txid)
-            .ok_or_else(|| anyhow!("indexer omitted the tree's creating transaction"))?;
-        if crate::renewal::tree_state_from_tx(&previous)?
-            .is_some_and(|state| state.tree_id == tree_id)
-        {
-            selected = Some((record, previous));
-            break;
-        }
+        .get_virtual_txs(&[record.outpoint.txid])
+        .await?
+        .remove(&record.outpoint.txid)
+        .ok_or_else(|| anyhow!("indexer omitted the tree's creating transaction"))?;
+    if !crate::renewal::tree_state_from_tx(&previous_tx)?
+        .is_some_and(|state| state == declared.state)
+    {
+        return Err(anyhow!("live tree {tree_id} has the wrong identity"));
     }
-    let (record, previous_tx) =
-        selected.ok_or_else(|| anyhow!("no live tree {tree_id} in this world"))?;
     require_rollover_due(&record)?;
     let renewed =
         renew_current_tree(rollover_keys, services, &world, &record, &previous_tx).await?;

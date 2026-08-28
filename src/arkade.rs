@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
 use ark_core::Asset;
 use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid, XOnlyPublicKey};
+use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
@@ -13,6 +14,10 @@ use wasm_bindgen_futures::JsFuture;
 const REQUEST_TIMEOUT_MS: i32 = 15_000;
 const MAX_INDEX_PAGES: usize = 128;
 const MAX_INDEX_RECORDS: usize = 100_000;
+const MAX_VIRTUAL_TXS_PER_REQUEST: usize = 50;
+const VIRTUAL_TX_REQUEST_CONCURRENCY: usize = 8;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const MAX_VTXO_OUTPOINTS_PER_REQUEST: usize = 50;
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Default)]
@@ -64,6 +69,8 @@ pub struct VtxoRecord {
     pub expires_at: Option<i64>,
     pub is_preconfirmed: bool,
     pub is_swept: bool,
+    pub spent_by: Option<Txid>,
+    pub settled_by: Option<Txid>,
     pub is_unrolled: bool,
     pub is_spent: bool,
 }
@@ -307,6 +314,18 @@ struct GetVtxosResponse {
 }
 
 #[derive(Deserialize)]
+struct GetCommitmentTxResponse {
+    #[serde(default)]
+    batches: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct GetVtxoTreeLeavesResponse {
+    leaves: Option<Vec<IndexerOutpoint>>,
+    page: Option<IndexerPage>,
+}
+
+#[derive(Deserialize)]
 struct IndexerPage {
     current: Option<i32>,
     next: Option<i32>,
@@ -331,6 +350,10 @@ struct IndexerVtxo {
     is_unrolled: bool,
     #[serde(rename = "isSpent", default)]
     is_spent: bool,
+    #[serde(rename = "arkTxid")]
+    spent_by: Option<String>,
+    #[serde(rename = "settledBy")]
+    settled_by: Option<String>,
 }
 
 /// Protobuf JSON encodes int64 as a decimal string, while the generated
@@ -756,6 +779,24 @@ fn parse_indexer_vtxo(vtxo: IndexerVtxo) -> Result<VtxoRecord> {
         expires_at: parse_timestamp(vtxo.expires_at, "expiry")?,
         is_preconfirmed: vtxo.is_preconfirmed,
         is_swept: vtxo.is_swept,
+        spent_by: vtxo
+            .spent_by
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse()
+                    .context("parse indexed spending Ark transaction")
+            })
+            .transpose()?,
+        settled_by: vtxo
+            .settled_by
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse()
+                    .context("parse indexed settlement transaction")
+            })
+            .transpose()?,
         is_unrolled: vtxo.is_unrolled,
         is_spent: vtxo.is_spent,
     })
@@ -996,8 +1037,247 @@ impl ArkadeRest {
         Ok(records)
     }
 
+    /// Query exact VTXO outpoints without scanning a shared script lineage.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub async fn get_vtxos_by_outpoints(&self, outpoints: &[OutPoint]) -> Result<Vec<VtxoRecord>> {
+        let mut requested = outpoints
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        requested.sort_unstable();
+        let chunks = requested
+            .chunks(MAX_VTXO_OUTPOINTS_PER_REQUEST)
+            .map(<[OutPoint]>::to_vec)
+            .collect::<Vec<_>>();
+        let responses = stream::iter(chunks)
+            .map(|chunk| async move { self.get_vtxos_by_outpoint_chunk(&chunk).await })
+            .buffer_unordered(VIRTUAL_TX_REQUEST_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut records = std::collections::HashMap::new();
+        for response in responses {
+            for record in response? {
+                if records.insert(record.outpoint, record).is_some() {
+                    return Err(anyhow!("indexer returned a duplicate exact VTXO"));
+                }
+            }
+        }
+        Ok(records.into_values().collect())
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    async fn get_vtxos_by_outpoint_chunk(&self, outpoints: &[OutPoint]) -> Result<Vec<VtxoRecord>> {
+        let requested = outpoints
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let query = outpoints
+            .iter()
+            .map(|outpoint| format!("outpoints={outpoint}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let url = format!(
+            "{}/v1/indexer/vtxos?{query}&page.size={}&page.index=1",
+            self.base,
+            outpoints.len()
+        );
+        let text = fetch_text(&self.client, "GET", &url, None, FetchCache::NoStore).await?;
+        let response: GetVtxosResponse =
+            serde_json::from_str(&text).context("parse exact vtxos")?;
+        response
+            .vtxos
+            .unwrap_or_default()
+            .into_iter()
+            .map(parse_indexer_vtxo)
+            .map(|record| {
+                let record = record?;
+                if !requested.contains(&record.outpoint) {
+                    return Err(anyhow!(
+                        "indexer returned unexpected exact VTXO {}",
+                        record.outpoint
+                    ));
+                }
+                Ok(record)
+            })
+            .collect()
+    }
+
+    /// Fetch exact cooperative successor candidates, including VTXOs recreated
+    /// as leaves of a settlement batch. Callers bind candidates to protocol
+    /// identities from their creating transactions.
+    pub async fn get_vtxo_successor_candidates(
+        &self,
+        spent: &[VtxoRecord],
+        expected_script: &ScriptBuf,
+        marker_asset: AssetId,
+    ) -> Result<Vec<(VtxoRecord, Transaction)>> {
+        let mut candidate_outpoints = Vec::new();
+        let mut settlements = Vec::new();
+        for record in spent {
+            if let Some(txid) = record.spent_by {
+                candidate_outpoints.extend([
+                    OutPoint {
+                        txid,
+                        vout: u32::from(crate::protocol::RENEWAL_STATE_OUTPUT_INDEX),
+                    },
+                    OutPoint {
+                        txid,
+                        vout: u32::from(crate::protocol::TREE_OUTPUT_INDEX),
+                    },
+                ]);
+            } else if let Some(txid) = record.settled_by {
+                settlements.push(txid);
+            } else {
+                return Err(anyhow!("spent VTXO {} has no successor", record.outpoint));
+            }
+        }
+        candidate_outpoints.extend(self.get_batch_tree_leaves(&settlements).await?);
+        let candidates = self
+            .get_vtxos_by_outpoints(&candidate_outpoints)
+            .await?
+            .into_iter()
+            .filter(|record| {
+                record.script == *expected_script && record.asset_amount(marker_asset) == Some(1)
+            })
+            .collect::<Vec<_>>();
+        let transactions = self
+            .get_virtual_txs(
+                &candidates
+                    .iter()
+                    .map(|record| record.outpoint.txid)
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        candidates
+            .into_iter()
+            .map(|record| {
+                let transaction = transactions
+                    .get(&record.outpoint.txid)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("tree successor transaction is not indexed yet"))?;
+                Ok((record, transaction))
+            })
+            .collect()
+    }
+
+    async fn get_batch_tree_leaves(&self, settlements: &[Txid]) -> Result<Vec<OutPoint>> {
+        let mut settlements = settlements
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        settlements.sort_unstable();
+        let responses = stream::iter(
+            settlements
+                .into_iter()
+                .map(|txid| async move { self.get_commitment_tree_leaves(txid).await }),
+        )
+        .buffer_unordered(VIRTUAL_TX_REQUEST_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        let mut leaves = std::collections::HashSet::new();
+        for response in responses {
+            for leaf in response? {
+                leaves.insert(leaf);
+            }
+        }
+        Ok(leaves.into_iter().collect())
+    }
+
+    async fn get_commitment_tree_leaves(&self, txid: Txid) -> Result<Vec<OutPoint>> {
+        let url = format!("{}/v1/indexer/commitmentTx/{txid}", self.base);
+        let text = fetch_text(&self.client, "GET", &url, None, FetchCache::NoStore).await?;
+        let response: GetCommitmentTxResponse =
+            serde_json::from_str(&text).context("parse commitment transaction")?;
+        let mut batch_vouts = response
+            .batches
+            .keys()
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .context("parse commitment batch output")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        batch_vouts.sort_unstable();
+        let mut leaves = Vec::new();
+        for vout in batch_vouts {
+            let mut index = 1;
+            let mut visited = std::collections::HashSet::from([index]);
+            loop {
+                let url = format!(
+                    "{}/v1/indexer/batch/{txid}/{vout}/tree/leaves?page.size=500&page.index={index}",
+                    self.base
+                );
+                let text = fetch_text(&self.client, "GET", &url, None, FetchCache::NoStore).await?;
+                let response: GetVtxoTreeLeavesResponse =
+                    serde_json::from_str(&text).context("parse commitment tree leaves")?;
+                for leaf in response.leaves.unwrap_or_default() {
+                    leaves.push(OutPoint {
+                        txid: leaf
+                            .txid
+                            .parse()
+                            .context("parse commitment tree leaf txid")?,
+                        vout: leaf.vout,
+                    });
+                }
+                let page = response.page.unwrap_or(IndexerPage {
+                    current: Some(index),
+                    next: Some(0),
+                    total: Some(index),
+                });
+                let cursor = VtxoPage {
+                    vtxos: Vec::new(),
+                    current: page.current.unwrap_or(index),
+                    next: page.next.unwrap_or(0),
+                    total: page.total.unwrap_or(0),
+                };
+                let Some(next) = next_vtxo_page(&cursor, index, &mut visited)? else {
+                    break;
+                };
+                index = next;
+            }
+        }
+        Ok(leaves)
+    }
+
     /// Fetch full virtual transactions and key them by their computed txid.
     pub async fn get_virtual_txs(
+        &self,
+        txids: &[Txid],
+    ) -> Result<std::collections::HashMap<Txid, Transaction>> {
+        let mut requested = txids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        requested.sort_unstable();
+        let chunks = requested
+            .chunks(MAX_VIRTUAL_TXS_PER_REQUEST)
+            .map(<[Txid]>::to_vec)
+            .collect::<Vec<_>>();
+        let responses = stream::iter(chunks)
+            .map(|chunk| async move { self.get_virtual_txs_chunk(&chunk).await })
+            .buffer_unordered(VIRTUAL_TX_REQUEST_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut transactions = std::collections::HashMap::with_capacity(requested.len());
+        for response in responses {
+            for (txid, transaction) in response? {
+                if transactions.insert(txid, transaction).is_some() {
+                    return Err(anyhow!(
+                        "indexer returned duplicate virtual transaction {txid}"
+                    ));
+                }
+            }
+        }
+        Ok(transactions)
+    }
+
+    async fn get_virtual_txs_chunk(
         &self,
         txids: &[Txid],
     ) -> Result<std::collections::HashMap<Txid, Transaction>> {
@@ -1005,8 +1285,11 @@ impl ArkadeRest {
         if txids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let requested: std::collections::HashSet<_> = txids.iter().copied().collect();
-        let joined = requested
+        let requested = txids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let joined = txids
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -1562,6 +1845,21 @@ mod tests {
         assert_eq!(record.created_at, None);
         assert_eq!(record.expires_at, None);
         assert!(!record.is_spent);
+
+        let mut spent = live_indexed_vtxo();
+        spent["isSpent"] = serde_json::json!(true);
+        spent["spentBy"] = serde_json::json!(format!("{:02x}", 9).repeat(32));
+        spent["arkTxid"] = serde_json::json!(format!("{:02x}", 10).repeat(32));
+        spent["settledBy"] = serde_json::json!(format!("{:02x}", 11).repeat(32));
+        let record = parse_indexer_vtxo(serde_json::from_value(spent).unwrap()).unwrap();
+        assert_eq!(
+            record.spent_by,
+            Some(format!("{:02x}", 10).repeat(32).parse().unwrap())
+        );
+        assert_eq!(
+            record.settled_by,
+            Some(format!("{:02x}", 11).repeat(32).parse().unwrap())
+        );
 
         for bad in [
             serde_json::json!(-5),

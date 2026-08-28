@@ -18,13 +18,16 @@ pub(crate) const PROTOCOL_DUST_SATS: u64 = 330;
 pub(crate) const ACTIVE_LOGS_PER_TREE: u64 = 5;
 pub(crate) const LOG_RESERVE_PER_TREE: u64 = 10;
 pub(crate) const XP_PER_TREE: u64 = 10;
-pub(crate) const MAP_WIDTH: u16 = 45;
-pub(crate) const MAP_HEIGHT: u16 = 19;
+pub(crate) const TREE_COUNT: usize = 2_100;
+pub(crate) const MAP_WIDTH: u16 = 425;
+pub(crate) const MAP_HEIGHT: u16 = 425;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) const PLAYER_SPAWN_X: u16 = 3;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) const PLAYER_SPAWN_Y: u16 = 17;
-pub(crate) const TREE_STATES: [TreeState; 10] = [
+const TREE_ID_START: u32 = 417;
+const TREE_LAYOUT_SEED: u64 = 0x574f_4f44_4c41_4e44;
+const INITIAL_TREE_STATES: [TreeState; 10] = [
     TreeState {
         tree_id: 417,
         x: 7,
@@ -76,6 +79,40 @@ pub(crate) const TREE_STATES: [TreeState; 10] = [
         y: 16,
     },
 ];
+
+fn layout_sample(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+pub(crate) fn tree_states() -> Vec<TreeState> {
+    let mut states = INITIAL_TREE_STATES.to_vec();
+    let mut occupied = states
+        .iter()
+        .map(|state| (state.x, state.y))
+        .collect::<HashSet<_>>();
+    let cell_count = u64::from(MAP_WIDTH) * u64::from(MAP_HEIGHT);
+    let mut nonce = 0_u64;
+    while states.len() < TREE_COUNT {
+        let cell = layout_sample(TREE_LAYOUT_SEED.wrapping_add(nonce)) % cell_count;
+        nonce += 1;
+        let x = (cell % u64::from(MAP_WIDTH)) as u16;
+        let y = (cell / u64::from(MAP_WIDTH)) as u16;
+        let spawn_distance =
+            u32::from(x.abs_diff(PLAYER_SPAWN_X)) + u32::from(y.abs_diff(PLAYER_SPAWN_Y));
+        if spawn_distance <= 4 || !occupied.insert((x, y)) {
+            continue;
+        }
+        states.push(TreeState {
+            tree_id: TREE_ID_START + states.len() as u32,
+            x,
+            y,
+        });
+    }
+    states
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -277,7 +314,7 @@ impl WorldManifest {
             || self.max_level_log_drop_basis_points != tree::MAX_LEVEL_LOG_DROP_BASIS_POINTS
             || self.respawn_min_seconds != tree::RESPAWN_MIN_SECS
             || self.respawn_max_seconds != tree::RESPAWN_MAX_SECS
-            || self.trees.len() != TREE_STATES.len()
+            || self.trees.len() != TREE_COUNT
         {
             return Err(anyhow!("woodland.sh world manifest shape is invalid"));
         }
@@ -302,7 +339,7 @@ impl WorldManifest {
             ));
         }
 
-        let expected_states: HashSet<_> = TREE_STATES.into_iter().collect();
+        let expected_states: HashSet<_> = tree_states().into_iter().collect();
         let mut states = HashSet::new();
         let mut tree_ids = HashSet::new();
         let mut coordinates = HashSet::new();
@@ -383,17 +420,17 @@ fn expected_asset_metadata(label: &str) -> Vec<u8> {
 impl ValidatedWorld {
     pub async fn verify_indexed_assets(&self, rest: &crate::arkade::ArkadeRest) -> Result<()> {
         for (asset_id, label, maximum_supply, allow_zero) in [
-            (self.tree_asset, "TREE", TREE_STATES.len() as u64, false),
+            (self.tree_asset, "TREE", self.trees.len() as u64, false),
             (
                 self.log_asset,
                 "LOG",
-                LOG_RESERVE_PER_TREE * TREE_STATES.len() as u64,
+                LOG_RESERVE_PER_TREE * self.trees.len() as u64,
                 true,
             ),
             (
                 self.xp_asset,
                 "XP",
-                XP_PER_TREE * TREE_STATES.len() as u64,
+                XP_PER_TREE * self.trees.len() as u64,
                 true,
             ),
         ] {
@@ -489,10 +526,14 @@ mod tests {
             params.dust_sats,
         )
         .unwrap();
-        let deployments: Vec<_> = TREE_STATES
-            .iter()
+        let deployments: Vec<_> = tree_states()
+            .into_iter()
             .enumerate()
-            .map(|(index, state)| (*state, Txid::from_byte_array([(index + 8) as u8; 32])))
+            .map(|(index, state)| {
+                let mut txid = [0_u8; 32];
+                txid[..8].copy_from_slice(&(index as u64 + 8).to_le_bytes());
+                (state, Txid::from_byte_array(txid))
+            })
             .collect();
         let manifest = WorldManifest::new(
             &params,
@@ -512,15 +553,15 @@ mod tests {
     }
 
     #[test]
-    fn manifest_round_trips_exactly_ten_trees() {
+    fn manifest_round_trips_exactly_declared_trees() {
         let (secp, params, emulator, manifest) = fixture();
         let json = manifest.to_json().unwrap();
         assert!(json.contains("\"xpAsset\""));
         assert!(json.contains("\"xpPerTree\""));
         let parsed = WorldManifest::from_json(&json).unwrap();
         let world = parsed.validate(&secp, &params, &emulator).unwrap();
-        assert_eq!(world.trees.len(), 10);
-        assert_eq!(world.trees[0].state, TREE_STATES[0]);
+        assert_eq!(world.trees.len(), TREE_COUNT);
+        assert_eq!(world.trees[0].state, tree_states()[0]);
         assert_eq!(world.xp_asset.to_string(), parsed.xp_asset);
         assert_eq!(parsed.arkade_service_url, "http://127.0.0.1:7070");
         assert_eq!(parsed.emulator_url, "http://127.0.0.1:7073");

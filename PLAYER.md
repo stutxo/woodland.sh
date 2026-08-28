@@ -49,11 +49,9 @@ player and tree covenants compare the packet to the state asset balance.
 XP has no control asset and cannot be reissued.
 
 Level is derived, never stored. The canonical level thresholds remain
-`woodland-xp-v1`; LOG chance rises from 10% to 15% at levels 10, 20, 30, 40,
-and 50.
-The deployed 100-XP world caps aggregate player XP at 100, so its level-10
-and higher chance bonuses are intentionally dormant. Reaching those tiers would
-require a larger future world or a separate balance change.
+`woodland-xp-v1`; LOG chance rises from 25% to 30% at levels 10, 20, 30, 40,
+and 50. The expanded 21,000-XP world can reach the lower bonus tiers while
+aggregate XP remains fixed and asset-backed.
 
 ## Atomic Chop
 
@@ -147,7 +145,7 @@ well as the key.
 
 ## Limits
 
-The player count is unlimited, but season resources are not: the example world
-contains 100 LOG and 100 XP. Player state currently keeps harvested assets
+The player count is unlimited, but season resources are not: the expanded world
+contains 21,000 LOG and 21,000 XP. Player state currently keeps harvested assets
 inside the recursive contract; a separate owner-authorized withdrawal contract
 would be required for external LOG transfer without weakening XP invariants.

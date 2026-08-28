@@ -20,13 +20,13 @@ Protocol v1 uses schema 1 and storage under `woodland.sh:web:v1:*`. A fresh
 world creates three fixed-supply groups:
 
 ```text
-group 0:  10 TREE
-group 1: 100 LOG
-group 2: 100 XP
+group 0:  2,100 TREE
+group 1: 21,000 LOG
+group 2: 21,000 XP
 ```
 
 Each tree receives one TREE, ten LOG, ten XP, health five, and 1,980 sats.
-Bootstrap funding is 19,800 sats. There is no control asset, PLAYER_TICKET,
+Bootstrap funding is 4,158,000 sats. There is no control asset, PLAYER_TICKET,
 allocator reserve, invitation, or player registry.
 
 A browser wallet receives one exact 330-sat VTXO and, in one transaction,
