@@ -48,15 +48,14 @@ export function mine(n = 1) {
 // headers" and stalls the whole stack).
 export async function bootstrapChain() {
   // Ensure EXACTLY ONE wallet is loaded, so bitcoin-cli (and Boltz) can route
-  // wallet RPCs without an explicit -rpcwallet. The wrinkle: btcpay/Core images
-  // differ — Core 30's image auto-creates the empty-named "" wallet on startup,
-  // while Core 31 creates none and rejects empty names. So we first wait for the
-  // image's own wallet when already present, otherwise immediately create our
-  // named wallet. createwallet is retried while the wallet subsystem finishes
-  // startup; waiting for Core 31 to auto-create a wallet wastes 30 seconds
-  // because that image intentionally creates none.
+  // wallet RPCs without an explicit -rpcwallet. Core 30 may auto-load the
+  // empty-named wallet, while Core 31 starts with none. A later Compose pass can
+  // also restart bitcoind after this function created `default`, leaving the
+  // database on disk but unloaded. Load first, then create only when absent.
   if (loadedWalletCount() === 0) {
-    await waitForOrFail('Bitcoin Core wallet (created)', () => {
+    await waitForOrFail('Bitcoin Core wallet (loaded or created)', () => {
+      if (loadedWalletCount() > 0) return true;
+      bitcoinCli(['loadwallet', WALLET], { capture: true });
       if (loadedWalletCount() > 0) return true;
       bitcoinCli(['createwallet', WALLET], { capture: true });
       return loadedWalletCount() > 0;

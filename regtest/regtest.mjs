@@ -121,6 +121,9 @@ async function start(options) {
   if (active.has('ark')) {
     result = composeUp([], { profiles: ['base', 'ark'] });
     if (result.code !== 0) fail('docker compose ark startup failed');
+    // Adding Ark services may recreate bitcoind. Core does not auto-load an
+    // existing wallet after that restart, so restore it before funding arkd.
+    await bootstrapChain();
     await setupArkd();
   }
   if (active.has('emulator')) await startEmulator();
