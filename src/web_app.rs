@@ -428,8 +428,6 @@ impl WoodlandApp {
             .network
             .parse::<bitcoin::Network>()
             .map_err(|_| JsValue::from_str("world manifest has an invalid network"))?;
-        let pending_storage_key = format!("woodland.sh:web:v1:pending:{server}");
-        let pending_chop = load_pending_chop(&pending_storage_key).map_err(js_err)?;
         let rest = ArkadeRest::new(server);
         let params = rest.get_info().await.map_err(js_err)?;
         if params.network != expected_network {
@@ -465,6 +463,8 @@ impl WoodlandApp {
             contract,
             ..
         } = validated;
+        let pending_storage_key = format!("woodland.sh:web:v1:pending:{server}:{genesis_txid}");
+        let pending_chop = load_pending_chop(&pending_storage_key).map_err(js_err)?;
         let profile = match player_profile.filter(|value| !value.trim().is_empty()) {
             Some(json) => {
                 let profile: PlayerProfile = serde_json::from_str(&json)

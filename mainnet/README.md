@@ -113,7 +113,8 @@ the provider's exact version before funding.
 Follow the deployment sequence in the repository `README.md`:
 
 1. run `woodland-operator status` before funding;
-2. fund the exact Arkade address and amount it reports;
+2. fund clean VTXOs at the reported address whose total exactly equals the
+   reported amount;
 3. run `woodland-operator ensure` until complete;
 4. require `woodland-operator status` to report `ready`;
 5. verify 2,100 tree VTXOs and fixed asset supplies;

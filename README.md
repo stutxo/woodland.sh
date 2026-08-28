@@ -322,8 +322,8 @@ cargo build --release --locked --features woodland-app --bin woodland-operator
 export WOODLAND_OPERATOR_BIN="$PWD/target/release/woodland-operator"
 
 "$WOODLAND_OPERATOR_BIN" status "$WOODLAND_WORLD_MANIFEST"
-# Fund the exact address and amount reported above using a compatible
-# mainnet Arkade wallet, then:
+# Fund the address above until its clean spendable VTXOs sum exactly to the
+# reported amount. One transfer or several exact aggregate transfers work.
 "$WOODLAND_OPERATOR_BIN" ensure "$WOODLAND_WORLD_MANIFEST"
 
 unset WOODLAND_DEPLOYER_SECRET

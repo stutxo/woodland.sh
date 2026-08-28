@@ -8,6 +8,7 @@ const SERVER_URL = SERVER_SETTING === 'self'
 const STORAGE_SCOPE = location.origin;
 const KEY = `woodland.sh:web:v1:key:${STORAGE_SCOPE}`;
 const PROFILE = `woodland.sh:web:v1:profile:${STORAGE_SCOPE}`;
+let profileStorageKey = PROFILE;
 let pendingStorageKey = `woodland.sh:web:v1:pending:${STORAGE_SCOPE}`;
 const POSITION = `woodland.sh:web:v1:position:${STORAGE_SCOPE}`;
 
@@ -964,7 +965,7 @@ function render() {
 
   activateButton.disabled = walking || busy || playerActive || !state.activationReady;
   activateButton.textContent = busy && !playerActive ? 'Creating player...' : 'Create player';
-  resetProfileButton.hidden = playerActive || !localStorage.getItem(PROFILE);
+  resetProfileButton.hidden = playerActive || !localStorage.getItem(profileStorageKey);
   resetProfileButton.disabled = walking || busy || playerActive;
   resetButton.disabled = walking || busy;
   const rolloverDue = state.playerStateExpiresInSeconds != null
@@ -1021,7 +1022,7 @@ async function run(label, action, completion = () => 'Success') {
 }
 
 function persistProfile() {
-  if (app) localStorage.setItem(PROFILE, app.exportProfile());
+  if (app) localStorage.setItem(profileStorageKey, app.exportProfile());
 }
 
 function persistPosition() {
@@ -1210,6 +1211,7 @@ resetButton.addEventListener('click', () => {
   if (busy || !window.confirm('Forget this local test key and create a new wallet?')) return;
   localStorage.removeItem(KEY);
   localStorage.removeItem(PROFILE);
+  localStorage.removeItem(profileStorageKey);
   localStorage.removeItem(pendingStorageKey);
   localStorage.removeItem(POSITION);
   location.reload();
@@ -1221,7 +1223,7 @@ resetProfileButton.addEventListener('click', () => {
     || state?.playerActive
     || !window.confirm('Forget the saved world profile but keep this funded wallet key?')
   ) return;
-  localStorage.removeItem(PROFILE);
+  localStorage.removeItem(profileStorageKey);
   localStorage.removeItem(POSITION);
   location.reload();
 });
@@ -1258,13 +1260,26 @@ async function boot() {
       respawnAt: null,
       respawnInSeconds: null,
     }));
-    pendingStorageKey = `woodland.sh:web:v1:pending:${manifest.arkadeServiceUrl.replace(/\/+$/, '')}`;
+    profileStorageKey = `${PROFILE}:${manifest.genesisTxid}`;
+    pendingStorageKey = `woodland.sh:web:v1:pending:${manifest.arkadeServiceUrl.replace(/\/+$/, '')}:${manifest.genesisTxid}`;
+    let storedProfile = localStorage.getItem(profileStorageKey);
+    const legacyProfile = localStorage.getItem(PROFILE);
+    if (!storedProfile && legacyProfile) {
+      try {
+        if (JSON.parse(legacyProfile).genesisTxid === manifest.genesisTxid) {
+          storedProfile = legacyProfile;
+          localStorage.setItem(profileStorageKey, legacyProfile);
+        }
+      } catch {
+        // A malformed legacy profile remains untouched for manual recovery.
+      }
+    }
     app = await WoodlandApp.init(
       manifest.arkadeServiceUrl,
       manifest.emulatorUrl,
       world,
       localStorage.getItem(KEY) || undefined,
-      localStorage.getItem(PROFILE) || undefined,
+      storedProfile || undefined,
     );
     localStorage.setItem(KEY, app.exportKey());
     syncAppTreeViewport();

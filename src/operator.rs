@@ -66,7 +66,7 @@ struct PlannedShard {
 struct BootstrapPlan {
     manifest: WorldManifest,
     deployer_script: String,
-    funding_outpoint: String,
+    funding_outpoints: Vec<String>,
     issuance_ark: String,
     issuance_checkpoints: Vec<String>,
     distribution_ark: String,
@@ -499,10 +499,14 @@ async fn print_status(path: &Path, keys: &Keys, services: &Services) -> Result<(
     if select_funding(&records, funding_sats).is_some() {
         println!("funded\t-\t0");
     } else {
+        let balance = clean_funding_balance(&records)?;
+        let missing = funding_sats.checked_sub(balance).ok_or_else(|| {
+            anyhow!("deployer has {balance} clean sats but no exact {funding_sats}-sat funding set")
+        })?;
         println!(
             "needs-funding\t{}\t{}",
             deployer.to_ark_address().encode(),
-            funding_sats
+            missing
         );
     }
     Ok(())
@@ -573,17 +577,30 @@ fn build_plan(
     deployer: &ark_core::Vtxo,
     maintenance_signer: XOnlyPublicKey,
     rollover_signer: XOnlyPublicKey,
-    funding: VtxoRecord,
+    funding: Vec<VtxoRecord>,
 ) -> Result<BootstrapPlan> {
     let address = deployer.to_ark_address();
     let tree_states = tree_states();
     let tree_count = tree_states.len();
     let funding_sats = world_funding_sats(&services.params)?;
+    let funding_total = funding.iter().try_fold(0_u64, |total, record| {
+        total
+            .checked_add(record.amount_sats)
+            .ok_or_else(|| anyhow!("world funding amount overflow"))
+    })?;
+    if funding_total != funding_sats {
+        return Err(anyhow!(
+            "world funding inputs do not equal the required amount"
+        ));
+    }
     let receivers = [SendReceiver::bitcoin(
         address,
         Amount::from_sat(funding_sats),
     )];
-    let inputs = [txbuild::vtxo_input(&funding, deployer)?];
+    let inputs = funding
+        .iter()
+        .map(|record| txbuild::vtxo_input(record, deployer))
+        .collect::<Result<Vec<_>>>()?;
     let mut issuance = build_offchain_transactions(
         &receivers,
         &address,
@@ -866,7 +883,10 @@ fn build_plan(
     Ok(BootstrapPlan {
         manifest,
         deployer_script: deployer.script_pubkey().to_hex_string(),
-        funding_outpoint: funding.outpoint.to_string(),
+        funding_outpoints: funding
+            .iter()
+            .map(|record| record.outpoint.to_string())
+            .collect(),
         issuance_ark: encode_psbt(&issuance.ark_tx),
         issuance_checkpoints: issuance.checkpoint_txs.iter().map(encode_psbt).collect(),
         distribution_ark: encode_psbt(&distribution.ark_tx),
@@ -993,20 +1013,32 @@ async fn execute_plan(
         .into_iter()
         .next();
     if issuance.is_none() && deployed.is_empty() {
-        let funding_outpoint = OutPoint::from_str(&plan.funding_outpoint)
-            .context("parse bootstrap funding outpoint")?;
+        let funding_outpoints = plan
+            .funding_outpoints
+            .iter()
+            .map(|value| OutPoint::from_str(value).context("parse bootstrap funding outpoint"))
+            .collect::<Result<Vec<_>>>()?;
         let funding = services
             .rest
-            .get_vtxos_by_outpoints(&[funding_outpoint])
-            .await?
-            .into_iter()
-            .find(|record| !record.is_spent)
-            .ok_or_else(|| {
-                anyhow!(
-                    "world bootstrap funding is pending or missing; retry shortly or clean regtest"
-                )
-            })?;
-        if funding.amount_sats != world_funding_sats(&services.params)? {
+            .get_vtxos_by_outpoints(&funding_outpoints)
+            .await?;
+        if funding.len() != funding_outpoints.len()
+            || funding.iter().any(|record| {
+                record.is_spent
+                    || !record.assets.is_empty()
+                    || record.script.to_hex_string() != plan.deployer_script
+            })
+        {
+            return Err(anyhow!(
+                "world bootstrap funding is pending or missing; retry shortly or clean regtest"
+            ));
+        }
+        let funding_total = funding.iter().try_fold(0_u64, |total, record| {
+            total
+                .checked_add(record.amount_sats)
+                .ok_or_else(|| anyhow!("world bootstrap funding amount overflow"))
+        })?;
+        if funding_total != world_funding_sats(&services.params)? {
             return Err(anyhow!("world bootstrap funding amount is invalid"));
         }
         submit_direct(
@@ -1687,18 +1719,41 @@ fn tree_regrow_vtxo_input(record: &VtxoRecord, contract: &tree::TreeContract) ->
     ))
 }
 
-fn select_funding(records: &[VtxoRecord], amount: u64) -> Option<VtxoRecord> {
+fn clean_funding_balance(records: &[VtxoRecord]) -> Result<u64> {
     records
         .iter()
-        .find(|record| record.amount_sats == amount && record.assets.is_empty())
-        .cloned()
+        .filter(|record| record.assets.is_empty())
+        .try_fold(0_u64, |total, record| {
+            total
+                .checked_add(record.amount_sats)
+                .ok_or_else(|| anyhow!("deployer funding balance overflow"))
+        })
 }
 
-async fn wait_for_funding(rest: &ArkadeRest, script: &str, amount: u64) -> Result<VtxoRecord> {
+fn select_funding(records: &[VtxoRecord], amount: u64) -> Option<Vec<VtxoRecord>> {
+    if let Some(record) = records
+        .iter()
+        .find(|record| record.amount_sats == amount && record.assets.is_empty())
+    {
+        return Some(vec![record.clone()]);
+    }
+    let mut funding = records
+        .iter()
+        .filter(|record| record.assets.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    funding.sort_by_key(|record| record.outpoint);
+    clean_funding_balance(&funding)
+        .ok()
+        .filter(|total| *total == amount)
+        .map(|_| funding)
+}
+
+async fn wait_for_funding(rest: &ArkadeRest, script: &str, amount: u64) -> Result<Vec<VtxoRecord>> {
     for _ in 0..INDEX_ATTEMPTS {
         let records = rest.get_vtxos(script, "spendableOnly").await?;
-        if let Some(record) = select_funding(&records, amount) {
-            return Ok(record);
+        if let Some(funding) = select_funding(&records, amount) {
+            return Ok(funding);
         }
         tokio::time::sleep(std::time::Duration::from_millis(INDEX_POLL_MS)).await;
     }
@@ -2134,6 +2189,53 @@ mod tests {
 
     fn pin<'a>(name: &'a str, value: Option<&'a str>) -> PinSetting<'a> {
         PinSetting { name, value }
+    }
+
+    fn funding_record(byte: u8, amount_sats: u64) -> VtxoRecord {
+        VtxoRecord {
+            outpoint: OutPoint {
+                txid: Txid::from_str(&format!("{byte:02x}").repeat(32)).unwrap(),
+                vout: 0,
+            },
+            script: bitcoin::ScriptBuf::new(),
+            amount_sats,
+            assets: Vec::new(),
+            created_at: Some(1),
+            expires_at: Some(i64::MAX),
+            is_preconfirmed: false,
+            is_swept: false,
+            spent_by: None,
+            settled_by: None,
+            is_unrolled: false,
+            is_spent: false,
+        }
+    }
+
+    #[test]
+    fn deployment_funding_accepts_one_or_an_exact_aggregate() {
+        let exact = funding_record(1, 158_000);
+        let split = [funding_record(2, 100_000), funding_record(3, 58_000)];
+        assert_eq!(
+            select_funding(std::slice::from_ref(&exact), 158_000)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(select_funding(&split, 158_000).unwrap().len(), 2);
+        assert!(select_funding(&split, 158_001).is_none());
+
+        let mut asset_bearing = funding_record(4, 1);
+        asset_bearing.assets.push(Asset {
+            asset_id: AssetId {
+                txid: asset_bearing.outpoint.txid,
+                group_index: 0,
+            },
+            amount: 1,
+        });
+        let mut records = split.to_vec();
+        records.push(asset_bearing);
+        assert_eq!(clean_funding_balance(&records).unwrap(), 158_000);
+        assert_eq!(select_funding(&records, 158_000).unwrap().len(), 2);
     }
 
     #[test]

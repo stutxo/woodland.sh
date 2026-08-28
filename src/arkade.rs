@@ -18,6 +18,7 @@ const MAX_VIRTUAL_TXS_PER_REQUEST: usize = 50;
 const VIRTUAL_TX_REQUEST_CONCURRENCY: usize = 8;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const MAX_VTXO_OUTPOINTS_PER_REQUEST: usize = 50;
+const EXACT_VTXO_REQUEST_CONCURRENCY: usize = 2;
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Default)]
@@ -1053,7 +1054,7 @@ impl ArkadeRest {
             .collect::<Vec<_>>();
         let responses = stream::iter(chunks)
             .map(|chunk| async move { self.get_vtxos_by_outpoint_chunk(&chunk).await })
-            .buffer_unordered(VIRTUAL_TX_REQUEST_CONCURRENCY)
+            .buffer_unordered(EXACT_VTXO_REQUEST_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
         let mut records = std::collections::HashMap::new();
