@@ -59,8 +59,9 @@
       #dashboard.player-active .dashboard-grid { grid-template-columns: minmax(0, 1fr) 262px; }
       .stats-box { grid-column: 1 / -1; width: min(100%, 600px); justify-self: end; }
     }
-    .leaderboard { margin-top: 12px; padding: 0; border: 1px solid #3a4934; background: #11170f; }
-    .leaderboard-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px; cursor: pointer; }
+    .lower-panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; gap: 12px; margin-top: 12px; }
+    .leaderboard { min-width: 0; margin: 0; padding: 0; border: 1px solid #3a4934; background: #11170f; }
+    .leaderboard-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px; }
     .server-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 0 10px 10px; }
     .panel-summary { padding: 10px 12px; cursor: pointer; }
     .leaderboard-scroll { overflow-x: auto; }
@@ -79,8 +80,9 @@
     .chat-compose { display: flex; gap: 8px; padding: 8px 10px 10px; border-top: 1px solid #202a1d; }
     .chat-compose input { min-width: 0; flex: 1; border: 1px solid #3a4934; border-radius: 4px; padding: 0 10px; color: #dfe9da; background: #090c08; font: inherit; }
     .chat-compose input:disabled { opacity: .4; }
-    details { color: #8e9b88; font-size: .76rem; }
-    details button { margin: 10px 6px 0 0; }
+    details, .protocol-details { color: #8e9b88; font-size: .76rem; }
+    details button, .protocol-details button { margin: 10px 6px 0 0; }
+    .protocol-details { min-width: 0; padding: 12px; border: 1px solid #3a4934; background: #11170f; }
     .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-top: 12px; }
     .detail-grid div { overflow-wrap: anywhere; }
     .detail-grid dt { color: #8e9b88; }
@@ -92,6 +94,7 @@
       #dashboard.player-active .dashboard-grid { grid-template-columns: 1fr; }
       .bag, .stats-box { width: 100%; }
       .stats-box { grid-column: auto; max-width: none; }
+      .lower-panels { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -186,11 +189,12 @@
       </div>
     </details>
 
-    <details id="leaderboard-panel" class="leaderboard" hidden>
-      <summary class="leaderboard-head">
-        <span>Players &amp; chat</span>
-        <span id="leaderboard-status" class="muted">Loading verified players...</span>
-      </summary>
+    <div class="lower-panels">
+      <section id="leaderboard-panel" class="leaderboard" aria-labelledby="players-chat-heading" hidden>
+        <div class="leaderboard-head">
+          <span id="players-chat-heading">Players &amp; chat</span>
+          <span id="leaderboard-status" class="muted">Loading verified players...</span>
+        </div>
       <div class="server-actions">
         <button id="delegate-renewal" type="button" hidden>Delegate renewals</button>
       </div>
@@ -210,10 +214,10 @@
           <button id="send-chat" type="submit" disabled>Send</button>
         </form>
       </div>
-    </details>
+      </section>
 
-    <details>
-      <summary>Details</summary>
+      <section class="protocol-details" aria-labelledby="details-heading">
+        <h2 id="details-heading">Details</h2>
       <button id="reset-profile" type="button" hidden>Forget saved PLAYER</button>
       <button id="reset" type="button">New test wallet</button>
       <dl id="details" class="detail-grid" hidden>
@@ -233,7 +237,8 @@
         <div><dt>Tree VTXO</dt><dd id="tree-outpoint"></dd></div>
         <div><dt>Last swing</dt><dd id="last-chop">None</dd></div>
       </dl>
-    </details>
+      </section>
+    </div>
   </main>
   <script type="module" src="./app.js"></script>
 </body>
