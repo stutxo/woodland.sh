@@ -231,23 +231,32 @@ async function main() {
       && totalsBefore.logs <= manifest.logReservePerTree * manifest.trees.length,
   );
 
-  // Join two renewals to the same batch. Each topic-filtered client receives
-  // its own path while parent chunks retain omitted sibling references.
-  const [first, peer] = await Promise.all([
-    renewAsync('tree', String(TREE_ID)),
+  // Join two untouched, equal-depth lineages to the same batch. Each
+  // topic-filtered client receives its own path while parent chunks retain
+  // omitted sibling references.
+  const [peer, sibling] = await Promise.all([
     renewAsync('tree', String(TREE_ID + 1)),
+    renewAsync('tree', String(TREE_ID + 2)),
   ]);
+  assert.equal(peer.kind, 'tree');
+  assert.equal(peer.treeId, TREE_ID + 1);
+  assert.equal(sibling.treeId, TREE_ID + 2);
+  assert.equal(peer.commitmentTxid, sibling.commitmentTxid, 'peer renewals must share one batch');
+  assert.notEqual(peer.newOutpoint, peer.oldOutpoint);
+  assert.notEqual(sibling.newOutpoint, sibling.oldOutpoint);
+  assert.ok(peer.newExpiresAt > peer.oldExpiresAt);
+  assert.ok(sibling.newExpiresAt > sibling.oldExpiresAt);
+
+  // Independently renew the mutated target so lookup depth cannot decide
+  // whether the peer intents reach the same Ark batch.
+  const first = renew('tree', String(TREE_ID));
   assert.equal(first.kind, 'tree');
   assert.equal(first.treeId, TREE_ID);
-  assert.equal(first.commitmentTxid, peer.commitmentTxid, 'peer renewals must share one batch');
   assert.notEqual(first.newOutpoint, first.oldOutpoint, 'renewal must create a new outpoint');
   assert.ok(
     first.newExpiresAt > first.oldExpiresAt,
     `expiry must increase: ${first.oldExpiresAt} -> ${first.newExpiresAt}`,
   );
-  assert.equal(peer.treeId, TREE_ID + 1);
-  assert.notEqual(peer.newOutpoint, peer.oldOutpoint);
-  assert.ok(peer.newExpiresAt > peer.oldExpiresAt);
 
   const [firstNewTxid] = first.newOutpoint.split(':');
   const leafBytes = await virtualTxBytes(firstNewTxid);
@@ -294,7 +303,7 @@ async function main() {
     );
   }
 
-  // World-wide conservation is untouched by both renewals.
+  // World-wide conservation is untouched by every renewal.
   const world = await indexerVtxos({ scripts: treeScript, spendableOnly: 'true' });
   assert.equal(world.length, manifest.trees.length, 'all declared trees remain live');
   const totals = worldAssetTotals(world, treeAsset, logAsset, xpAsset);
