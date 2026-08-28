@@ -1282,7 +1282,7 @@ async function boot() {
       storedProfile || undefined,
     );
     localStorage.setItem(KEY, app.exportKey());
-    syncAppTreeViewport();
+    // Keep the Rust bootstrap viewport around spawn until player state is known.
     adoptState(await refreshWorld());
     persistProfile();
     restorePosition();
