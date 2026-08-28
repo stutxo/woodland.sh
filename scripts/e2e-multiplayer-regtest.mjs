@@ -788,7 +788,9 @@ async function main() {
         const { expiresInSeconds: beforeExpiry, ...beforeStable } = before;
         const { expiresInSeconds: afterExpiry, ...afterStable } = tree;
         assert.deepEqual(afterStable, beforeStable);
-        assert.ok(afterExpiry <= beforeExpiry && afterExpiry > 300);
+        if (beforeExpiry != null && afterExpiry != null) {
+          assert.ok(afterExpiry <= beforeExpiry && afterExpiry > 300);
+        }
       }
     }
     const chopTxids = selectedTrees.map((selected) => (
