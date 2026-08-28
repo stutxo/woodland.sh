@@ -1415,7 +1415,11 @@ setInterval(async () => {
     const resumePending = Boolean(state?.pendingChopTxid)
       && Date.now() >= pendingRetryAfter;
     if (resumePending) pendingRetryAfter = Date.now() + 5_000;
-    const refreshWorld = !resumePending && Date.now() >= nextWorldRefreshAt;
+    const respawnDue = state?.trees?.some((tree) => (
+      tree.health === 0 && tree.respawnInSeconds === 0
+    ));
+    const refreshWorld = !resumePending
+      && (respawnDue || Date.now() >= nextWorldRefreshAt);
     adoptState(await withApp(() => {
       if (resumePending) return app.resumePendingChop();
       return refreshWorld ? app.refreshWorld() : app.refresh();
