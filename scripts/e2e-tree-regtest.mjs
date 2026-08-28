@@ -775,7 +775,7 @@ async function main() {
       return;
     }
     assert.equal(chopped.mapFrame.stumpCount, 1);
-    assert.equal(chopped.standingTreeGlyphs, 9);
+    assert.equal(chopped.standingTreeGlyphs, treeCount - 1);
     assert.equal(chopped.stumpGlyphs, 1);
     assert.equal(chopped.focusedTreeHealth, 'stump');
     assert.equal(chopped.bagLogs, '5');
