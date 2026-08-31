@@ -34,7 +34,7 @@ use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
-const REGISTRY_SCHEMA: u32 = 2;
+const REGISTRY_SCHEMA: u32 = 1;
 const DEFAULT_BIND: &str = "127.0.0.1:8090";
 const DEFAULT_REFRESH_SECS: u64 = 15;
 const MAX_REGISTERED_PLAYERS: usize = 10_000;
@@ -848,6 +848,29 @@ async fn set_delegation(
     }))
 }
 
+/// An identical replay of a stored registration is already verified consent,
+/// so it is answered from the registry without the upstream lineage verify
+/// or a registry rewrite; anything else falls through to the full path.
+fn replayed_registration(
+    registry: &RegistryFile,
+    owner: XOnlyPublicKey,
+    player_asset: AssetId,
+    signature: schnorr::Signature,
+) -> Option<LeaderboardPlayer> {
+    let entry = registry.players.get(&player_asset.to_string())?;
+    if entry.owner != owner.to_string() || entry.registration_signature != signature.to_string() {
+        return None;
+    }
+    let mut player = entry.state.clone()?;
+    if player
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_unix())
+    {
+        player.active = false;
+    }
+    Some(player)
+}
+
 async fn register_player(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterPlayerRequest>,
@@ -871,6 +894,14 @@ async fn register_player(
             ApiError::bad_request("signature does not authorize this server registration")
         })?;
     let key = player_asset.to_string();
+    if let Some(player) = replayed_registration(
+        &*state.registry.read().await,
+        owner,
+        player_asset,
+        signature,
+    ) {
+        return Ok(Json(player));
+    }
     let (registered_at, delegated_renewal, delegation_updated_at_ms) =
         state.registry.read().await.players.get(&key).map_or_else(
             || (now_unix(), false, 0),
@@ -1589,6 +1620,57 @@ mod tests {
         assert_eq!(index.query(&second_chunk).0.len(), 2);
         index.retain_active(&BTreeSet::from(["a".to_owned()]), 150);
         assert_eq!(index.query(&second_chunk).0[0].player_asset, "a");
+    }
+
+    #[test]
+    fn registration_replay_short_circuits_only_on_identical_signature() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[9; 32]).unwrap());
+        let owner = keypair.x_only_public_key().0;
+        let asset = AssetId {
+            txid: Txid::from_byte_array([10; 32]),
+            group_index: 0,
+        };
+        let genesis = Txid::from_byte_array([4; 32]);
+        let message =
+            player::server_registration_message(genesis, owner, asset, "https://server.example");
+        let signature = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+        let other_message =
+            player::server_registration_message(genesis, owner, asset, "https://other.example");
+        let other = secp.sign_schnorr_no_aux_rand(&other_message, &keypair);
+        let mut registry = RegistryFile::default();
+        registry.players.insert(
+            asset.to_string(),
+            RegisteredPlayer {
+                owner: owner.to_string(),
+                player_asset: asset.to_string(),
+                registration_signature: signature.to_string(),
+                delegated_renewal: false,
+                delegation_updated_at_ms: 0,
+                registered_at: 1,
+                state: Some(player(&asset.to_string(), 7, true, 1)),
+            },
+        );
+        // Identical replay: served from the registry, no upstream verify.
+        let replayed = replayed_registration(&registry, owner, asset, signature)
+            .expect("identical replay hits the fast path");
+        assert_eq!(replayed.player_asset, asset.to_string());
+        assert_eq!(replayed.registered_at, 1);
+        // A different signature, owner, or unknown PLAYER_ID falls through to
+        // the full upstream verify.
+        assert!(replayed_registration(&registry, owner, asset, other).is_none());
+        let stranger = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[11; 32]).unwrap())
+            .x_only_public_key()
+            .0;
+        assert!(replayed_registration(&registry, stranger, asset, signature).is_none());
+        let unknown = AssetId {
+            txid: Txid::from_byte_array([12; 32]),
+            group_index: 0,
+        };
+        assert!(replayed_registration(&registry, owner, unknown, signature).is_none());
+        // Without cached live state there is nothing to answer with.
+        registry.players.get_mut(&asset.to_string()).unwrap().state = None;
+        assert!(replayed_registration(&registry, owner, asset, signature).is_none());
     }
 
     #[test]

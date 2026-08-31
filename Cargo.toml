@@ -36,13 +36,13 @@ default = []
 woodland-app = []
 # Add local-only fault probes and destructive browser-test hooks.
 regtest-e2e = ["woodland-app"]
-keygen = ["dep:bip39", "woodland-app"]
+keygen = ["dep:bip39", "dep:zeroize", "woodland-app"]
 server = ["woodland-app", "dep:axum", "dep:tower-http"]
 fuzzing = []
 
 [dependencies]
 anyhow = "1"
-bip39 = { version = "2.2.2", optional = true }
+bip39 = { version = "2.2.2", optional = true, features = ["zeroize"] }
 ark-core = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
 ark-script = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
 ark-rest = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
@@ -60,7 +60,8 @@ serde_json = "1"
 serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["AbortSignal", "Window", "Storage", "Headers", "Request", "RequestCache", "RequestInit", "Response"] }
+web-sys = { version = "0.3", features = ["AbortSignal", "Location", "Window", "Storage", "Headers", "Request", "RequestCache", "RequestInit", "Response"] }
+zeroize = { version = "1", optional = true, default-features = false, features = ["alloc"] }
 
 # Native operator runtime; browser renewal uses the same REST/SSE batch module
 # through reqwest's WASM transport.

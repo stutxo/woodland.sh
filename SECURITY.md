@@ -2,21 +2,19 @@
 
 ## Supported versions
 
-Security fixes are made against the current protocol v1 release and its latest
-source. Pre-release protocol generations are unsupported and are not migrated.
+Security fixes target protocol v1 and the latest source.
 
 | Version | Supported |
 | --- | --- |
-| Current v1 release | Yes |
-| Pre-release generations | No |
+| v1 | Yes |
 
 ## Project status
 
-woodland.sh v1 is exercised on Mutinynet and includes an experimental mainnet
-deployment path. Mainnet availability is not a claim of production-grade browser
-custody or an independent security audit. The documented trust assumptions and
-known boundaries are part of the protocol design rather than guarantees
-provided by this policy.
+woodland.sh v1 has an experimental mainnet deployment path. The repository ships
+no live deployment manifest. Mainnet availability is not a claim of
+production-grade browser custody or an independent security audit. Documented
+trust assumptions and known boundaries are part of the protocol design rather
+than guarantees provided by this policy.
 
 ## Report a vulnerability
 
@@ -47,12 +45,23 @@ best-effort basis; this project does not promise a response or remediation SLA.
 
 Security-sensitive areas include:
 
-- Arkade Script bypasses in player chop, tree chop, regrowth, or renewal.
+- Arkade Script bypasses in player chop, tree chop, stump-refill renewal, or
+  retire-and-restock; player renewal or LOG withdrawal; or vault restock or
+  renewal.
 - TREE, LOG, XP, or PLAYER_ID inflation, substitution, assignment, control,
   metadata, or conservation failures.
-- PLAYER_ID/profile confusion, competing lineage selection, or activation retry
-  divergence.
-- Forged player identity, position, XP, health, roll, or reward transitions.
+- Soulbound-XP bypasses: any path that moves XP out of player state, detaches
+  the numeric XP packet from the XP asset balance, or smuggles XP through the
+  withdrawal or renewal leaves.
+- Vault restock conservation or identity failures: wrong reserve amounts, a
+  replacement tree at the wrong coordinate, duplicated or redirected TREE
+  markers, or vault change that leaks supply.
+- Withdraw-leaf LOG leakage: sats, PLAYER_ID, XP, or more LOG than declared
+  leaving player state, or a destination funded by anything but the wallet
+  dust input.
+- PLAYER_ID/profile confusion, competing lineage selection, activation retry
+  divergence, or bypass of canonical initial player roll and luck credit.
+- Forged player identity, position, XP, health, roll, credit, or reward transitions.
 - Incorrect Taproot signer closures, emulator tweaks, PSBT response checks,
   checkpoint signatures, batch graph validation, or forfeit handling.
 - Manifest validation, signer or service pinning, creating-transaction binding,
@@ -70,9 +79,22 @@ Security-sensitive areas include:
   watchtower renewal, expiry-policy bypass, and exploitable races caused by
   outpoint rotation.
 
-Public deterministic randomness, non-covenant map location and adjacency, chat
-content and moderation, Sybil creation, Arkade/emulator/server availability,
-request-rate abuse, public identity aggregation, the maintenance-controlled
-regrowth clock, signer retirement without rotation, NUMS-exit recovery limits,
-and the reference browser's localStorage custody are known boundaries documented
-in [`README.md`](README.md), [`PLAYER.md`](PLAYER.md), and [`TREE.md`](TREE.md).
+Public deterministic player luck, PLAYER_ID Sybil and identity grinding,
+unprovable pre-covenant PLAYER_ID ancestry, non-covenant map location and
+adjacency, chat content and moderation, Arkade/emulator/server availability,
+request-rate abuse, public identity aggregation, signer retirement without
+rotation, NUMS-exit recovery limits, and the reference browser's localStorage
+custody are known boundaries documented in [`README.md`](README.md),
+[`PLAYER.md`](PLAYER.md), and [`TREE.md`](TREE.md). Player-bound entropy
+prevents choosing a favorable tree but does not make permissionless identities
+unique. An intermediate marker output can select any starting roll and credit
+within the corridor; the recursive rate budget and streak bounds remain enforced.
+Stump refill and vault restock are permissionless covenant paths — no signer
+clock or project-held key gates them — and the operator watcher is a convenience,
+not a trust root.
+
+Service-endpoint authentication rests on HTTPS and the manifest's URL, signer,
+and forfeit pins; arkd's per-boot ephemeral batch-operator key cannot be pinned,
+so an attacker who defeats those channels could disrupt or strand renewal
+batches but cannot redirect the pinned sweep key, forfeit payout, or covenant
+outputs.

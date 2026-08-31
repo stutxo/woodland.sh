@@ -7,12 +7,11 @@ ARKD_COMMIT=c7c3184f5cd416e231023f717489a5b0550960cc
 ARKD_IMAGE=arkd-local:c7c3184-forest-v1-stock
 ARKD_WALLET_IMAGE=arkd-wallet-local:c7c3184-forest-v1-stock
 export ARKD_IMAGE ARKD_WALLET_IMAGE
-OWNER_VOLUME=dark-forest-regtest-owner
-LOCK_FILE=/tmp/dark-forest-regtest.lock
+OWNER_VOLUME=woodland-regtest-owner
+LOCK_FILE=/tmp/woodland-regtest.lock
 WORLD_MANIFEST="$ROOT/regtest/_build/woodland-world.json"
 WORLD_PLAN="$ROOT/regtest/_build/woodland-world-plan.json"
 DEPLOYER_SECRET=${WOODLAND_DEPLOYER_SECRET:-1111111111111111111111111111111111111111111111111111111111111111}
-MAINTENANCE_SECRET=${WOODLAND_TREE_MAINTENANCE_SECRET:-2222222222222222222222222222222222222222222222222222222222222222}
 ROLLOVER_SECRET=${WOODLAND_ROLLOVER_SECRET:-4444444444444444444444444444444444444444444444444444444444444444}
 
 usage() {
@@ -21,7 +20,7 @@ usage: ./scripts/regtest.sh <command> [args]
 
   start                         build missing images and start minimal base + ark
   start-tree                    start minimal base + ark + script emulator
-  maintain                      run the wrapper's pre-game maintenance pass
+  renew-world                   run the wrapper's pre-game renewal pass
   stop                          stop containers, preserving data
   clean --force                 remove containers and volumes
   build-images [arkd-source]    build stock pinned arkd and arkd-wallet images
@@ -101,7 +100,6 @@ run_world_bootstrap() {
   WOODLAND_ARKADE_SERVICE_URL=http://127.0.0.1:7070 \
   WOODLAND_EMULATOR_URL=http://127.0.0.1:7073 \
   WOODLAND_DEPLOYER_SECRET="$DEPLOYER_SECRET" \
-  WOODLAND_TREE_MAINTENANCE_SECRET="$MAINTENANCE_SECRET" \
   WOODLAND_ROLLOVER_SECRET="$ROLLOVER_SECRET" cargo run \
     --manifest-path "$ROOT/Cargo.toml" \
     --locked \
@@ -153,7 +151,7 @@ assert_stack_ownership() {
 
   if docker volume inspect "$OWNER_VOLUME" >/dev/null 2>&1; then
     owner=$(docker volume inspect "$OWNER_VOLUME" \
-      --format '{{ index .Labels "dark-forest.owner" }}')
+      --format '{{ index .Labels "woodland.owner" }}')
     if [[ "$owner" != "$ROOT" ]]; then
       echo "error: the global arkade-regtest volumes belong to another checkout: $owner" >&2
       exit 1
@@ -168,7 +166,7 @@ assert_stack_ownership() {
     echo "error: found unowned arkade-regtest volumes; refuse to reuse or delete them" >&2
     exit 1
   fi
-  docker volume create --label "dark-forest.owner=$ROOT" "$OWNER_VOLUME" >/dev/null
+  docker volume create --label "woodland.owner=$ROOT" "$OWNER_VOLUME" >/dev/null
 }
 
 assert_stack_stopped() {
@@ -231,7 +229,7 @@ command=${1:-}
 shift || true
 
 case "$command" in
-  start|start-tree|maintain|stop|clean|build-images|fund|balance|vtxos|info|mine|rpc|ark|arkd)
+  start|start-tree|renew-world|stop|clean|build-images|fund|balance|vtxos|info|mine|rpc|ark|arkd)
     if [[ ${ARKADE_REGTEST_LOCKED:-} != 1 ]]; then
       export ARKADE_REGTEST_LOCKED=1
       exec flock --exclusive "$LOCK_FILE" "$0" "$command" "$@"
@@ -247,7 +245,7 @@ if [[ "$command" == "clean" ]]; then
 fi
 
 case "$command" in
-  start|start-tree|maintain|stop|clean|fund|balance|vtxos|info|mine|rpc|ark|arkd)
+  start|start-tree|renew-world|stop|clean|fund|balance|vtxos|info|mine|rpc|ark|arkd)
     assert_stack_ownership
     ;;
 esac
@@ -271,13 +269,13 @@ case "$command" in
     assert_pinned_images
     ensure_world
     ;;
-  maintain)
-    if [[ ${WOODLAND_MAINTENANCE_STARTUP:-} != 1 ]]; then
-      echo "error: maintain is pre-game only; start it through ./scripts/run-web.sh" >&2
+  renew-world)
+    if [[ ${WOODLAND_RENEWAL_STARTUP:-} != 1 ]]; then
+      echo "error: renew-world is pre-game only; start it through ./scripts/run-web.sh" >&2
       exit 1
     fi
     require_regtest
-    run_world_bootstrap maintain-once "$WORLD_MANIFEST"
+    run_world_bootstrap renew-once "$WORLD_MANIFEST"
     ;;
   stop)
     require_regtest
@@ -291,9 +289,7 @@ case "$command" in
     docker volume rm "$OWNER_VOLUME" >/dev/null
     rm -f \
       "$WORLD_MANIFEST" \
-      "$WORLD_PLAN" \
-      "$ROOT/regtest/_build/dark-forest-world.json" \
-      "$ROOT/regtest/_build/dark-forest-world-plan.json"
+      "$WORLD_PLAN"
     ;;
   build-images)
     build_images "${1:-}"

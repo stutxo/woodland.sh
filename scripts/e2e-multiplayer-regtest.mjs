@@ -274,7 +274,7 @@ async function main() {
 
     assert.notEqual(initial[0].state.address, initial[1].state.address);
     const initialShared = assertSharedWorld(initial, 'initial shared world');
-    assert.equal(initialShared.fullTreeValueSats, 1_980);
+    assert.equal(initialShared.fullTreeValueSats, 330);
     assert.ok(
       initialShared.trees.every((tree) => tree.health >= 0 && tree.health <= 5),
       'shared world contains invalid tree health',
@@ -627,12 +627,11 @@ async function main() {
       && tree.y <= synchronizedViewportMaxY
       && tree.health === 5
       && !selectedTrees.some((selected) => selected.treeId === tree.treeId)
-      && beforeRace.every((view) => {
-        const candidate = view.state.trees.find((item) => item.treeId === tree.treeId);
-        return candidate?.treeOutpoint === tree.treeOutpoint && candidate.nextDrop === false;
-      })
     ));
-    assert.ok(raceTree, 'no common deterministic-miss tree is available for a race');
+    assert.ok(raceTree, 'no common healthy tree is available for a race');
+    const racePredictions = beforeRace.map((view) => (
+      view.state.trees.find((tree) => tree.treeId === raceTree.treeId).nextDrop
+    ));
     const racePlayerStateInputs = beforeRace.map((view) => view.state.playerStateOutpoint);
     const raceScoresBefore = beforeRace.map((view) => ({
       xp: view.state.playerXp,
@@ -668,10 +667,15 @@ async function main() {
     );
     const racedShared = assertSharedWorld(raced, 'same-tree race reconciliation');
     const racedTree = racedShared.trees.find((tree) => tree.treeId === raceTree.treeId);
-    assert.equal(racedTree.health, 5, 'deterministic race miss changed tree health');
+    assert.equal(
+      racedTree.health,
+      5 - Number(racePredictions[winner]),
+      'same-tree race must apply only the winning player outcome',
+    );
     for (const [index, view] of raced.entries()) {
-      assert.equal(view.state.playerXp, raceScoresBefore[index].xp);
-      assert.equal(view.state.playerLogs, raceScoresBefore[index].logs);
+      const reward = index === winner ? Number(racePredictions[index]) : 0;
+      assert.equal(view.state.playerXp, raceScoresBefore[index].xp + reward);
+      assert.equal(view.state.playerLogs, raceScoresBefore[index].logs + reward);
       assert.equal(
         view.state.playerStateOutpoint !== racePlayerStateInputs[index],
         index === winner,
@@ -680,14 +684,17 @@ async function main() {
     }
     treesBeforeChops.set(raceTree.treeId, racedTree);
     ownChops = raced;
+    const raceRewards = racePredictions.map((drop, index) => (
+      index === winner ? Number(drop) : 0
+    ));
 
     if (!FULL_E2E) {
       const chopped = await refreshWorldPlayers(
         players,
         'smoke concurrent chop synchronization',
         (value, index) => value.state?.playerActive
-          && value.state.playerXp === disjointRewards[index]
-          && value.state.playerLogs === disjointRewards[index]
+          && value.state.playerXp === disjointRewards[index] + raceRewards[index]
+          && value.state.playerLogs === disjointRewards[index] + raceRewards[index]
           && selectedTrees.every((selected) => (
             value.state.trees.find((tree) => tree.treeId === selected.treeId)?.treeOutpoint
               !== treesBeforeChops.get(selected.treeId).treeOutpoint
@@ -718,9 +725,11 @@ async function main() {
     ownChops = await Promise.all(players.map(async (player, index) => {
       let view = ownChops[index];
       let attempts = 1;
-      while (view.state.playerLogs === 0) {
+      while (
+        view.state.trees.find((tree) => tree.treeId === selectedTrees[index].treeId).health === 5
+      ) {
         attempts += 1;
-        assert.ok(attempts <= 25, `${player.label} did not receive LOG within 25 swings`);
+        assert.ok(attempts <= 11, `${player.label} exceeded the luck-protection bound`);
         const beforeTree = view.state.trees.find(
           (tree) => tree.treeId === selectedTrees[index].treeId,
         );
@@ -742,26 +751,27 @@ async function main() {
       return view;
     }));
     for (const [index, view] of ownChops.entries()) {
-      assert.equal(view.state.playerXp, 1);
+      const expectedRewards = 1 + raceRewards[index];
+      assert.equal(view.state.playerXp, expectedRewards);
       assert.equal(view.state.playerLevel, 1);
       assert.equal(view.state.playerNextLevelXp, 83);
       assert.equal(view.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
-      assert.equal(view.state.playerLogs, 1);
+      assert.equal(view.state.playerLogs, expectedRewards);
     }
     assert.ok(
-      attemptCounts.every((attempts) => attempts >= 1 && attempts <= 25),
-      'clean multiplayer rolls exceeded their swing bound',
+      attemptCounts.every((attempts) => attempts >= 1 && attempts <= 11),
+      'multiplayer luck exceeded its swing bound',
     );
 
     const chopped = await refreshWorldPlayers(
       players,
       'concurrent chop synchronization',
       (value, index) => value.state?.playerActive
-        && value.state.playerXp === 1
+        && value.state.playerXp === 1 + raceRewards[index]
         && value.state.playerLevel === 1
         && value.state.playerNextLevelXp === 83
         && value.state.logDropBasisPoints === manifest.baseLogDropBasisPoints
-        && value.state.playerLogs === 1
+        && value.state.playerLogs === 1 + raceRewards[index]
         && selectedTrees.every((selected) => (
           value.state.trees.find((tree) => tree.treeId === selected.treeId)?.health === 4
         )),
@@ -780,13 +790,23 @@ async function main() {
       if (selectedIds.has(tree.treeId)) {
         assert.equal(before.health, 5);
         assert.equal(tree.health, 4);
-        assert.equal(before.valueSats, 1_980);
-        assert.equal(tree.valueSats, 1_980);
+        assert.equal(before.valueSats, 330);
+        assert.equal(tree.valueSats, 330);
         assert.notEqual(tree.treeOutpoint, before.treeOutpoint);
         assert.ok(tree.lastAttemptTxid);
       } else {
-        const { expiresInSeconds: beforeExpiry, ...beforeStable } = before;
-        const { expiresInSeconds: afterExpiry, ...afterStable } = tree;
+        const {
+          expiresInSeconds: beforeExpiry,
+          nextRollBucket: _beforeRollBucket,
+          nextDrop: _beforeDrop,
+          ...beforeStable
+        } = before;
+        const {
+          expiresInSeconds: afterExpiry,
+          nextRollBucket: _afterRollBucket,
+          nextDrop: _afterDrop,
+          ...afterStable
+        } = tree;
         assert.deepEqual(afterStable, beforeStable);
         if (beforeExpiry != null && afterExpiry != null) {
           assert.ok(afterExpiry <= beforeExpiry && afterExpiry > 300);

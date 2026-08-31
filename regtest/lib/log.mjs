@@ -1,5 +1,4 @@
-// Tiny colored logger — mirrors the green timestamped lines the old bash
-// scripts produced, so CI output stays familiar.
+// Tiny colored logger for readable local and CI output.
 const GREEN = '\x1b[0;32m';
 const YELLOW = '\x1b[0;33m';
 const RED = '\x1b[0;31m';

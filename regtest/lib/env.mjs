@@ -1,4 +1,4 @@
-// Environment loading. Mirrors the old lib/env.sh precedence:
+// Environment loading precedence:
 //   .env.defaults (base)  <  first override found  <  pre-set process env
 // Override discovery order (first found wins):
 //   1. explicit --env <path>

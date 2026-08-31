@@ -13,20 +13,23 @@ deployment root (offline, disposable after verification)
 └─ deployer
 
 operations root (permanent offline recovery material)
-├─ maintenance
 └─ rollover
 ```
 
 `woodland-keygen` uses BIP39 with an empty passphrase and hardened BIP32
 children. The project namespace is the hardened integer `1464815428'`
-(`0x574f4f44`, ASCII `WOOD`), followed by protocol `1'`, Bitcoin network `0'`,
-and the role:
+(`0x574f4f44`, ASCII `WOOD`), followed by the stable key-derivation namespace
+`1'`, Bitcoin network `0'`, and the role:
 
 ```text
 deployer:    m/1464815428'/1'/0'/0'
-maintenance: m/1464815428'/1'/0'/1'
-rollover:    m/1464815428'/1'/0'/2'
+rollover:    m/1464815428'/1'/0'/1'
 ```
+
+Role `0'` derives the deployer child from the deployment root. Role `1'` derives
+the rollover child from the independent operations root. Tree renewal, tree
+retirement, and vault restock are permissionless covenant leaves, so no
+additional project-held lifecycle key exists.
 
 The paths and `public.json` are public. The mnemonic and derived secret files are
 not. Do not add a memory-only BIP39 passphrase; this utility intentionally does
@@ -53,14 +56,14 @@ The command refuses to overwrite an existing destination and creates:
 deployment-root.txt  24-word deployment root
 operations-root.txt  24-word operations root
 deployment.env       derived deployer child only
-maintenance.env      derived maintenance and rollover children only
+operations.env       derived rollover child only
 public.json          fingerprints, paths, and x-only public keys
 README.txt           handling reminder
 ```
 
 On Unix, the directory is created as `0700` and every file as `0600`.
 Immediately move the two root files to separate offline backup media. Never copy
-either root file to the maintenance host.
+either root file to the watcher host.
 
 Recommended minimum backup:
 
@@ -89,18 +92,21 @@ woodland-keygen verify \
   /path/to/original/public.json
 ```
 
-Require `recovery verified` and compare all three x-only public keys manually.
+Require `recovery verified` and compare both x-only public keys manually.
 Delete `/tmp/woodland-recovered` after the rehearsal.
 
 ## Deployment environment
 
 Copy `deployment.env.example` to an ignored file with mode `0600`. Fill service
-pins independently, then copy in the three child secrets from `deployment.env`
-and `maintenance.env` generated during the ceremony.
+pins independently, then copy in both child secrets from `deployment.env`
+and `operations.env` generated during the ceremony.
 
-The deployment machine temporarily needs all three children because the final
-manifest commits the maintenance and rollover public keys. It never needs either
-root mnemonic.
+The deployment machine temporarily needs both children because the final
+manifest commits the rollover public key. It never needs either root mnemonic.
+The manifest also commits the Arkade service's forfeit public key and forfeit
+address at genesis; renewal clients reject any batch or payout that
+does not match them, so treat a changed forfeit identity on the service as a
+new deployment requiring a new manifest, not a resumable one.
 
 The Arkade service must include upstream arkd commit
 `c7c3184f5cd416e231023f717489a5b0550960cc` or its equivalent offchain
@@ -113,26 +119,29 @@ the provider's exact version before funding.
 Follow the deployment sequence in the repository `README.md`:
 
 1. run `woodland-operator status` before funding;
-2. fund clean VTXOs at the reported address whose total exactly equals the
+2. require the proposed manifest to report schema 1 and protocol 1;
+3. fund clean VTXOs at the reported address whose total exactly equals the
    reported amount;
-3. run `woodland-operator ensure` until complete;
-4. require `woodland-operator status` to report `ready`;
-5. verify 2,100 tree VTXOs and fixed asset supplies;
-6. back up and commit the public manifest.
+4. run `woodland-operator ensure` until complete;
+5. require `woodland-operator status` to report `ready`;
+6. verify 2,100 tree VTXOs and fixed asset supplies;
+7. back up and commit the public manifest.
 
 After verification, remove `WOODLAND_DEPLOYER_SECRET` from online systems. If
 the deployer has no spendable VTXO or change, its deployment root may be archived
-or destroyed. Keep the operations root offline permanently.
+or destroyed. Move `WOODLAND_ROLLOVER_SECRET` to the watcher host (and
+optionally the game-server host); it has no ongoing use on the deployment
+machine. Keep the operations root offline permanently.
 
-## Maintenance host
+## Renewal watcher host
 
-Build `woodland-operator` for the maintenance host and install:
+Build `woodland-operator` for the watcher host and install:
 
 ```text
 /opt/woodland/woodland-operator
 /etc/woodland/woodland-world.json
 /etc/woodland/mainnet.env
-/etc/systemd/system/woodland-maintenance.service
+/etc/systemd/system/woodland-renewal.service
 ```
 
 Use:
@@ -143,32 +152,63 @@ Use:
 /etc/woodland/mainnet.env             root:woodland  0640
 ```
 
-Populate `mainnet.env` from `maintenance.env.example` and the generated
-`maintenance.env`. It must not contain the deployer child or either root.
+Populate `mainnet.env` from `operations.env.example` and the generated
+`operations.env`. It must contain neither the deployer child nor either root.
+The watcher's rollover child only triggers tree and vault renewals; the renewal
+leaves are permissionless `{operator}` covenant self-sends that cannot move or
+mutate world state. A renewal on a zero-health stump with reserve refills its
+health to five. Restocks are
+permissionless `{operator, emulator}` service-signed transactions and need no
+project-held key; restock a depleted tree on demand with
+`woodland-operator restock /etc/woodland/woodland-world.json tree <tree-id>` or
+sweep every depleted tree with
+`woodland-operator restock /etc/woodland/woodland-world.json due`.
 
 Enable the watcher:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now woodland-maintenance.service
-sudo journalctl -u woodland-maintenance.service -f
+sudo systemctl enable --now woodland-renewal.service
+sudo journalctl -u woodland-renewal.service -f
 ```
 
 Require the log line:
 
 ```text
-woodland.sh maintenance watcher ready
+woodland.sh renewal watcher ready
+```
+
+Tree and vault renewals trigger when the remaining lifetime of a tree or the
+vault drops below half its observed batch lifetime, clamped to a maximum of 12
+hours. Trees deployed in the same session expire close together, so expect
+correlated renewal waves; the watcher renews up to eight trees concurrently and
+reports a `missingExpiry`
+count whenever the indexer omits a live tree's expiry. Any nonzero
+`missingExpiry` or a renewal failure warrants immediate attention: an expired
+tree is swept by the Arkade service and cannot be recovered. If a tree enters
+the final minutes still live — for example after a watcher outage longer than
+the renewal window — run a forced rollover, which bypasses both the earliness
+and safety-margin checks but never renews an expired record. The vault is
+renewed by the watcher on the same margin; there is no manual vault force
+command:
+
+Registration failures and abandoned pre-forfeit joins are cleaned up by a
+signed ownership proof before the watcher retries, including queued intents
+left by a prior process. Once forfeits have reached the emulator, the watcher
+preserves the intent and requires indexed lineage reconciliation rather than
+deleting potentially committed state.
+
+```bash
+sudo WOODLAND_FORCE_ROLLOVER=1 /opt/woodland/woodland-operator renew /etc/woodland/woodland-world.json tree <tree-id>
 ```
 
 Run one active watcher. Additional operators should remain passive standbys;
 concurrent watchers can race the same tree outpoints. Monitor process uptime,
 reconnect errors, service `/v1/info` availability, and tree renewal failures.
-The host clock must remain synchronized because the regrowth delay is signer
-policy rather than a covenant clock.
 
 ## Optional game-server host
 
-Build the Axum server and a same-origin web bundle separately from maintenance:
+Build the Axum server and a same-origin web bundle separately from the watcher:
 
 ```bash
 cargo build --release --locked --features server --bin woodland-server
@@ -199,15 +239,18 @@ Use:
 
 Populate `server.env` from `server.env.example`.
 `WOODLAND_SERVER_PUBLIC_URL` is the canonical public app/API origin signed by
-players. `WOODLAND_SERVER_WEB_ROOT` makes Axum serve the bundle on that same
+players. Registration signatures bind that origin and the world genesis, so
+changing the public URL or pointing the server at a redeployed world
+invalidates every stored registration and the server refuses to start: stop
+it, remove `players.json`, and let players re-register. `WOODLAND_SERVER_WEB_ROOT` makes Axum serve the bundle on that same
 origin. `WOODLAND_SERVER_ORIGIN` is needed only to allow a separate static
 frontend such as GitHub Pages. Public origins must use HTTPS on mainnet.
 
 The optional `WOODLAND_ROLLOVER_SECRET` enables signed player delegation. The
-process must never receive the deployer child, maintenance child, either root
-mnemonic, or a player key. Compromise of the rollover child can force or race
-exact-self-send renewals, but the covenant does not let it transfer or mutate
-player state.
+process must never receive the deployer child, either root mnemonic, or a
+player key. Compromise of the rollover child can force or race exact-self-send
+player renewals and trigger tree or vault renewals, but the covenants do not
+let it transfer or mutate player, tree, or vault state.
 
 Terminate TLS in a reverse proxy in front of the loopback listener. The same
 public origin serves `/`, static bundle files, and:

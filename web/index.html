@@ -6,7 +6,8 @@
   <meta name="referrer" content="no-referrer">
   <!-- WOODLAND_CSP -->
   <!-- WOODLAND_SERVER -->
-  <title>woodland.sh</title>
+  <title>woodland.sh (alpha)</title>
+  <link rel="icon" href="data:,">
   <style>
     :root { color-scheme: dark; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; background: #0d120c; color: #dfe9da; }
     * { box-sizing: border-box; }
@@ -71,6 +72,7 @@
     .leaderboard .rank { width: 3rem; text-align: right; }
     .leaderboard .score { width: 5rem; text-align: right; }
     .leaderboard-note { padding: 8px 10px 10px; color: #8e9b88; font-size: .72rem; }
+    .leaderboard-disclosure > summary { cursor: pointer; }
     .chat { border-top: 1px solid #2b3727; }
     .chat h3 { margin: 0; padding: 10px; font-size: .86rem; }
     #chat-status { padding: 0 10px 6px; }
@@ -87,6 +89,45 @@
     .detail-grid div { overflow-wrap: anywhere; }
     .detail-grid dt { color: #8e9b88; }
     .detail-grid dd { margin: 3px 0 0; color: #dfe9da; }
+    .backup-details { margin: 0 0 10px; padding: 0; border-color: #506047; background: #090c08; }
+    .backup-details > summary { padding: 10px 12px; color: #b9e879; cursor: pointer; }
+    .backup-body { padding: 0 12px 12px; line-height: 1.5; }
+    .backup-body > * + * { margin-top: 8px; }
+    .backup-warning { padding: 8px 10px; border-left: 3px solid #f2d475; color: #dfe9da; background: #11170f; }
+    .backup-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .backup-actions button { margin-right: 0; }
+    #backup-status { min-height: 1.2em; overflow-wrap: anywhere; }
+    .about { margin-top: 12px; padding: 0; background: #11170f; }
+    .about-content { padding: 2px 12px 14px; color: #aebaa8; line-height: 1.55; }
+    .about-content > * + * { margin-top: 14px; }
+    .about-content h2, .about-content h3 { color: #dfe9da; }
+    .about-content h2 { margin-bottom: 0; }
+    .about-content h3 { margin: 0; font-size: .9rem; }
+    .about-content strong, .about-content code { color: #b9e879; }
+    .about-content ul { margin: 8px 0 0; padding-left: 20px; }
+    .about-content li + li { margin-top: 5px; }
+    .about-flow { margin: 0; padding: 10px 12px; overflow-x: auto; border: 1px solid #222d1f; color: #dfe9da; background: #090c08; font: .76rem/1.5 ui-monospace, monospace; }
+    .about-contracts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .about-contract { min-width: 0; padding: 10px; border: 1px solid #2b3527; background: #0d120c; }
+    .about-contract > * + * { margin-top: 8px; }
+    .covenant-details { margin: 18px 0 0; padding: 0; border-color: #506047; background: #090c08; }
+    .covenant-details > summary { padding: 12px; color: #b9e879; cursor: pointer; }
+    .covenant-details-body { padding: 0 12px 14px; }
+    .covenant-details-body > * + * { margin-top: 14px; }
+    .covenant-note { padding: 10px; border-left: 3px solid #b9e879; color: #dfe9da; background: #11170f; }
+    .covenant-table-scroll { overflow-x: auto; }
+    .covenant-table { width: 100%; min-width: 620px; border-collapse: collapse; font-size: .74rem; }
+    .covenant-table th, .covenant-table td { padding: 8px 10px; border: 1px solid #2b3527; text-align: left; vertical-align: top; }
+    .covenant-table th { color: #b9e879; background: #11170f; }
+    .covenant-script { padding: 10px; border: 1px solid #2b3527; background: #0d120c; }
+    .covenant-script > * + * { margin-top: 8px; }
+    .opcode-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+    .opcode-grid div { padding: 8px; border: 1px solid #2b3527; background: #0d120c; }
+    .opcode-grid dt { color: #b9e879; }
+    .opcode-grid dd { margin: 4px 0 0; }
+    @media (max-width: 760px) {
+      .about-contracts { grid-template-columns: 1fr; }
+    }
     .error { color: #ff9f8d !important; }
     [hidden] { display: none !important; }
     @media (max-width: 680px) {
@@ -101,7 +142,7 @@
 <body>
   <main>
     <header>
-      <h1>woodland.sh</h1>
+      <h1>woodland.sh <span class="muted">(alpha)</span></h1>
       <button id="refresh" type="button">Refresh</button>
     </header>
 
@@ -114,6 +155,7 @@
           <span>XP <strong id="hud-xp">0</strong></span>
           <span>LOG <strong id="hud-logs">0</strong></span>
           <span>Nearby <strong id="hud-online">0</strong></span>
+          <span>Pos <strong id="hud-position">(3, 17)</strong></span>
         </div>
       </div>
       <div class="map-help"><span>@ you · &amp; player · tree · + stump</span><span id="map-hint">Entering the woodland...</span></div>
@@ -169,7 +211,7 @@
             </div>
             <div class="stat">
               <span>LOG drop chance</span>
-              <strong id="log-chance">25%</strong>
+              <strong id="log-chance">20%</strong>
             </div>
             <div class="stat">
               <span>Wallet</span>
@@ -204,7 +246,10 @@
           <tbody id="leaderboard-rows"><tr><td colspan="5">No verified players yet.</td></tr></tbody>
         </table>
       </div>
-      <p class="leaderboard-note">Creating a player automatically registers its public identity and verified inventory with this server. Claimed map location and chat are signed social state, not covenant-enforced movement. Renewal delegation remains a separate signed choice.</p>
+      <details class="leaderboard-disclosure">
+        <summary class="leaderboard-note">How multiplayer data works</summary>
+        <p class="leaderboard-note">Creating a player automatically registers its public identity and verified inventory with this server. Claimed map location and chat are signed social state, not covenant-enforced movement. Renewal delegation remains a separate signed choice.</p>
+      </details>
       <div class="chat">
         <h3>Chat</h3>
         <div id="chat-status" class="muted"></div>
@@ -218,6 +263,19 @@
 
       <section class="protocol-details" aria-labelledby="details-heading">
         <h2 id="details-heading">Details</h2>
+        <details class="backup-details">
+          <summary>Player backup &amp; restore</summary>
+          <div class="backup-body">
+            <p>Download the private key and exact PLAYER_ID needed to reopen this player in another browser.</p>
+            <p class="backup-warning"><strong>Keep the file secret.</strong> Anyone who has it controls the player and wallet. Restoring replaces this browser’s current key.</p>
+            <div class="backup-actions">
+              <button id="download-backup" type="button" disabled>Download backup</button>
+              <button id="restore-backup" type="button" disabled>Restore backup</button>
+              <input id="restore-backup-file" type="file" accept=".json,application/json" hidden>
+            </div>
+            <p id="backup-status" class="muted" role="status" aria-live="polite"></p>
+          </div>
+        </details>
       <button id="reset-profile" type="button" hidden>Forget saved PLAYER</button>
       <button id="reset" type="button">New test wallet</button>
       <dl id="details" class="detail-grid" hidden>
@@ -226,7 +284,7 @@
         <div><dt>Tree LOG reserve</dt><dd id="tree-reserve"></dd></div>
         <div><dt>Tree XP reserve</dt><dd id="tree-xp"></dd></div>
         <div><dt>Forest</dt><dd id="forest-health"></dd></div>
-        <div><dt>Respawning</dt><dd id="regrow-ready"></dd></div>
+        <div><dt>Tree state</dt><dd id="tree-state"></dd></div>
         <div><dt>Season XP</dt><dd id="xp-backing"></dd></div>
         <div><dt>Emulator</dt><dd id="emulator"></dd></div>
         <div><dt>PLAYER_ID</dt><dd id="player-asset"></dd></div>
@@ -239,6 +297,199 @@
       </dl>
       </section>
     </div>
+
+    <details id="about-contracts" class="about">
+      <summary class="panel-summary">About woodland.sh and its VTXO contracts</summary>
+      <div class="about-content">
+        <p>A VTXO is a Bitcoin-backed Arkade output: a one-use box containing sats, assets, and game state. A contract never edits that box in place. It spends the current VTXO, checks the complete transaction, and permits only a valid replacement VTXO.</p>
+        <pre class="about-flow" aria-label="Example VTXO state transition">old player + old tree
+        │ valid swing
+        ▼
+new player + new tree + extension + anchor</pre>
+
+        <h2>What enforces the game?</h2>
+        <ul>
+          <li><strong>Bitcoin Taproot</strong> enforces which keys must sign each spending path.</li>
+          <li><strong>Arkade Script covenants</strong> inspect transaction inputs, outputs, assets, and state packets.</li>
+          <li><strong>Asset V1</strong> tracks the fixed TREE, LOG, and XP supplies and their movement.</li>
+        </ul>
+        <p>The browser and woodland server present and index the game. They do not decide whether a gameplay transaction is valid.</p>
+
+        <h2>The three gameplay contracts</h2>
+        <div class="about-contracts">
+          <section class="about-contract">
+            <h3>Player</h3>
+            <p>One owner-specific VTXO per player. It holds 330 sats, one PLAYER_ID, identity, position, roll, luck credit, numeric XP, harvested LOG, and earned XP.</p>
+            <p>Its paths allow chopping, exact renewal by the owner or delegated watchtower, and owner-authorized LOG withdrawal. XP has no withdrawal path and remains bound to that player.</p>
+          </section>
+          <section class="about-contract">
+            <h3>Tree</h3>
+            <p>Each of the 2,100 trees occupies a separate VTXO using one shared contract template. It holds 330 sats, one TREE marker, coordinates, health, and its remaining LOG and XP.</p>
+            <p>Its paths allow chopping, batch renewal with stump refill, and atomic retirement and restocking when its reserve is empty.</p>
+          </section>
+          <section class="about-contract">
+            <h3>Supply vault</h3>
+            <p>One covenant VTXO holds the undistributed LOG and XP reserve. It is not a general-purpose wallet.</p>
+            <p>Its only paths are an exact self-renewal or an atomic restock that gives one depleted tree exactly 1,000 LOG and 1,000 XP while preserving the remaining vault balance.</p>
+          </section>
+        </div>
+
+        <h2>Why a swing uses two contracts</h2>
+        <p>A swing spends the player and selected tree together. The player covenant verifies identity, owner approval, roll, luck, and XP backing. The tree covenant independently verifies its inventory and the reward movement. Both must approve the same transaction.</p>
+        <pre class="about-flow" aria-label="Successful and missed swing state changes">success: player LOG/XP +1 · tree LOG/XP -1 · tree health -1
+miss:    assets and health unchanged · player roll/luck advances</pre>
+        <p>This reciprocal check prevents crediting a player without debiting a tree, forging XP, changing identity, or redirecting assets.</p>
+
+        <h2>Renewal, permission, and trust</h2>
+        <p>Arkade VTXOs have finite batch lifetimes. Renewal consumes a state VTXO and recreates it in a fresh batch without changing its state. A tree stump is the one exception: renewal resets zero health to five while preserving its identity and inventory.</p>
+        <p>“Permissionless” does not mean signature-free or unrestricted. It means any caller may submit the covenant path without a player or woodland-held authorization key. The Arkade operator and script-tweaked emulator still approve only the transaction shape allowed by that path.</p>
+        <p>Arkade Script is evaluated by the configured emulator, not Bitcoin consensus. Bitcoin Taproot still enforces every required signer, so bypassing a covenant requires the emulator and every other signer on the selected path.</p>
+
+        <details class="covenant-details">
+          <summary>More technical details: the covenant scripts (not required to play)</summary>
+          <div class="covenant-details-body">
+            <p class="covenant-note"><strong>Technical caveat.</strong> This section describes protocol implementation, transaction shapes, and signer rules. It is intended for reviewers and curious players; none of it is required to play woodland.sh.</p>
+
+            <h2>Script inventory</h2>
+            <p>The game uses eight distinct Arkade covenant programs mounted as nine usable Taproot leaves. Player renewal is one program mounted twice with different signer sets.</p>
+            <div class="covenant-table-scroll">
+              <table class="covenant-table">
+                <thead>
+                  <tr><th>VTXO</th><th>Arkade programs</th><th>Usable Taproot leaves</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Player</td><td>Chop, renewal, LOG withdrawal</td><td>Chop, owner renewal, watchtower renewal, withdrawal</td></tr>
+                  <tr><td>Tree</td><td>Chop, renewal, retire/restock</td><td>Three corresponding leaves</td></tr>
+                  <tr><td>Vault</td><td>Restock, renewal</td><td>Two corresponding leaves</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>Each contract also includes an Arkade-required delayed-exit leaf keyed to a NUMS point. It satisfies batch expiry accounting without providing a usable path around the recursive covenants.</p>
+
+            <h2>How a covenant becomes a Taproot leaf</h2>
+            <pre class="about-flow" aria-label="Arkade covenant leaf structure">Arkade leaf
+├─ Arkade Script: transaction and state rules
+├─ ordinary signers: owner, rollover key, or Arkade operator
+└─ introspector: emulator key tweaked by the covenant hash
+
+tweaked emulator = emulator + H("ArkScriptHash", covenant)·G</pre>
+            <p>The emulator evaluates the Arkade Script. Bitcoin Taproot enforces the complete signer closure, including the covenant-specific tweaked emulator key. The player leaves add the owner or rollover signer; tree and vault leaves require the Arkade operator and emulator pair.</p>
+
+            <h2>How to read the programs</h2>
+            <p>The scripts are stack programs made from arithmetic checks and Arkade transaction-introspection opcodes. Most rules end in <code>OP_EQUALVERIFY</code>: a failed comparison immediately rejects the spend.</p>
+            <dl class="opcode-grid">
+              <div><dt><code>PUSHCURRENTINPUTINDEX</code></dt><dd>Proves which transaction input is executing this leaf.</dd></div>
+              <div><dt><code>INSPECTNUMINPUTS</code> / <code>OUTPUTS</code></dt><dd>Pins the complete transaction shape.</dd></div>
+              <div><dt><code>INSPECTINPUTVALUE</code> / <code>OUTPUTVALUE</code></dt><dd>Checks the sat value carried by an endpoint.</dd></div>
+              <div><dt><code>INSPECTINPUTSCRIPTPUBKEY</code> / <code>OUTPUTSCRIPTPUBKEY</code></dt><dd>Checks recursive P2TR destinations.</dd></div>
+              <div><dt><code>INSPECTINPUTPACKET</code> / <code>INSPECTPACKET</code></dt><dd>Compares previous and replacement state packets.</dd></div>
+              <div><dt><code>FINDASSETGROUPBYASSETID</code></dt><dd>Finds the packet group for TREE, LOG, XP, or PLAYER_ID.</dd></div>
+              <div><dt><code>INSPECTINASSETLOOKUP</code> / <code>OUTASSETLOOKUP</code></dt><dd>Reads asset assignment locations and amounts.</dd></div>
+              <div><dt><code>INSPECTASSETGROUPCTRL</code></dt><dd>Requires transfer groups to remain uncontrolled and non-reissuable.</dd></div>
+            </dl>
+            <pre class="about-flow" aria-label="Example covenant shape checks">PUSHCURRENTINPUTINDEX  1  EQUALVERIFY
+INSPECTNUMINPUTS       2  EQUALVERIFY
+INSPECTNUMOUTPUTS      4  EQUALVERIFY</pre>
+
+            <h2>Player covenant programs</h2>
+            <section class="covenant-script">
+              <h3>1. Player chop — <code>player_chop_covenant_script</code></h3>
+              <p>The player half proves owner-specific state continuity. It requires player input zero, the two-input/four-output swing shape, the same player P2TR and 330 sats, and the manifest-pinned tree P2TR and value at both tree endpoints.</p>
+              <pre class="about-flow" aria-label="Player chop covenant checks">preserve: player P2TR, 330 sats, PLAYER_ID, identity, position
+advance:  roll = SHA256(previous roll), canonical luck credit
+require:  numeric XP equals player-held XP before and after
+pin:      merged extension, canonical anchor, exact tree contract</pre>
+              <p>It validates the canonical reward calculation but leaves the actual health, LOG, and XP deltas to the reciprocal tree script. This keeps owner continuity on the player side and global supply accounting on the tree side.</p>
+            </section>
+
+            <section class="covenant-script">
+              <h3>2. Player renewal — <code>player_renewal_covenant_script</code></h3>
+              <p>This exact-self-send program is used by both the owner-renewal and watchtower-renewal leaves. The Arkade intent proof has a fake message input at index zero, the real player VTXO at index one, the replacement state at output zero, and the merged extension at output one.</p>
+              <pre class="about-flow" aria-label="Player renewal covenant checks">same P2TR and 330 sats
+same identity, position, roll, luck, and XP packets
+same one-unit PLAYER_ID
+same LOG and XP presence and balances
+no assets in the extension output</pre>
+              <p>The owner leaf requires owner, operator, and emulator. The watchtower leaf replaces the owner with the low-authority rollover key. Both execute the same preservation program, so the watchtower cannot chop or withdraw.</p>
+            </section>
+
+            <section class="covenant-script">
+              <h3>3. Player LOG withdrawal — <code>player_withdraw_covenant_script</code></h3>
+              <p>The transaction spends player state plus one ordinary wallet funding input. It recreates player state, sends LOG to the owner-selected destination, and carries the standard extension and anchor.</p>
+              <pre class="about-flow" aria-label="Player withdrawal covenant equations">player LOG in - player LOG out = destination LOG
+player XP in                    = player XP out
+destination sat value           = wallet funding input value
+player state value              = 330 sats before and after</pre>
+              <p>Identity, position, roll, luck, numeric XP, XP assets, and PLAYER_ID are preserved exactly. The destination script is intentionally unrestricted because LOG is liquid. The player’s 330 sats never fund the destination.</p>
+            </section>
+
+            <h2>Tree covenant programs</h2>
+            <section class="covenant-script">
+              <h3>4. Tree chop — <code>tree_covenant_script</code></h3>
+              <p>This is the main game-rule program. It requires tree input one, two inputs, four outputs, and four ordered asset groups: PLAYER_ID, TREE, LOG, and XP. Player and tree scripts, sat values, identities, the extension, and the anchor must all be canonical.</p>
+              <p>The script hashes the previous player roll, converts the new roll into a bucket modulo 10,000, derives probability from input XP, applies bounded luck credit, and leaves one canonical reward bit <code>G</code>.</p>
+              <pre class="about-flow" aria-label="Tree chop covenant equations">player numeric XP out = player numeric XP in + G
+tree health in         = tree health out + G
+tree LOG in            = tree LOG out + G
+player LOG out         = player LOG in + G
+tree XP in             = tree XP out + G
+player XP out          = player XP in + G</pre>
+              <p>It also requires positive input health, one conserved TREE marker, and equality between player numeric XP and player-held XP assets. A miss has <code>G = 0</code>: assets and health stay fixed while roll and luck still advance.</p>
+            </section>
+
+            <section class="covenant-script">
+              <h3>5. Tree renewal — <code>tree_renewal_covenant_script</code></h3>
+              <p>Tree renewal preserves the exact P2TR, sat value, tree identity, TREE marker, and LOG/XP balances while moving the state into a fresh Arkade batch.</p>
+              <pre class="about-flow" aria-label="Tree stump renewal rule">if input health is 0 and LOG remains:
+    output health must be 5
+else:
+    output health must equal input health</pre>
+              <p>The LOG-presence check distinguishes a refillable stump from a fully depleted tree. A depleted tree has no LOG group, remains at zero health, and proceeds to retire/restock instead.</p>
+            </section>
+
+            <section class="covenant-script">
+              <h3>6. Tree retire/restock — <code>tree_retire_covenant_script</code></h3>
+              <p>The dead-tree input must contain exactly one TREE marker and no LOG or XP. It is spent with the supply vault and replaced at the same P2TR, coordinate, identity, and 330-sat value.</p>
+              <pre class="about-flow" aria-label="Fresh tree requirements">fresh health = 5
+fresh TREE   = 1
+fresh LOG    = 1,000
+fresh XP     = 1,000
+
+TREE originates from the dead tree
+LOG and XP originate from the vault</pre>
+              <p>This half proves the replacement tree is correct. The reciprocal vault program proves the reserve change is correct.</p>
+            </section>
+
+            <h2>Vault covenant programs</h2>
+            <section class="covenant-script">
+              <h3>7. Vault restock — <code>vault_restock_covenant_script</code></h3>
+              <p>The vault must be input one and hold exactly LOG and XP. The fresh-tree output is pinned to the shared tree P2TR and 330 sats; the vault-change output must preserve the exact vault P2TR and sat value.</p>
+              <pre class="about-flow" aria-label="Vault restock equations">vault LOG in - vault LOG out = 1,000
+vault XP in  - vault XP out  = 1,000</pre>
+              <p>Asset assignments prove that the TREE marker comes from the dead tree while LOG and XP come from the vault. Both the tree and vault leaves must approve the same atomic transaction.</p>
+            </section>
+
+            <section class="covenant-script">
+              <h3>8. Vault renewal — <code>vault_renewal_covenant_script</code></h3>
+              <p>The simplest covenant is an exact version-2 intent self-send:</p>
+              <pre class="about-flow" aria-label="Vault renewal checks">same vault P2TR
+same sat value
+same LOG presence and amount
+same XP presence and amount
+no assets in the extension output</pre>
+              <p>The vault has no mutable state packets. Its complete state is its P2TR, sat value, and remaining asset balances.</p>
+            </section>
+
+            <h2>Canonical numeric encoding</h2>
+            <p>XP, health, and luck credit use fixed-width numeric packets. Each program checks the byte length, converts with <code>BIN2NUM</code>, converts back with <code>NUM2BIN</code>, compares the exact bytes, and rejects negative values. This prevents alternate encodings such as negative zero from representing the same apparent number with different committed bytes.</p>
+
+            <h2>Activation and manifest checks</h2>
+            <p>Activation is not a separate covenant leaf: it spends an ordinary wallet VTXO and creates the first player state. On the first recursive spend, every player leaf recognizes the direct-activation shape and requires the identity-derived roll, PLAYER_ID group zero, and initial luck credit 8,000.</p>
+            <p>The world manifest carries raw tree and vault script commitments. Clients rebuild those contracts from the pinned asset IDs, signer keys, network, dust, and reserve constants, then require every P2TR and Arkade Script byte to match the manifest before accepting the world.</p>
+          </div>
+        </details>
+      </div>
+    </details>
   </main>
   <script type="module" src="./app.js"></script>
 </body>

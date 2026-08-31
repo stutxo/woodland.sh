@@ -9,6 +9,7 @@
 
 use crate::arkade::{EmulatorRest, EmulatorTxTreeNode, ServerParams};
 use crate::keys::Keys;
+use crate::world::WorldPins;
 use anyhow::{anyhow, Context, Result};
 use ark_core::batch::{
     aggregate_nonces, create_and_sign_forfeit_txs, generate_nonce_tree, sign_batch_tree_tx,
@@ -31,8 +32,9 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Batches are frequent on regtest; a stalled stream or skipped intent must
-/// still fail with a clear error instead of hanging a maintenance loop.
+/// still fail with a clear error instead of hanging a renewal loop.
 const BATCH_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const INTENT_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_BATCH_GRAPH_NODES: usize = 512;
 const MAX_SSE_FRAME_BYTES: usize = 1_048_576;
 
@@ -40,6 +42,9 @@ pub struct BatchServices {
     pub ark: ark_rest::Client,
     pub emulator: EmulatorRest,
     pub params: ServerParams,
+    /// Manifest-pinned service identity; batch validation and forfeit
+    /// signing trust these over anything the endpoint announces.
+    pub pins: WorldPins,
     ark_base: String,
     digest: String,
 }
@@ -49,6 +54,7 @@ impl BatchServices {
         ark_url: &str,
         emulator: EmulatorRest,
         params: ServerParams,
+        pins: WorldPins,
     ) -> Result<Self> {
         let ark_base = ark_url.trim_end_matches('/').to_string();
         let ark = ark_rest::Client::new(ark_base.clone())
@@ -59,15 +65,39 @@ impl BatchServices {
             .get_info()
             .await
             .map_err(|error| anyhow!("read arkd REST info: {error}"))?;
-        require_matching_server_params(&info, &params)?;
+        require_matching_server_params(&info, &params, &pins)?;
         require_zero_renewal_fees(&info)?;
         Ok(Self {
             ark,
             emulator,
             params,
+            pins,
             ark_base,
             digest: info.digest,
         })
+    }
+
+    /// Bind, emulator-approve, and settle one prepared renewal intent through
+    /// its batch. The batch cosigner is ephemeral and generated here so every
+    /// host (operator, watchtower, browser, headless client) shares one
+    /// approval ordering.
+    pub async fn settle_renewal(
+        &self,
+        authorizer_keys: &Keys,
+        emulator_pk: bitcoin::XOnlyPublicKey,
+        prepared: crate::renewal::RenewalIntent,
+        previous_tx: &bitcoin::Transaction,
+    ) -> Result<RenewalOutcome> {
+        let cosigner = Keys::generate()?;
+        let prepared = crate::renewal::bind(
+            authorizer_keys,
+            prepared,
+            previous_tx,
+            cosigner.keypair.public_key(),
+        )?;
+        let approved =
+            crate::renewal::approve(authorizer_keys, &self.emulator, emulator_pk, prepared).await?;
+        join_batch_with_intent(self, authorizer_keys, &cosigner, emulator_pk, &approved).await
     }
 }
 
@@ -175,6 +205,92 @@ impl BatchProgress {
     }
 }
 
+fn error_text_contains(error: &impl std::fmt::Debug, required: &[&str]) -> bool {
+    let text = format!("{error:?}").to_ascii_lowercase();
+    required.iter().all(|needle| text.contains(needle))
+}
+
+fn is_duplicate_intent_registration(error: &impl std::fmt::Debug) -> bool {
+    error_text_contains(error, &["duplicated input", "already registered"])
+}
+
+fn is_missing_intent(error: &impl std::fmt::Debug) -> bool {
+    error_text_contains(error, &["no matching intents found"])
+}
+
+/// Delete every queued intent that overlaps the renewal input. Arkd authorizes
+/// deletion by the freshly signed outpoint proof, so this also clears residue
+/// left by an earlier process whose intent id is unavailable after restart.
+async fn delete_matching_renewal_intents(
+    ark: &ark_rest::Client,
+    authorizer_keys: &Keys,
+    renewal: &crate::renewal::ApprovedRenewal,
+) -> Result<()> {
+    let deletion = crate::renewal::prepare_intent_deletion(authorizer_keys, &renewal.input)?;
+    match ark.delete_intent(&deletion.message, &deletion.proof).await {
+        Ok(()) => Ok(()),
+        // A batch may consume or discard the intent between the failed request
+        // and cleanup. Absence is already the desired postcondition.
+        Err(error) if is_missing_intent(&error) => Ok(()),
+        Err(error) => Err(anyhow!("delete pending renewal intent: {error:?}")),
+    }
+}
+
+fn with_cleanup_result(error: anyhow::Error, cleanup: Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => error.context("removed the pending renewal intent before retry"),
+        Err(cleanup_error) => error.context(format!(
+            "failed to remove the pending renewal intent: {cleanup_error:#}"
+        )),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn delete_matching_renewal_intents_bounded(
+    ark: &ark_rest::Client,
+    authorizer_keys: &Keys,
+    renewal: &crate::renewal::ApprovedRenewal,
+) -> Result<()> {
+    tokio::time::timeout(
+        INTENT_CLEANUP_TIMEOUT,
+        delete_matching_renewal_intents(ark, authorizer_keys, renewal),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out deleting the pending renewal intent"))?
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn register_renewal_intent(
+    ark: &ark_rest::Client,
+    authorizer_keys: &Keys,
+    renewal: &crate::renewal::ApprovedRenewal,
+    deadline: tokio::time::Instant,
+) -> Result<String> {
+    for attempt in 0..2 {
+        let registration = tokio::time::timeout_at(
+            deadline,
+            ark.register_intent(&renewal.message, &renewal.proof),
+        )
+        .await;
+        match registration {
+            Ok(Ok(intent_id)) => return Ok(intent_id),
+            Ok(Err(error)) if attempt == 0 && is_duplicate_intent_registration(&error) => {
+                delete_matching_renewal_intents_bounded(ark, authorizer_keys, renewal)
+                    .await
+                    .context("clear the conflicting renewal intent")?;
+            }
+            Ok(Err(error)) => return Err(anyhow!("register renewal intent: {error:?}")),
+            Err(_) => {
+                let error = anyhow!("timed out registering the renewal intent");
+                let cleanup =
+                    delete_matching_renewal_intents_bounded(ark, authorizer_keys, renewal).await;
+                return Err(with_cleanup_result(error, cleanup));
+            }
+        }
+    }
+    unreachable!("the registration loop returns on its second attempt")
+}
+
 /// Register one emulator-approved exact-self-send rollover and ride its batch
 /// to finalization. `rollover_keys` authorizes liveness without holding player
 /// funds; `cosigner` is ephemeral and used only for the batch tree MuSig2.
@@ -187,20 +303,8 @@ pub async fn join_batch_with_intent(
     renewal: &crate::renewal::ApprovedRenewal,
 ) -> Result<RenewalOutcome> {
     let deadline = tokio::time::Instant::now() + BATCH_JOIN_TIMEOUT;
-    let registration = tokio::time::timeout_at(
-        deadline,
-        services
-            .ark
-            .register_intent(&renewal.message, &renewal.proof),
-    )
-    .await;
-    let intent_id = match registration {
-        Ok(Ok(intent_id)) => intent_id,
-        Ok(Err(error)) => return Err(anyhow!("register renewal intent: {error:?}")),
-        Err(_) => return Err(anyhow!(
-            "timed out registering the renewal intent; arkd may retain it and require operator cleanup before retry"
-        )),
-    };
+    let intent_id =
+        register_renewal_intent(&services.ark, rollover_keys, renewal, deadline).await?;
     let forfeits_released = AtomicBool::new(false);
     let result = match tokio::time::timeout_at(
         deadline,
@@ -220,19 +324,25 @@ pub async fn join_batch_with_intent(
         Err(_) => Err(anyhow!("timed out waiting for the renewal batch")),
     };
 
-    result.map_err(|error| {
-        if forfeits_released.load(Ordering::SeqCst) {
-            error.context(
-                "the signed forfeits reached the emulator; reconcile the input's indexed lineage before retrying",
-            )
-        } else {
-            error
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if forfeits_released.load(Ordering::SeqCst) => Err(error.context(
+            "the signed forfeits reached the emulator; reconcile the input's indexed lineage before retrying",
+        )),
+        Err(error) => {
+            let cleanup =
+                delete_matching_renewal_intents_bounded(&services.ark, rollover_keys, renewal)
+                    .await;
+            Err(with_cleanup_result(error, cleanup))
         }
-    })
+    }
 }
 #[cfg(target_arch = "wasm32")]
-async fn browser_timeout<F: Future>(future: F) -> Option<F::Output> {
-    let timeout_ms = u32::try_from(BATCH_JOIN_TIMEOUT.as_millis()).unwrap_or(u32::MAX);
+async fn browser_timeout_for<F: Future>(
+    future: F,
+    duration: std::time::Duration,
+) -> Option<F::Output> {
+    let timeout_ms = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
     match select(
         Box::pin(future),
         Box::pin(gloo_timers::future::TimeoutFuture::new(timeout_ms)),
@@ -245,6 +355,53 @@ async fn browser_timeout<F: Future>(future: F) -> Option<F::Output> {
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn browser_timeout<F: Future>(future: F) -> Option<F::Output> {
+    browser_timeout_for(future, BATCH_JOIN_TIMEOUT).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delete_matching_renewal_intents_bounded(
+    ark: &ark_rest::Client,
+    authorizer_keys: &Keys,
+    renewal: &crate::renewal::ApprovedRenewal,
+) -> Result<()> {
+    browser_timeout_for(
+        delete_matching_renewal_intents(ark, authorizer_keys, renewal),
+        INTENT_CLEANUP_TIMEOUT,
+    )
+    .await
+    .ok_or_else(|| anyhow!("timed out deleting the pending renewal intent"))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn register_renewal_intent(
+    ark: &ark_rest::Client,
+    authorizer_keys: &Keys,
+    renewal: &crate::renewal::ApprovedRenewal,
+) -> Result<String> {
+    for attempt in 0..2 {
+        let registration =
+            browser_timeout(ark.register_intent(&renewal.message, &renewal.proof)).await;
+        match registration {
+            Some(Ok(intent_id)) => return Ok(intent_id),
+            Some(Err(error)) if attempt == 0 && is_duplicate_intent_registration(&error) => {
+                delete_matching_renewal_intents_bounded(ark, authorizer_keys, renewal)
+                    .await
+                    .context("clear the conflicting renewal intent")?;
+            }
+            Some(Err(error)) => return Err(anyhow!("register renewal intent: {error:?}")),
+            None => {
+                let error = anyhow!("timed out registering the renewal intent");
+                let cleanup =
+                    delete_matching_renewal_intents_bounded(ark, authorizer_keys, renewal).await;
+                return Err(with_cleanup_result(error, cleanup));
+            }
+        }
+    }
+    unreachable!("the registration loop returns on its second attempt")
+}
+
+#[cfg(target_arch = "wasm32")]
 pub async fn join_batch_with_intent(
     services: &BatchServices,
     authorizer_keys: &Keys,
@@ -252,14 +409,7 @@ pub async fn join_batch_with_intent(
     emulator_pk: bitcoin::XOnlyPublicKey,
     renewal: &crate::renewal::ApprovedRenewal,
 ) -> Result<RenewalOutcome> {
-    let registration = browser_timeout(
-        services
-            .ark
-            .register_intent(&renewal.message, &renewal.proof),
-    )
-    .await
-    .ok_or_else(|| anyhow!("timed out registering the renewal intent"))?;
-    let intent_id = registration.map_err(|error| anyhow!("register renewal intent: {error:?}"))?;
+    let intent_id = register_renewal_intent(&services.ark, authorizer_keys, renewal).await?;
     let forfeits_released = AtomicBool::new(false);
     let result = browser_timeout(join_registered_batch(
         services,
@@ -272,15 +422,18 @@ pub async fn join_batch_with_intent(
     ))
     .await
     .unwrap_or_else(|| Err(anyhow!("timed out waiting for the renewal batch")));
-    result.map_err(|error| {
-        if forfeits_released.load(Ordering::SeqCst) {
-            error.context(
-                "the signed forfeits reached the emulator; reconcile the input's indexed lineage before retrying",
-            )
-        } else {
-            error
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if forfeits_released.load(Ordering::SeqCst) => Err(error.context(
+            "the signed forfeits reached the emulator; reconcile the input's indexed lineage before retrying",
+        )),
+        Err(error) => {
+            let cleanup =
+                delete_matching_renewal_intents_bounded(&services.ark, authorizer_keys, renewal)
+                    .await;
+            Err(with_cleanup_result(error, cleanup))
         }
-    })
+    }
 }
 
 async fn join_registered_batch(
@@ -307,7 +460,7 @@ async fn join_registered_batch(
     let response = open_event_stream(&services.ark_base, &topics, &services.digest).await?;
     let mut stream = response.bytes_stream();
 
-    let forfeit_xonly = services.params.forfeit_pk.inner.x_only_public_key().0;
+    let forfeit_xonly = services.pins.forfeit_pk.inner.x_only_public_key().0;
     let mut rng = rand::rngs::OsRng;
 
     let mut progress = BatchProgress::default();
@@ -320,6 +473,9 @@ async fn join_registered_batch(
     let mut agg_nonce_pks: HashMap<Txid, musig::AggregatedNonce> = HashMap::new();
     let mut renewed_outpoint: Option<OutPoint> = None;
     let mut buffer = String::new();
+    // Transport chunks can split a multi-byte UTF-8 sequence; hold the
+    // incomplete tail instead of aborting the renewal.
+    let mut pending: Vec<u8> = Vec::new();
 
     loop {
         let chunk = stream
@@ -332,7 +488,16 @@ async fn join_registered_batch(
                 "batch event transport chunk exceeds the safety limit"
             ));
         }
-        buffer.push_str(std::str::from_utf8(&chunk).context("batch event stream is not UTF-8")?);
+        pending.extend_from_slice(&chunk);
+        let valid_up_to = match std::str::from_utf8(&pending) {
+            Ok(_) => pending.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => return Err(anyhow!("batch event stream is not UTF-8")),
+        };
+        buffer.push_str(
+            std::str::from_utf8(&pending[..valid_up_to]).expect("validated UTF-8 prefix"),
+        );
+        pending.drain(..valid_up_to);
 
         while let Some(frame) = take_sse_frame(&mut buffer) {
             if frame.len() > MAX_SSE_FRAME_BYTES {
@@ -550,7 +715,7 @@ async fn join_registered_batch(
                         sign_fn,
                         std::slice::from_ref(&input),
                         &connector_graph.leaves(),
-                        &services.params.forfeit_address,
+                        &services.pins.forfeit_address,
                         Amount::from_sat(services.params.dust_sats),
                     )
                     .map_err(|error| anyhow!("build renewal forfeit: {error}"))?;
@@ -678,10 +843,14 @@ fn validate_batch_expiry(
 fn require_matching_server_params(
     info: &ark_core::server::Info,
     params: &ServerParams,
+    pins: &WorldPins,
 ) -> Result<()> {
     if info.signer_pk.x_only_public_key().0 != params.signer_pk
         || info.forfeit_pk != params.forfeit_pk.inner
         || info.forfeit_address != params.forfeit_address
+        || info.signer_pk.x_only_public_key().0 != pins.operator_signer
+        || info.forfeit_pk != pins.forfeit_pk.inner
+        || info.forfeit_address != pins.forfeit_address
         || info.network != params.network
         || info.dust.to_sat() != params.dust_sats
         || info.vtxo_min_amount.map(Amount::to_sat) != Some(params.vtxo_min_sats)
@@ -898,6 +1067,10 @@ fn validate_vtxo_tree(
                 "VTXO tree transaction {txid} must contain exactly one batch operator cosigner"
             ));
         };
+        // arkd's batch-operator cosigner is an ephemeral key generated per
+        // service boot, so no stable identity can be pinned here. The batch's
+        // binding to the pinned service instead comes from the manifest-pinned
+        // forfeit key in every tree sweep leaf and the pinned forfeit payout.
         if batch_operator
             .replace(*operator)
             .is_some_and(|key| key != *operator)
@@ -1150,15 +1323,26 @@ fn combine_forfeits(
             tweaked_emulator,
             "emulator",
         )?;
-        crate::txbuild::verified_signature_for_key(
-            rollover_keys,
-            ours,
-            &combined,
-            1,
-            rollover_keys.owner_pk(),
-            "rollover",
-        )?;
-        if combined.inputs[1].tap_script_sigs.len() != 2 {
+        // The client signs only when its key is a leaf signer; permissionless
+        // leaves (operator + emulator only) take just the emulator signature
+        // and arkd completes its own when it enforces the forfeit.
+        let client_sig_expected = ours.inputs[1]
+            .witness_script
+            .as_ref()
+            .map(ark_core::script::extract_checksig_pubkeys)
+            .is_some_and(|signers| signers.contains(&rollover_keys.owner_pk()));
+        if client_sig_expected {
+            crate::txbuild::verified_signature_for_key(
+                rollover_keys,
+                ours,
+                &combined,
+                1,
+                rollover_keys.owner_pk(),
+                "rollover",
+            )?;
+        }
+        let expected_sigs = 1 + usize::from(client_sig_expected);
+        if combined.inputs[1].tap_script_sigs.len() != expected_sigs {
             return Err(anyhow!("rollover forfeit contains an unexpected signature"));
         }
         complete.push(combined);
@@ -1288,6 +1472,96 @@ pub(crate) fn fuzz_sse_frame(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "server")]
+    use axum::{
+        extract::State,
+        http::{header, StatusCode},
+        response::IntoResponse,
+        routing::post,
+        Router,
+    };
+    #[cfg(feature = "server")]
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc,
+    };
+
+    #[cfg(feature = "server")]
+    #[derive(Clone)]
+    struct IntentMockState {
+        registrations: Arc<AtomicUsize>,
+        trace: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "server")]
+    async fn mock_register_intent(State(state): State<IntentMockState>) -> impl IntoResponse {
+        state
+            .trace
+            .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |trace| {
+                Some(trace * 10 + 1)
+            })
+            .unwrap();
+        let attempt = state.registrations.fetch_add(1, AtomicOrdering::SeqCst);
+        let headers = [(header::CONTENT_TYPE, "application/json")];
+        if attempt == 0 {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                headers,
+                r#"{"code":13,"message":"failed to push intent: duplicated input abc:0 already registered by another intent"}"#,
+            )
+        } else {
+            (StatusCode::OK, headers, r#"{"intentId":"recovered"}"#)
+        }
+    }
+
+    #[cfg(feature = "server")]
+    async fn mock_delete_intent(State(state): State<IntentMockState>) -> impl IntoResponse {
+        state
+            .trace
+            .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |trace| {
+                Some(trace * 10 + 2)
+            })
+            .unwrap();
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{}",
+        )
+    }
+
+    #[cfg(feature = "server")]
+    fn test_renewal_input(keys: &Keys) -> ark_core::intent::Input {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let leaf = bitcoin::script::Builder::new()
+            .push_x_only_key(&keys.owner_pk())
+            .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
+            .into_script();
+        let spend_info = bitcoin::taproot::TaprootBuilder::new()
+            .add_leaf(0, leaf.clone())
+            .unwrap()
+            .finalize(&secp, key(99).x_only_public_key().0)
+            .unwrap();
+        let control_block = spend_info
+            .control_block(&(leaf.clone(), bitcoin::taproot::LeafVersion::TapScript))
+            .unwrap();
+        ark_core::intent::Input::new(
+            OutPoint {
+                txid: Txid::from_byte_array([42; 32]),
+                vout: 0,
+            },
+            bitcoin::Sequence::MAX,
+            None,
+            TxOut {
+                value: Amount::from_sat(330),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(spend_info.output_key()),
+            },
+            vec![leaf.clone()],
+            (leaf, control_block),
+            false,
+            false,
+            Vec::new(),
+        )
+    }
 
     #[test]
     fn batch_progress_reduces_only_valid_ordered_events() {
@@ -1324,6 +1598,75 @@ mod tests {
             .finalize("batch", Txid::from_byte_array([8; 32]))
             .is_err());
         assert!(progress.finalize("batch", commitment).unwrap());
+    }
+
+    #[test]
+    fn intent_cleanup_classification_is_narrow() {
+        assert!(is_duplicate_intent_registration(
+            &"INTERNAL_ERROR: duplicated input abc:0 already registered by another intent"
+        ));
+        assert!(!is_duplicate_intent_registration(
+            &"INVALID_INTENT_PROOF: duplicated input abc:0"
+        ));
+        assert!(!is_duplicate_intent_registration(
+            &"VTXO_ALREADY_SPENT: input abc:0 already spent"
+        ));
+        assert!(is_missing_intent(
+            &"INVALID_INTENT_PROOF: no matching intents found for intent proof"
+        ));
+        assert!(!is_missing_intent(&"INTENT_NOT_FOUND: unrelated id"));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn duplicate_registration_is_deleted_then_retried() {
+        let state = IntentMockState {
+            registrations: Arc::new(AtomicUsize::new(0)),
+            trace: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/v1/batch/registerIntent", post(mock_register_intent))
+            .route("/v1/batch/deleteIntent", post(mock_delete_intent))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let authorizer = Keys::from_hex(&"07".repeat(32)).unwrap();
+        let input = test_renewal_input(&authorizer);
+        let message = ark_core::intent::IntentMessage::Register {
+            onchain_output_indexes: Vec::new(),
+            valid_at: 0,
+            expire_at: u64::MAX,
+            own_cosigner_pks: vec![key(8).public_key()],
+        };
+        let deletion = crate::renewal::prepare_intent_deletion(&authorizer, &input).unwrap();
+        let renewal = crate::renewal::ApprovedRenewal {
+            proof: deletion.proof,
+            message: message.clone(),
+            message_json: message.encode().unwrap(),
+            input,
+            input_expires_at: i64::MAX,
+            leaf_outputs: Vec::new(),
+            arkade_script: ScriptBuf::new(),
+        };
+        let ark = ark_rest::Client::new(format!("http://{address}")).unwrap();
+        let intent_id = register_renewal_intent(
+            &ark,
+            &authorizer,
+            &renewal,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(intent_id, "recovered");
+        assert_eq!(state.registrations.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(state.trace.load(AtomicOrdering::SeqCst), 121);
+        server.abort();
+        let _ = server.await;
     }
 
     fn key(byte: u8) -> bitcoin::secp256k1::Keypair {

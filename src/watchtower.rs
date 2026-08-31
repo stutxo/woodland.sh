@@ -1,7 +1,7 @@
 //! Unattended player-state renewal through the covenant's exact-self-send leaf.
 
 use crate::arkade::{ArkadeRest, EmulatorParams, EmulatorRest, ServerParams, VtxoRecord};
-use crate::batch::{self, BatchServices};
+use crate::batch::BatchServices;
 use crate::keys::Keys;
 use crate::player;
 use crate::renewal;
@@ -113,36 +113,33 @@ pub async fn renew_player(
         .ok_or_else(|| anyhow!("player creating transaction has no state packets"))?;
     let old_outpoint = record.outpoint;
     let old_expires_at = record.expires_at;
-    let prepared =
-        renewal::prepare_player_watchtower(&record, &previous_tx, &contract, player_asset)?;
-    let cosigner = Keys::generate()?;
-    let prepared = renewal::bind(
-        rollover_keys,
-        prepared,
+    let expiry_margin_secs = if force {
+        0
+    } else {
+        crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
+    };
+    let prepared = renewal::prepare_player_watchtower(
+        &record,
         &previous_tx,
-        cosigner.keypair.public_key(),
+        &contract,
+        player_asset,
+        expiry_margin_secs,
     )?;
-    let approved = renewal::approve(
-        rollover_keys,
-        services.emulator_rest,
-        services.emulator.signer_pk,
-        prepared,
-    )
-    .await?;
     let batch_services = BatchServices::connect(
         services.arkade_url,
         services.emulator_rest.clone(),
         services.params.clone(),
+        world.pins.clone(),
     )
     .await?;
-    let outcome = batch::join_batch_with_intent(
-        &batch_services,
-        rollover_keys,
-        &cosigner,
-        services.emulator.signer_pk,
-        &approved,
-    )
-    .await?;
+    let outcome = batch_services
+        .settle_renewal(
+            rollover_keys,
+            services.emulator.signer_pk,
+            prepared,
+            &previous_tx,
+        )
+        .await?;
     let renewed = wait_for_record(services.rest, &script, outcome.outpoint).await?;
     if renewed.expires_at <= old_expires_at {
         return Err(anyhow!("player renewal did not extend the indexed expiry"));

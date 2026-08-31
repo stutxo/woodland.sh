@@ -14,7 +14,7 @@ const outputPath = path.resolve(rawOutputPath);
 const manifestText = await readFile(manifestPath, 'utf8');
 const manifest = JSON.parse(manifestText);
 if (manifest.schemaVersion !== 1 || manifest.protocolVersion !== 1 || manifest.gameId !== 'woodland.sh') {
-  throw new Error('web bundle requires a woodland.sh protocol v1 manifest');
+  throw new Error('web bundle requires a woodland.sh protocol v1 schema 1 manifest');
 }
 
 const arkade = new URL(manifest.arkadeServiceUrl);

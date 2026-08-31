@@ -17,6 +17,18 @@ const INTENT_REFERENCE: u8 = 0x02;
 const CONTROL_BY_ID: u8 = 0x01;
 const CONTROL_BY_GROUP: u8 = 0x02;
 
+pub(crate) fn asset_group_count(transaction: &Transaction) -> Result<usize> {
+    let payload = ark_core::extension::find_packet_payload(transaction, ASSET_PACKET_TYPE)
+        .context("parse transaction extension packets")?
+        .ok_or_else(|| anyhow!("transaction has no asset packet"))?;
+    let mut cursor = Cursor::new(payload);
+    let group_count = cursor.count("asset group count")?;
+    if group_count > usize::from(u16::MAX) + 1 {
+        return Err(anyhow!("asset packet has too many groups"));
+    }
+    Ok(group_count)
+}
+
 pub(crate) fn output_assets(transaction: &Transaction, output_index: u32) -> Result<Vec<Asset>> {
     if transaction.output.get(output_index as usize).is_none() {
         return Err(anyhow!(

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Local preview and maintenance supervisor. Production static hosting is Pages.
+// Local preview and renewal supervisor. Production static hosting is Pages.
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -14,17 +14,12 @@ const WORLD_MANIFEST = path.resolve(
   configuredSetting('WOODLAND_WORLD_MANIFEST', 'regtest/_build/woodland-world.json'),
 );
 const WEB_ROOT = path.resolve(ROOT, process.env.WOODLAND_WEB_ROOT || 'dist');
-const MAINTENANCE_SECRET = configuredSetting(
-  'WOODLAND_TREE_MAINTENANCE_SECRET',
-  '2222222222222222222222222222222222222222222222222222222222222222',
-);
 const ROLLOVER_SECRET = configuredSetting(
   'WOODLAND_ROLLOVER_SECRET',
   '4444444444444444444444444444444444444444444444444444444444444444',
 );
 for (const name of [
   'WOODLAND_DEPLOYER_SECRET',
-  'WOODLAND_TREE_MAINTENANCE_SECRET',
   'WOODLAND_ROLLOVER_SECRET',
 ]) {
   delete process.env[name];
@@ -55,7 +50,7 @@ const EMULATOR_UPSTREAM = configuredSetting(
 
 const watcherLockId = createHash('sha256').update(WORLD_MANIFEST).digest('hex').slice(0, 16);
 const WATCHER_LOCK = process.env.WOODLAND_WATCHER_LOCK_FILE
-  || path.join('/tmp', `woodland-maintenance-${watcherLockId}.lock`);
+  || path.join('/tmp', `woodland-renewal-${watcherLockId}.lock`);
 const WATCHER_RESTART_MAX_MS = 30_000;
 let watcherReady = false;
 let watcherFailure = null;
@@ -134,15 +129,15 @@ server.listen(port, host, () => {
 function readWatcherOutput(message) {
   for (const line of message.split('\n').filter(Boolean)) {
     if (
-      line.includes('woodland.sh maintenance watcher ready')
-      || line.includes('woodland.sh maintenance watcher recovered')
+      line.includes('woodland.sh renewal watcher ready')
+      || line.includes('woodland.sh renewal watcher recovered')
     ) {
       watcherReady = true;
       watcherFailure = null;
       watcherRestartDelayMs = 1_000;
     } else if (
-      line.includes('woodland.sh maintenance watcher:')
-      || line.includes('woodland.sh maintenance reconnect:')
+      line.includes('woodland.sh renewal watcher:')
+      || line.includes('woodland.sh renewal reconnect:')
     ) {
       watcherReady = false;
       watcherFailure = line.trim();
@@ -180,7 +175,6 @@ function startWatcher() {
       cwd: ROOT,
       env: {
         ...process.env,
-        WOODLAND_TREE_MAINTENANCE_SECRET: MAINTENANCE_SECRET,
         WOODLAND_ROLLOVER_SECRET: ROLLOVER_SECRET,
       },
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -196,7 +190,7 @@ function startWatcher() {
     if (watcher !== child || shuttingDown) return;
     watcherReady = false;
     watcherFailure = error.message;
-    console.error(`woodland.sh respawn watcher failed: ${error.message}`);
+    console.error(`woodland.sh renewal watcher failed: ${error.message}`);
   });
   child.on('exit', (code, signal) => {
     if (watcher !== child) return;
@@ -204,7 +198,7 @@ function startWatcher() {
     if (shuttingDown) return;
     watcherReady = false;
     watcherFailure = code === 73
-      ? 'another maintenance watcher owns this world'
+      ? 'another renewal watcher owns this world'
       : `watcher exited with ${signal || `status ${code}`}`;
     console.error(`woodland.sh ${watcherFailure}`);
     scheduleWatcherRestart();

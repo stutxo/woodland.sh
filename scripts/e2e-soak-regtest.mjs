@@ -39,7 +39,29 @@ const RELOAD_COUNT = setting(
   1,
   PLAYER_COUNT,
 );
+const FORCE_TREE_RENEWAL_ROUND = setting(
+  'WOODLAND_SOAK_FORCE_TREE_RENEWAL_ROUND',
+  0,
+  0,
+  ROUNDS,
+);
+const FORCE_POST_CHOP_RENEWAL_ROUND = setting(
+  'WOODLAND_SOAK_FORCE_POST_CHOP_RENEWAL_ROUND',
+  0,
+  0,
+  ROUNDS,
+);
+if (
+  (FORCE_TREE_RENEWAL_ROUND > 0 || FORCE_POST_CHOP_RENEWAL_ROUND > 0)
+  && TREES_PER_ROUND !== 1
+) {
+  throw new Error('forced tree renewal requires one tree per round');
+}
 const SOAK_VIEWPORT_MAX = 64;
+// Total issued supplies: the on-tree reserve plus the supply vault's
+// undistributed balance, both created at genesis.
+const INDEXED_LOG_SUPPLY = 21_000_000;
+const INDEXED_XP_SUPPLY = 21_000_000;
 let expectedLogSupply = 0;
 let expectedXpSupply = 0;
 const ROUND_DELAY_MS = setting('WOODLAND_SOAK_ROUND_DELAY_MS', 500, 0, 60_000);
@@ -138,6 +160,43 @@ function treeProjection(state) {
   }));
 }
 
+function playerGameProjection(state) {
+  return {
+    playerAsset: state.playerAsset,
+    playerXp: state.playerXp,
+    playerLogs: state.playerLogs,
+    playerLuckCredit: state.playerLuckCredit,
+    playerLevel: state.playerLevel,
+  };
+}
+function treeRenewalProjection(tree) {
+  return {
+    treeId: tree.treeId,
+    x: tree.x,
+    y: tree.y,
+    logReserveRemaining: tree.logReserveRemaining,
+    xpRemaining: tree.xpRemaining,
+    valueSats: tree.valueSats,
+    deploymentTxid: tree.deploymentTxid,
+    depleted: tree.depleted,
+  };
+}
+
+function assertTreeRenewal(beforeTree, afterTree, label) {
+  assert.notEqual(afterTree.treeOutpoint, beforeTree.treeOutpoint, `${label}: outpoint did not rotate`);
+  assert.deepEqual(
+    treeRenewalProjection(afterTree),
+    treeRenewalProjection(beforeTree),
+    `${label}: balances or identity changed`,
+  );
+  const expectedHealth = beforeTree.health === 0 && beforeTree.logReserveRemaining > 0
+    ? 5
+    : beforeTree.health;
+  assert.equal(afterTree.health, expectedHealth, `${label}: health changed unexpectedly`);
+  assert.equal(afterTree.lastAttemptTxid ?? null, null, `${label}: retained a chop transaction`);
+}
+
+
 function assertConverged(views, label) {
   const expected = treeProjection(views[0].state);
   for (const view of views) {
@@ -202,6 +261,39 @@ async function fetchAssetSupply(baseUrl, assetId) {
   assert.ok(Number.isSafeInteger(supply) && supply >= 0, `asset ${assetId} has invalid supply`);
   return supply;
 }
+function forceTreeRenewal(treeId) {
+  const output = execFileSync(
+    'cargo',
+    [
+      'run',
+      '--manifest-path',
+      path.join(ROOT, 'Cargo.toml'),
+      '--locked',
+      '--quiet',
+      '--features',
+      'regtest-e2e',
+      '--bin',
+      'woodland-operator',
+      '--',
+      'renew',
+      process.env.WOODLAND_WORLD_MANIFEST
+        || path.join(ROOT, 'regtest/_build/woodland-world.json'),
+      'tree',
+      String(treeId),
+    ],
+    {
+      cwd: ROOT,
+      env: { ...process.env, WOODLAND_FORCE_ROLLOVER: '1' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'inherit'],
+    },
+  );
+  const renewal = JSON.parse(output.trim().split('\n').at(-1));
+  assert.equal(renewal.kind, 'tree', 'forced renewal returned the wrong state kind');
+  assert.equal(renewal.treeId, treeId, 'forced renewal returned the wrong tree');
+  return renewal;
+}
+
 
 function selectRoundTargets(shared, stickyTargetTreeId, round) {
   if (TREES_PER_ROUND === 1) {
@@ -238,7 +330,7 @@ function selectRoundTargets(shared, stickyTargetTreeId, round) {
   };
 }
 
-function classifyRoundTransitions(round, targetTrees, beforePlayerOutpoints, views, results) {
+function classifyRoundTransitions(round, targetTrees, beforePlayers, views, results) {
   const targetTreeIds = targetTrees.map((tree) => tree.treeId);
   const beforeTrees = new Map(targetTrees.map((tree) => [tree.treeId, tree]));
   const reportedAccepted = results
@@ -251,36 +343,122 @@ function classifyRoundTransitions(round, targetTrees, beforePlayerOutpoints, vie
   const changedPlayers = views
     .map((view, index) => ({ view, index }))
     .filter(
-      ({ view, index }) => view.state.playerStateOutpoint !== beforePlayerOutpoints[index],
+      ({ view, index }) => view.state.playerStateOutpoint !== beforePlayers[index].outpoint,
     );
-  assert.equal(
-    changedPlayers.length,
-    targetTrees.length,
-    `round ${round}: player transition count`,
-  );
-  const winners = [];
-  let drops = 0;
-  for (const treeId of targetTreeIds) {
+  const transitions = targetTreeIds.map((treeId) => {
     const beforeTree = beforeTrees.get(treeId);
     const afterTree = views[0].state.trees.find((tree) => tree.treeId === treeId);
+    assert.ok(afterTree, `round ${round}: tree ${treeId} disappeared`);
     assert.notEqual(
       afterTree.treeOutpoint,
       beforeTree.treeOutpoint,
       `round ${round}: tree ${treeId} did not rotate`,
     );
     const treeTxid = afterTree.treeOutpoint.split(':')[0];
-    const matchingPlayers = changedPlayers.filter(
-      ({ view }) => view.state.playerStateOutpoint.split(':')[0] === treeTxid,
-    );
+    const reportedChops = reportedAccepted
+      .map(({ result, index }) => ({
+        index,
+        result,
+        tree: result.state?.trees?.find((tree) => tree.treeId === treeId),
+      }))
+      .filter(({ index, result, tree }) => {
+        if (!tree || !result.state?.playerStateOutpoint) return false;
+        const playerTxid = result.state.playerStateOutpoint.split(':')[0];
+        const retainedGameState = JSON.stringify(playerGameProjection(views[index].state))
+          === JSON.stringify(playerGameProjection(result.state));
+        return tree.treeOutpoint.split(':')[0] === playerTxid && retainedGameState;
+      });
+    const matchingIndexes = new Set([
+      ...changedPlayers
+        .filter(({ view }) => view.state.playerStateOutpoint.split(':')[0] === treeTxid)
+        .map(({ index }) => index),
+      ...reportedChops.map(({ index }) => index),
+    ]);
+    return {
+      treeId,
+      beforeTree,
+      afterTree,
+      matchingIndexes,
+      reportedChops,
+    };
+  });
+  const renewalOnly = transitions.every(({ matchingIndexes }) => matchingIndexes.size === 0);
+  if (renewalOnly) {
     assert.equal(
-      matchingPlayers.length,
-      1,
-      `round ${round}: tree ${treeId} has ${matchingPlayers.length} player transitions`,
+      reportedAccepted.length,
+      0,
+      `round ${round}: watcher renewal accompanied an accepted chop report`,
     );
-    winners.push({ treeId, index: matchingPlayers[0].index });
-    drops += Number(afterTree.health < beforeTree.health);
+    for (const { treeId, beforeTree, afterTree } of transitions) {
+      assertTreeRenewal(
+        beforeTree,
+        afterTree,
+        `round ${round}: watcher renewal of tree ${treeId}`,
+      );
+    }
+    for (const { view, index } of changedPlayers) {
+      assert.deepEqual(
+        playerGameProjection(view.state),
+        beforePlayers[index].game,
+        `round ${round}: player ${index + 1} changed game state during watcher renewal`,
+      );
+    }
+    return {
+      round,
+      retryAfterTreeRenewal: true,
+      renewedTreeIds: targetTreeIds,
+      renewedPlayers: changedPlayers.map(({ index }) => index),
+    };
+  }
+
+  assert.ok(
+    changedPlayers.length >= targetTrees.length,
+    `round ${round}: only ${changedPlayers.length} player transitions for `
+      + `${targetTrees.length} trees`,
+  );
+  const winners = [];
+  const renewedTreeIds = [];
+  let drops = 0;
+  for (const {
+    treeId,
+    beforeTree,
+    afterTree,
+    matchingIndexes,
+    reportedChops,
+  } of transitions) {
+    assert.equal(
+      matchingIndexes.size,
+      1,
+      `round ${round}: tree ${treeId} has ${matchingIndexes.size} player transitions`,
+    );
+    const [winnerIndex] = matchingIndexes;
+    assert.equal(
+      changedPlayers.some(({ index }) => index === winnerIndex),
+      true,
+      `round ${round}: tree ${treeId} winner did not retain a player transition`,
+    );
+    const reportedChop = reportedChops.find(({ index }) => index === winnerIndex);
+    const committedTree = reportedChop?.tree ?? afterTree;
+    if (committedTree.treeOutpoint !== afterTree.treeOutpoint) {
+      assertTreeRenewal(
+        committedTree,
+        afterTree,
+        `round ${round}: post-chop renewal of tree ${treeId}`,
+      );
+      renewedTreeIds.push(treeId);
+    }
+    winners.push({ treeId, index: winnerIndex });
+    drops += Number(committedTree.health < beforeTree.health);
   }
   const winnerIndexes = new Set(winners.map((winner) => winner.index));
+  const renewedPlayers = changedPlayers.filter(({ index }) => !winnerIndexes.has(index));
+  for (const { view, index } of renewedPlayers) {
+    assert.deepEqual(
+      playerGameProjection(view.state),
+      beforePlayers[index].game,
+      `round ${round}: player ${index + 1} changed game state outside a target-tree transaction`,
+    );
+  }
   for (const reported of reportedAccepted) {
     assert.equal(
       winnerIndexes.has(reported.index),
@@ -303,6 +481,7 @@ function classifyRoundTransitions(round, targetTrees, beforePlayerOutpoints, vie
   }));
   return {
     round,
+    retryAfterTreeRenewal: false,
     treeId: targetTreeIds.length === 1 ? targetTreeIds[0] : null,
     treeIds: targetTreeIds,
     winner: winners.length === 1 ? winners[0].index : null,
@@ -311,13 +490,15 @@ function classifyRoundTransitions(round, targetTrees, beforePlayerOutpoints, vie
     reportedAcceptedCount: reportedAccepted.length,
     recoveryMessage: recoveryMessages.length === 1 ? recoveryMessages[0].message : null,
     recoveryMessages,
+    renewedPlayers: renewedPlayers.map(({ index }) => index),
+    renewedTreeIds,
     drop: drops > 0,
     drops,
     conflicts: PLAYER_COUNT - targetTrees.length,
   };
 }
 
-async function reloadPlayersForRound(players, views, round) {
+async function reloadPlayersForRound(players, views, round, soakViewport) {
   if (RELOAD_EVERY === 0 || round % RELOAD_EVERY !== 0) {
     return { views, retries: 0, reloads: 0 };
   }
@@ -341,6 +522,10 @@ async function reloadPlayersForRound(players, views, round) {
         && value.serverRegistered
         && value.state.playerAsset === expectedAssets.get(index),
       OPERATION_TIMEOUT_MS,
+    );
+    await player.execute(
+      `globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT(0, 0, arguments[0], arguments[1]);`,
+      soakViewport,
     );
     assert.equal(reloaded.state.pendingChopTxid ?? null, null, `${player.label}: pending chop`);
   });
@@ -442,12 +627,13 @@ try {
     );
   });
 
+  const soakViewport = [
+    Math.min(SOAK_VIEWPORT_MAX, manifest.mapWidth - 1),
+    Math.min(SOAK_VIEWPORT_MAX, manifest.mapHeight - 1),
+  ];
   await mapLimit(players, ACTIVATION_CONCURRENCY, (player) => player.execute(
     `globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT(0, 0, arguments[0], arguments[1]);`,
-    [
-      Math.min(SOAK_VIEWPORT_MAX, manifest.mapWidth - 1),
-      Math.min(SOAK_VIEWPORT_MAX, manifest.mapHeight - 1),
-    ],
+    soakViewport,
   ));
 
   let views = await mapLimit(players, ACTIVATION_CONCURRENCY, async (player) => {
@@ -477,6 +663,10 @@ try {
   );
 
   let stickyTargetTreeId = null;
+  let treeRenewalRetries = 0;
+  let forcedPreChopTreeRenewals = 0;
+  let forcedPostChopTreeRenewals = 0;
+  let playerRenewals = 0;
   for (let round = 1; round <= ROUNDS; round += 1) {
     const selection = selectRoundTargets(views[0].state, stickyTargetTreeId, round);
     const { targetTrees } = selection;
@@ -485,26 +675,89 @@ try {
     const assignedTreeIds = players.map(
       (_, index) => targetTreeIds[index % targetTreeIds.length],
     );
-    const beforePlayerOutpoints = views.map((view) => view.state.playerStateOutpoint);
+    const beforePlayers = views.map((view) => ({
+      outpoint: view.state.playerStateOutpoint,
+      game: playerGameProjection(view.state),
+    }));
     const roundStartedAt = Date.now();
+    if (
+      FORCE_TREE_RENEWAL_ROUND === round
+      && forcedPreChopTreeRenewals === 0
+    ) {
+      const renewal = forceTreeRenewal(targetTrees[0].treeId);
+      assert.equal(
+        renewal.oldOutpoint,
+        targetTrees[0].treeOutpoint,
+        `round ${round}: forced renewal raced an unexpected tree state`,
+      );
+      forcedPreChopTreeRenewals += 1;
+      console.log(`soak round ${round}: forced pre-chop tree ${renewal.treeId} renewal`);
+    }
     const results = await mapLimit(players, RACE_CONCURRENCY, (player, index) => {
       const playerTree = views[index].state.trees.find(
         (tree) => tree.treeId === assignedTreeIds[index],
       );
       return player.race(views[index].state, playerTree);
     });
+    if (
+      FORCE_POST_CHOP_RENEWAL_ROUND === round
+      && forcedPostChopTreeRenewals === 0
+    ) {
+      const accepted = results
+        .map((result, index) => ({ result, index }))
+        .filter(({ result }) => result.ok);
+      assert.equal(
+        accepted.length,
+        1,
+        `round ${round}: forced post-chop renewal requires one accepted report`,
+      );
+      const committedTree = accepted[0].result.state.trees.find(
+        (tree) => tree.treeId === targetTrees[0].treeId,
+      );
+      assert.ok(committedTree, `round ${round}: accepted tree state is missing`);
+      const renewal = forceTreeRenewal(targetTrees[0].treeId);
+      assert.equal(
+        renewal.oldOutpoint,
+        committedTree.treeOutpoint,
+        `round ${round}: forced post-chop renewal raced an unexpected tree state`,
+      );
+      forcedPostChopTreeRenewals += 1;
+      console.log(`soak round ${round}: forced post-chop tree ${renewal.treeId} renewal`);
+    }
     if (ROUND_DELAY_MS) await sleep(ROUND_DELAY_MS);
     const convergence = await refreshUntilConverged(players, `round ${round}`);
     views = convergence.views;
     convergenceRetries += convergence.retries;
+    const transition = classifyRoundTransitions(
+      round,
+      targetTrees,
+      beforePlayers,
+      views,
+      results,
+    );
+    if (transition.retryAfterTreeRenewal) {
+      treeRenewalRetries += transition.renewedTreeIds.length;
+      playerRenewals += transition.renewedPlayers.length;
+      assert.ok(
+        treeRenewalRetries <= ROUNDS * TREES_PER_ROUND,
+        'tree renewals prevented sustained chop progress',
+      );
+      console.warn(
+        `soak round ${round}: renewed tree(s) `
+          + `${transition.renewedTreeIds.join(',')}; retrying the logical round`,
+      );
+      round -= 1;
+      continue;
+    }
     const report = {
-      ...classifyRoundTransitions(round, targetTrees, beforePlayerOutpoints, views, results),
+      ...transition,
       durationMs: Date.now() - roundStartedAt,
     };
+    playerRenewals += report.renewedPlayers.length;
     recoveredUnknownOutcomes += report.recoveryMessages.length;
     roundReports.push(report);
 
-    const reloaded = await reloadPlayersForRound(players, views, round);
+    const reloaded = await reloadPlayersForRound(players, views, round, soakViewport);
     views = reloaded.views;
     convergenceRetries += reloaded.retries;
     browserReloads += reloaded.reloads;
@@ -527,8 +780,8 @@ try {
   ]);
   const indexedAssetSupplies = { treeMarkers, logs, xp };
   assert.equal(treeMarkers, views[0].state.trees.length, 'indexed TREE supply changed');
-  assert.equal(logs, expectedLogSupply, 'indexed LOG supply changed');
-  assert.equal(xp, expectedXpSupply, 'indexed XP supply changed');
+  assert.equal(logs, INDEXED_LOG_SUPPLY, 'indexed LOG supply changed');
+  assert.equal(xp, INDEXED_XP_SUPPLY, 'indexed XP supply changed');
   const report = {
     profile: 'soak',
     webUrl: WEB_URL,
@@ -542,6 +795,8 @@ try {
     reloadEvery: RELOAD_EVERY,
     reloadCount: RELOAD_COUNT,
     roundDelayMs: ROUND_DELAY_MS,
+    forceTreeRenewalRound: FORCE_TREE_RENEWAL_ROUND,
+    forcePostChopRenewalRound: FORCE_POST_CHOP_RENEWAL_ROUND,
     durationMs: Date.now() - startedAt,
     p50RoundMs: percentile(durations, 0.5),
     p95RoundMs: percentile(durations, 0.95),
@@ -551,6 +806,15 @@ try {
     reportedAcceptedSwings:
       ROUNDS * TREES_PER_ROUND - recoveredUnknownOutcomes,
     recoveredUnknownOutcomes,
+    playerRenewals,
+    treeRenewalRetries,
+    forcedTreeRenewals: forcedPreChopTreeRenewals + forcedPostChopTreeRenewals,
+    forcedPreChopTreeRenewals,
+    forcedPostChopTreeRenewals,
+    postChopTreeRenewals: roundReports.reduce(
+      (total, round) => total + round.renewedTreeIds.length,
+      0,
+    ),
     totalPlayerXp: views.reduce((total, view) => total + view.state.playerXp, 0),
     totalPlayerLogs: views.reduce((total, view) => total + view.state.playerLogs, 0),
     indexedAssetSupplies,

@@ -12,7 +12,7 @@ fi
 
 exec 9>"$LOCK_FILE"
 if ! flock --exclusive --nonblock 9; then
-  printf 'error: another Mutinynet maintenance process owns %s\n' "$LOCK_FILE" >&2
+  printf 'error: another Mutinynet world process owns %s\n' "$LOCK_FILE" >&2
   exit 73
 fi
 
@@ -22,7 +22,6 @@ source "$ENV_FILE"
 set +a
 
 : "${WOODLAND_DEPLOYER_SECRET:?missing WOODLAND_DEPLOYER_SECRET}"
-: "${WOODLAND_TREE_MAINTENANCE_SECRET:?missing WOODLAND_TREE_MAINTENANCE_SECRET}"
 : "${WOODLAND_ROLLOVER_SECRET:?missing WOODLAND_ROLLOVER_SECRET}"
 : "${WOODLAND_WORLD_MANIFEST:?missing WOODLAND_WORLD_MANIFEST}"
 
@@ -84,7 +83,7 @@ WOODLAND_SERVER_URL=self WOODLAND_WASM_FEATURES=woodland-app "$ROOT/scripts/buil
 
 "$OPERATOR" watch "$WOODLAND_WORLD_MANIFEST" &
 WATCHER_PID=$!
-env -u WOODLAND_TREE_MAINTENANCE_SECRET "$ROOT/target/release/woodland-server" &
+"$ROOT/target/release/woodland-server" &
 SERVER_PID=$!
 
 printf '\nwoodland.sh app and API: %s/\n' "$WOODLAND_SERVER_PUBLIC_URL"

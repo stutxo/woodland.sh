@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-WASM_FEATURES=${WOODLAND_WASM_FEATURES:-regtest-e2e}
+WASM_FEATURES=${WOODLAND_WASM_FEATURES:-woodland-app}
 WORLD_MANIFEST=${WOODLAND_WORLD_MANIFEST:-$ROOT/regtest/_build/woodland-world.json}
 OUTPUT_DIR=${WOODLAND_WEB_OUTPUT_DIR:-$ROOT/dist}
 cd "$ROOT"

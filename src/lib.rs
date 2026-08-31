@@ -1,33 +1,35 @@
 //! woodland.sh recursive Arkade covenants and verified client services.
 
-#[cfg_attr(
-    all(target_arch = "wasm32", not(feature = "regtest-e2e")),
-    allow(dead_code)
-)]
-mod arkade;
+/// Transport, manifest, and transaction plumbing behind the public covenant
+/// APIs. Downstream clients (bots, alternative browsers, tooling) build on
+/// these concrete types rather than reimplementing them.
+pub mod arkade;
 mod asset_packet;
 mod keys;
 #[cfg_attr(
     all(target_arch = "wasm32", not(feature = "regtest-e2e")),
     allow(dead_code)
 )]
-mod txbuild;
+pub mod txbuild;
 
 pub mod player;
 pub mod protocol;
 pub mod renewal;
 pub mod tree;
 
+#[cfg(feature = "woodland-app")]
+pub mod vault;
+
 pub mod batch;
 
-#[cfg(all(feature = "woodland-app", any(target_arch = "wasm32", test)))]
-mod chop;
+#[cfg(feature = "woodland-app")]
+pub mod chop;
 
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 
 #[cfg(feature = "woodland-app")]
-mod world;
+pub mod world;
 
 #[cfg_attr(
     all(target_arch = "wasm32", not(feature = "regtest-e2e")),
@@ -36,6 +38,8 @@ mod world;
 #[cfg(all(feature = "woodland-app", target_arch = "wasm32"))]
 mod web_app;
 
+#[cfg(all(feature = "woodland-app", not(target_arch = "wasm32")))]
+pub mod client;
 #[cfg(all(feature = "woodland-app", not(target_arch = "wasm32")))]
 pub mod operator;
 

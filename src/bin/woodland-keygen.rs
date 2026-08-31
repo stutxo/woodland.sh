@@ -1,7 +1,7 @@
 //! Offline-only generation and recovery for woodland.sh mainnet authority keys.
 //!
 //! Two independent BIP39 roots are split into hardened BIP32 role paths. Root
-//! mnemonics never belong on deployment or maintenance hosts.
+//! mnemonics never belong on deployment or watcher hosts.
 
 use anyhow::{anyhow, bail, Context, Result};
 use bip39::{Language, Mnemonic};
@@ -20,11 +20,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use zeroize::Zeroizing;
 
 const SCHEME: &str = "woodland-bip39-bip32-v1";
 const DEPLOYER_PATH: &str = "m/1464815428'/1'/0'/0'";
-const MAINTENANCE_PATH: &str = "m/1464815428'/1'/0'/1'";
-const ROLLOVER_PATH: &str = "m/1464815428'/1'/0'/2'";
+const ROLLOVER_PATH: &str = "m/1464815428'/1'/0'/1'";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,15 +41,13 @@ struct PublicBundle {
     deployment_root_fingerprint: String,
     operations_root_fingerprint: String,
     deployer: PublicKeyRecord,
-    maintenance: PublicKeyRecord,
     rollover: PublicKeyRecord,
 }
 
 struct DerivedBundle {
     public: PublicBundle,
-    deployer_secret: String,
-    maintenance_secret: String,
-    rollover_secret: String,
+    deployer_secret: Zeroizing<String>,
+    rollover_secret: Zeroizing<String>,
 }
 
 fn generate_mnemonic() -> Result<Mnemonic> {
@@ -68,7 +66,7 @@ fn root_from_mnemonic(mnemonic: &Mnemonic) -> Result<Xpriv> {
     Ok(root)
 }
 
-fn derive_child(root: &Xpriv, path: &str) -> Result<(String, String)> {
+fn derive_child(root: &Xpriv, path: &str) -> Result<(Zeroizing<String>, String)> {
     let secp = Secp256k1::new();
     let path = DerivationPath::from_str(path).context("parse hardened derivation path")?;
     let child = root
@@ -77,7 +75,7 @@ fn derive_child(root: &Xpriv, path: &str) -> Result<(String, String)> {
     let keypair = Keypair::from_secret_key(&secp, &child.private_key);
     let xonly = keypair.x_only_public_key().0;
     Ok((
-        child.private_key.secret_bytes().to_lower_hex_string(),
+        Zeroizing::new(child.private_key.secret_bytes().to_lower_hex_string()),
         xonly.to_string(),
     ))
 }
@@ -96,8 +94,6 @@ fn derive_bundle(deployment: &Mnemonic, operations: &Mnemonic) -> Result<Derived
         .fingerprint()
         .to_string();
     let (deployer_secret, deployer_public) = derive_child(&deployment_root, DEPLOYER_PATH)?;
-    let (maintenance_secret, maintenance_public) =
-        derive_child(&operations_root, MAINTENANCE_PATH)?;
     let (rollover_secret, rollover_public) = derive_child(&operations_root, ROLLOVER_PATH)?;
 
     Ok(DerivedBundle {
@@ -110,17 +106,12 @@ fn derive_bundle(deployment: &Mnemonic, operations: &Mnemonic) -> Result<Derived
                 derivation_path: DEPLOYER_PATH.to_owned(),
                 xonly_public_key: deployer_public,
             },
-            maintenance: PublicKeyRecord {
-                derivation_path: MAINTENANCE_PATH.to_owned(),
-                xonly_public_key: maintenance_public,
-            },
             rollover: PublicKeyRecord {
                 derivation_path: ROLLOVER_PATH.to_owned(),
                 xonly_public_key: rollover_public,
             },
         },
         deployer_secret,
-        maintenance_secret,
         rollover_secret,
     })
 }
@@ -158,13 +149,16 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 fn write_derived_files(output: &Path, bundle: &DerivedBundle) -> Result<()> {
     write_private(
         &output.join("deployment.env"),
-        &format!("WOODLAND_DEPLOYER_SECRET={}\n", bundle.deployer_secret),
+        &format!(
+            "WOODLAND_DEPLOYER_SECRET={}\n",
+            bundle.deployer_secret.as_str()
+        ),
     )?;
     write_private(
-        &output.join("maintenance.env"),
+        &output.join("operations.env"),
         &format!(
-            "WOODLAND_TREE_MAINTENANCE_SECRET={}\nWOODLAND_ROLLOVER_SECRET={}\n",
-            bundle.maintenance_secret, bundle.rollover_secret
+            "WOODLAND_ROLLOVER_SECRET={}\n",
+            bundle.rollover_secret.as_str()
         ),
     )?;
     write_private(
@@ -174,15 +168,17 @@ fn write_derived_files(output: &Path, bundle: &DerivedBundle) -> Result<()> {
     write_private(
         &output.join("README.txt"),
         &format!(
-            "woodland.sh mainnet key bundle\n\nScheme: {SCHEME}\nDeployment root fingerprint: {}\nOperations root fingerprint: {}\n\nKeep root mnemonic files on offline backup media and never copy them to a maintenance host. Copy only maintenance.env to that host. Remove deployment.env from online systems after world deployment and balance verification.\n",
+            "woodland.sh mainnet key bundle\n\nScheme: {SCHEME}\nDeployment root fingerprint: {}\nOperations root fingerprint: {}\n\nKeep root mnemonic files on offline backup media and never copy them to a watcher host. Copy only operations.env to that host. Remove deployment.env from online systems after world deployment and balance verification.\n",
             bundle.public.deployment_root_fingerprint, bundle.public.operations_root_fingerprint
         ),
     )
 }
 
 fn read_mnemonic(path: &Path) -> Result<Mnemonic> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read mnemonic file {}", path.display()))?;
+    let text = Zeroizing::new(
+        fs::read_to_string(path)
+            .with_context(|| format!("read mnemonic file {}", path.display()))?,
+    );
     Mnemonic::parse_in(Language::English, text.trim())
         .with_context(|| format!("parse mnemonic file {}", path.display()))
 }
@@ -199,10 +195,6 @@ fn print_public(bundle: &PublicBundle) {
     println!(
         "deployer {}: {}",
         bundle.deployer.derivation_path, bundle.deployer.xonly_public_key
-    );
-    println!(
-        "maintenance {}: {}",
-        bundle.maintenance.derivation_path, bundle.maintenance.xonly_public_key
     );
     println!(
         "rollover {}: {}",
@@ -222,11 +214,11 @@ fn generate(output: PathBuf) -> Result<()> {
     let bundle = derive_bundle(&deployment, &operations)?;
     write_private(
         &output.join("deployment-root.txt"),
-        &format!("{deployment}\n"),
+        &Zeroizing::new(format!("{deployment}\n")),
     )?;
     write_private(
         &output.join("operations-root.txt"),
-        &format!("{operations}\n"),
+        &Zeroizing::new(format!("{operations}\n")),
     )?;
     write_derived_files(&output, &bundle)?;
     print_public(&bundle.public);
@@ -350,17 +342,14 @@ mod tests {
             "a0990f658bc1ebee6f0bc63fb840035a1e8dc1f7fc3b7007dec349b80fb85e97"
         );
         assert_eq!(
-            first.public.maintenance.xonly_public_key,
+            first.public.rollover.xonly_public_key,
             "215fc9f246b711433725d1a662dc03845bbf6e85e2407131db5f8468f2d713a5"
         );
-        assert_eq!(
-            first.public.rollover.xonly_public_key,
-            "25f24bed1d799a7bae60b17c50a3e7bd05f07239c4584b809415825895926079"
+        assert_ne!(
+            first.deployer_secret.as_str(),
+            first.rollover_secret.as_str()
         );
-        assert_ne!(first.deployer_secret, first.maintenance_secret);
-        assert_ne!(first.maintenance_secret, first.rollover_secret);
         assert_eq!(first.public.deployer.derivation_path, DEPLOYER_PATH);
-        assert_eq!(first.public.maintenance.derivation_path, MAINTENANCE_PATH);
         assert_eq!(first.public.rollover.derivation_path, ROLLOVER_PATH);
     }
 
@@ -398,7 +387,7 @@ mod tests {
             "deployment-root.txt",
             "operations-root.txt",
             "deployment.env",
-            "maintenance.env",
+            "operations.env",
             "public.json",
             "README.txt",
         ] {

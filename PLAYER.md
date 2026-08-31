@@ -3,15 +3,15 @@
 ## Purpose
 
 A player is one owner-specific recursive VTXO. It holds 330 sats, exactly one
-self-issued PLAYER_ID, immutable identity and position packets, numeric XP,
-harvested LOG, and earned XP. There is no carrier, PLAYER_TICKET, allocator,
-protocol registry, or player cap. When configured, the game server automatically
-indexes newly activated PLAYER_ID state, presence, and chat, but has no role in
-gameplay authorization.
+self-issued PLAYER_ID, immutable identity and position packets, a recursive
+player roll, bounded luck credit, numeric XP, harvested LOG, and earned XP.
+There is no carrier, PLAYER_TICKET, allocator, protocol registry, or player cap.
+When configured, the game server indexes public state, presence, and chat, but
+has no role in gameplay authorization.
 
 ```text
-player state: D sats + 1 PLAYER_ID + identity + position + numeric XP packet
-              + optional LOG + optional XP asset
+player state: D sats + 1 PLAYER_ID + identity + position + player roll
+              + luck credit + numeric XP + optional LOG + optional XP asset
 D = 330 sats
 ```
 
@@ -25,13 +25,20 @@ issues a marker and creates the personalized player state. It attaches:
 - metadata `game=woodland.sh`, `protocol=1`, `asset=PLAYER_ID`, and the owner;
 - identity derived from `SHA256("woodland.sh/PlayerIdentity/v1" || owner || genesis_txid)`;
 - spawn position `(3,17)`;
-- canonical numeric XP zero.
+- roll `SHA256("woodland.sh/player-roll/v1" || identity_packet)`;
+- luck credit 8,000 and canonical numeric XP zero.
 
 The PLAYER_ID AssetId is `(activation_txid, 0)`. The browser persists that exact
 ID before submission, then discovers only state containing that one-unit asset.
 A failed submission can be rebuilt deterministically; a submitted-but-unknown
 transaction can be reconciled by the same marker. Anyone may fund more players
 or mint a decoy marker, but cannot reproduce an existing transaction-derived ID.
+For the reference client's direct issuance-to-state shape, every player
+covenant leaf recognizes the first recursive spend because the PLAYER_ID
+AssetId txid equals the state input's outpoint txid. On that spend it requires
+the identity-derived roll, AssetId group index zero, and 8,000 credit. A
+malformed direct activation therefore cannot be laundered through renewal or
+withdrawal before chopping.
 
 ## XP Backing
 
@@ -48,10 +55,57 @@ A forged activation with a high XP packet but no XP cannot chop: both
 player and tree covenants compare the packet to the state asset balance.
 XP has no control asset and cannot be reissued.
 
-Level is derived, never stored. The canonical level thresholds remain
-`woodland-xp-v1`; LOG chance rises from 25% to 30% at levels 10, 20, 30, 40,
-and 50. The expanded 21,000-XP world can reach the lower bonus tiers while
+Level is derived, never stored. The reachable canonical curve is
+`woodland-xp-v1`: level 2 at 83 XP, with chance boundaries at levels 10, 20,
+30, 40, and 50 (1,154 / 4,470 / 13,363 / 37,224 / 101,333 XP). Base LOG
+chance is 20% and rises two percentage points per boundary to a 30% cap while
 aggregate XP remains fixed and asset-backed.
+
+## Player-Bound Luck
+
+The next reward belongs to the player lineage. A swing advances
+`Rnext = SHA256(Rprevious)` and maps the successor to a little-endian bucket
+modulo 10,000. Selecting or restocking another tree cannot change that bucket.
+
+For input-XP rate `p`, input credit `C`, `Q = C+p`, and reward bit `G`:
+
+```text
+G = 0                    if Q < 10,000
+G = 1                    if Q > 20,000
+G = (roll_bucket < p)    otherwise
+Cnext = Q - 10,000*G
+```
+
+Credit is canonical, fixed-width, and constrained to 0–20,000. The identity
+`Cnext + 10,000*G = C+p` keeps cumulative rewards within two units of expected
+value. At 20%, every eleven-swing window contains a reward, so no miss run
+exceeds ten; no rate permits more than two consecutive successes. The hash
+chain is public and predictable. This prevents tree-target grinding and bounds
+variance; it does not prevent PLAYER_ID Sybils or provide hidden randomness.
+
+## Soulbound XP, Liquid LOG
+
+XP is soulbound by covenant: no leaf moves it out of player state. The chop
+covenants pin XP deltas to the deterministic drop bit, both renewal leaves
+preserve the XP balance and packet exactly, and the LOG withdrawal leaf
+requires the XP balance and packet to survive unchanged. There is no transfer
+path at all — not to other players, not to ordinary outputs — so a level can
+never be bought, sold, or pooled.
+
+LOG is the liquid token. The fourth player tapleaf, authorized by the owner
+plus the Arkade operator and tweaked emulator, withdraws an arbitrary amount
+of LOG to any destination:
+
+```text
+inputs:  player state, owner wallet dust input
+outputs: player state minus the withdrawn LOG, LOG destination, extension,
+         anchor
+groups:  PLAYER_ID, LOG, XP
+```
+
+The covenant preserves the player P2TR, 330 sats, PLAYER_ID, identity,
+position, XP packet, and XP balance exactly; the destination output is funded
+entirely by the wallet dust input, never by player sats.
 
 ## Atomic Chop
 
@@ -67,8 +121,8 @@ output 2: zero-value merged Ark extension
 output 3: canonical zero-value anchor
 ```
 
-`G` is the deterministic drop bit derived from the tree roll and input XP.
-The four Asset V1 groups are ordered `PLAYER_ID`, `TREE`, `LOG`, `XP`.
+`G` is the deterministic reward bit derived from player roll, luck credit, and
+input XP. The four Asset V1 groups are ordered `PLAYER_ID`, `TREE`, `LOG`, `XP`.
 Group zero is exactly one metadata-free, uncontrolled unit assigned from input
 zero to output zero. Zero LOG/XP assignments are omitted while those world
 groups remain present because the tree has positive inventory before a swing.
@@ -80,6 +134,8 @@ The player covenant requires:
 - recursive preservation of player script and `D` sats;
 - the exact shared tree script and fixed tree value;
 - preserved identity and position;
+- canonical initial luck on the first recursive spend;
+- exact roll hash successor and bounded luck-credit transition;
 - player input/output assets contain exactly one PLAYER_ID and only optional LOG
   and XP besides it;
 - input and output XP packets equal their corresponding XP balances;
@@ -89,10 +145,13 @@ The reciprocal tree covenant enforces the actual inventory and XP deltas.
 
 ## Authorization
 
-The chop tapleaf is fixed to:
+The player contract has four tapleaves:
 
 ```text
-player owner + Arkade operator + script-tweaked emulator
+chop:                player owner + Arkade operator + script-tweaked emulator
+owner renewal:       player owner + Arkade operator + script-tweaked emulator
+watchtower renewal:  rollover key + Arkade operator + script-tweaked emulator
+LOG withdrawal:      player owner + Arkade operator + script-tweaked emulator
 ```
 
 The owner key remains a Bitcoin Taproot signer; owner authorization is not
@@ -120,7 +179,7 @@ operation is therefore near-expiry policy, not a requirement for active players.
 Every renewal preserves byte-for-byte:
 
 - player P2TR and 330 sats;
-- identity, position, and XP packets;
+- identity, position, roll, luck-credit, and XP packets;
 - the one-unit PLAYER_ID;
 - LOG and XP balances.
 
@@ -130,22 +189,37 @@ The reference frontend uses:
 
 ```text
 woodland.sh:web:v1:key:<site-origin>
-woodland.sh:web:v1:profile:<site-origin>
+woodland.sh:web:v1:profile:<site-origin>:<genesis-txid>
 woodland.sh:web:v1:position:<site-origin>
-woodland.sh:web:v1:pending:<arkade-url>
+woodland.sh:web:v1:pending:<arkade-url>:<genesis-txid>
 ```
 
 The profile pins the current genesis transaction and exact PLAYER_ID AssetId.
-Unknown chop outcomes retain the exact prepared PSBT and reconcile indexed state
-before another swing.
+Unknown chop outcomes retain the exact prepared PSBT and reconcile indexed
+state before another swing.
 
 The signing key alone is insufficient for deterministic discovery when public
 decoy states exist; production backups must preserve the profile's PLAYER_ID as
 well as the key.
 
+The browser's **Player backup & restore** control downloads one plaintext JSON
+file containing both values plus the world identity. Keep it offline and secret:
+anyone with the file controls the player and wallet. Restore validates the key
+against its saved wallet address and reinstates the exact PLAYER_ID profile.
+
 ## Limits
 
-The player count is unlimited, but season resources are not: the expanded world
-contains 21,000 LOG and 21,000 XP. Player state currently keeps harvested assets
-inside the recursive contract; a separate owner-authorized withdrawal contract
-would be required for external LOG transfer without weakening XP invariants.
+The player count is unlimited, but season resources are not: the world
+contains exactly 21,000,000 LOG and 21,000,000 XP, of which 2,100,000 each
+sit on trees at genesis and the rest in the supply vault. Harvested LOG
+leaves player state through the owner-authorized withdrawal leaf; XP never
+leaves. PLAYER_ID is per-season: future seasons issue fresh markers under the
+same global TREE/LOG/XP asset IDs, so a player's identity persists across
+seasons through its owner key.
+
+A covenant sees the current transaction, not arbitrary ancestry from before a
+marker entered player state. An owner can issue a marker to an unconstrained
+intermediate output and later choose any valid starting roll and credit. This
+can bias reward timing inside the corridor, but every recursive transition still
+enforces player binding, the exact rate budget, the credit corridor, and streak
+limits. The reference client always uses direct canonical activation.

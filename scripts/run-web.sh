@@ -6,7 +6,6 @@ export WOODLAND_NETWORK=regtest
 export WOODLAND_ARKADE_SERVICE_URL=http://127.0.0.1:7070
 export WOODLAND_EMULATOR_URL=http://127.0.0.1:7073
 export WOODLAND_DEPLOYER_SECRET=1111111111111111111111111111111111111111111111111111111111111111
-export WOODLAND_TREE_MAINTENANCE_SECRET=2222222222222222222222222222222222222222222222222222222222222222
 export WOODLAND_ROLLOVER_SECRET=4444444444444444444444444444444444444444444444444444444444444444
 export WOODLAND_WORLD_MANIFEST="$ROOT/regtest/_build/woodland-world.json"
 PORT=${WOODLAND_WEB_PORT:-8000}
@@ -40,18 +39,21 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 "$ROOT/scripts/regtest.sh" start-tree
-WOODLAND_MAINTENANCE_STARTUP=1 "$ROOT/scripts/regtest.sh" maintain
+WOODLAND_RENEWAL_STARTUP=1 "$ROOT/scripts/regtest.sh" renew-world
+# Registration signatures bind the server origin and world genesis; a reused
+# database from another port or world fails closed and stops the server.
+rm -f "$WOODLAND_SERVER_DB"
 cargo build --locked --features server --bin woodland-operator --bin woodland-server
-WOODLAND_SERVER_URL=self "$ROOT/scripts/build-web.sh"
+WOODLAND_SERVER_URL=self WOODLAND_WASM_FEATURES=regtest-e2e "$ROOT/scripts/build-web.sh"
 unset WOODLAND_DEPLOYER_SECRET
 
 "$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" &
 WATCHER_PID=$!
-env -u WOODLAND_TREE_MAINTENANCE_SECRET "$ROOT/target/debug/woodland-server" &
+"$ROOT/target/debug/woodland-server" &
 SERVER_PID=$!
 
 printf '\nwoodland.sh: http://127.0.0.1:%s/\n' "$PORT"
 printf 'Static app, leaderboard, presence, chat, and delegation share this origin.\n'
-printf 'Every LOG drop gives 1 XP. LOG chance rises from 25%% to 30%% at woodland levels 10, 20, 30, 40, and 50.\n'
-printf 'Renewable stumps return after 20-40 seconds; exhausted trees stay depleted.\n\n'
+printf 'Every LOG drop gives 1 XP. LOG chance rises from 20%% to 30%% at woodland levels 10, 20, 30, 40, and 50.\n'
+printf "Renewable stumps refill on the watcher's next renewal; exhausted trees stay depleted.\n\n"
 wait -n "$WATCHER_PID" "$SERVER_PID"

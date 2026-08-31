@@ -19,8 +19,8 @@ One genesis transaction creates three uncontrolled, fixed-supply assets:
 | Genesis group | Asset | Supply | Initial allocation |
 | --- | --- | ---: | --- |
 | 0 | TREE | 2,100 | one per tree |
-| 1 | LOG | 21,000 | ten per tree |
-| 2 | XP | 21,000 | ten per tree |
+| 1 | LOG | 21,000,000 | 1,000 per tree; 18,900,000 in the supply vault |
+| 2 | XP | 21,000,000 | 1,000 per tree; 18,900,000 in the supply vault |
 
 Genesis metadata commits `game=woodland.sh`, `protocol=1`, and the asset name.
 All groups have `control_asset=None`; stock arkd rejects reissuance.
@@ -28,17 +28,29 @@ All groups have `control_asset=None`; stock arkd rejects reissuance.
 With Arkade dust `D = 330 sats`:
 
 ```text
-player state: D sats + 1 PLAYER_ID + identity + position + numeric XP packet
-              + optional LOG + optional XP asset
-initial tree: 1 TREE + 10 LOG + 10 XP + health 5 + fixed 6D (1,980 sats)
+player state: D sats + 1 PLAYER_ID + identity + position + player roll
+              + luck credit + numeric XP + optional LOG + optional XP asset
+initial tree: 1 TREE + 1,000 LOG + 1,000 XP + health 5 + fixed D (330 sats)
+supply vault: D sats + 18,900,000 LOG + 18,900,000 XP
 ```
 
 Numeric XP is not independently forgeable: it must equal the XP held by
 the recursive player state. A successful swing transfers one LOG and one
 XP from the selected tree into player state and increments XP by one. A
-miss transfers nothing. Total LOG and XP remain 21,000. Base LOG chance is 25%,
-rising by one percentage point at levels 10, 20, 30, 40, and 50 to a 30% cap.
-The expanded XP supply makes the lower bonus tiers reachable.
+miss transfers nothing. Total LOG and XP remain 21,000,000 across trees,
+players, and the vault.
+
+Base LOG chance is 20%, rising by two percentage points at levels 10, 20, 30,
+40, and 50 of the reachable `woodland-xp-v1` curve
+(1,154 / 4,470 / 13,363 / 37,224 / 101,333 XP) to a 30% cap. Reward entropy
+belongs to the player lineage, not the selected tree, so changing targets
+cannot search for a better next outcome. A bounded luck-credit accumulator
+keeps realized rewards within two LOG of accumulated expected value, permits
+at most two consecutive successes, and limits the base rate to ten consecutive
+misses (at least one reward per eleven swings). The roll remains public and
+predictable; this is variance control, not hidden randomness. XP is soulbound.
+LOG is liquid and the protocol can withdraw it to any destination. The alpha
+browser intentionally leaves withdrawal to marketplaces and custom clients.
 
 ## Atomic Swing
 
@@ -54,17 +66,36 @@ Group zero moves the player's exact one-unit PLAYER_ID from player input zero to
 player output zero. Groups one through three are the world's TREE, LOG, and
 XP. Together, the reciprocal Arkade covenants enforce the
 two-input/four-output shape, scripts, values, packet continuity, group order,
-empty transfer metadata/control fields, and anchor. The tree covenant
-additionally enforces:
+empty transfer metadata/control fields, and anchor. Both covenants additionally
+enforce:
 
 - exactly one TREE marker;
-- `Rnext = SHA256(Rprevious)`;
-- the public XP-dependent drop threshold;
-- health, LOG, and XP deltas equal to the same drop bit;
+- player roll advancement `Rnext = SHA256(Rprevious)`;
+- input-XP-dependent 20–30% threshold and bounded luck-credit transition;
+- health, LOG, and XP deltas equal to the same reward bit;
 - player XP equals player-held XP before and after the swing.
 
 The player tapleaf requires player, Arkade operator, and script-tweaked emulator
 signatures. The shared tree tapleaf requires operator and tweaked emulator.
+
+## Stumps, Restock, and the Supply Vault
+
+The third world contract is the supply vault: a covenant, not a wallet, holding
+the undistributed 18,900,000 LOG and 18,900,000 XP. It has exactly two
+permissionless leaves — an atomic retire-and-restock and an exact-self-send
+renewal — so nobody can redirect the reserve anywhere else.
+
+A tree whose health reaches zero with reserve left is a stump: any batch
+renewal of that tree refills its health to five while preserving identity,
+assets, script, and sats. A tree whose LOG reserve reaches zero holds only its
+TREE marker; one restock transaction spends it together with the vault and
+recreates it at the same coordinate with the same script, 330 sats, one TREE,
+a fresh 1,000 LOG / 1,000 XP reserve, and health five. Tree lifecycle
+transactions cannot change player reward entropy. The tree's 330-sat backing is
+recycled inside the transaction, so replacements need no new world funding.
+Both tree-side leaves close over the Arkade operator and tweaked emulator only:
+stump refill and restock are permissionless covenant paths, and a coordinate
+stays empty only once the vault itself is exhausted.
 
 ## Activation and Renewal
 
@@ -73,14 +104,27 @@ Activation is permissionless and browser-owned:
 1. derive the player's ordinary Arkade address;
 2. receive one exact 330-sat VTXO from any Arkade wallet;
 3. issue one uncontrolled `PLAYER_ID` into the personalized player state while
-   attaching identity, position, and zero XP;
+   attaching identity, position, identity-derived roll, 8,000 luck credit, and zero XP;
 4. derive its AssetId from the activation txid and persist that exact ID before
    submission;
 5. index only state carrying that one-unit marker.
 
+For the direct issuance-to-state transaction above, every player covenant leaf
+recognizes the first recursive spend because the PLAYER_ID issuance txid equals
+the state input txid. It requires the identity-derived roll and 8,000 credit, so
+renewal or withdrawal cannot launder a malformed direct activation.
+
+The covenant cannot inspect ancestry from before a marker entered player state.
+A malicious owner can route a newly issued marker through an unconstrained
+intermediate output and choose any valid starting roll and credit in the
+0–20,000 corridor. After entry, every swing still enforces the exact rate
+budget, corridor, streak bounds, and player-bound hash transition. This is part
+of the permissionless identity-grinding boundary, not a route to tree-target
+or supply inflation. The reference activation never creates that shape.
+
 Anyone can issue a different marker or copy the public player script, but cannot
 reproduce the selected AssetId without reproducing its transaction ID. Decoy
-states therefore do not block discovery of the real recursive lineage.
+states therefore do not block discovery of the selected recursive lineage.
 
 Player state has two exact-self-send batch-renewal paths:
 
@@ -93,17 +137,21 @@ live. The browser registers the intent, follows Arkade's batch event stream,
 contributes tree nonces/signatures, obtains emulator forfeit signatures, and
 validates the new expiry itself.
 
-Trees still need independent maintenance services for timed regrowth and
-near-expiry rollover. Those services do not hold player keys or proxy player
-traffic.
+Tree renewal is likewise permissionless: the leaf closes over the operator
+and tweaked emulator alone, refills stumps as a side effect, and needs no
+project-held key. The operator `watch` command is a convenience that renews
+trees at the expiry margin and stumps immediately, renews the vault on the
+same margin, and reports any live tree missing an indexed expiry. It holds no
+player keys and proxies no player traffic.
 
 ## Reviewer Map
 
 The protocol-critical review surface is intentionally small:
 
 - `src/protocol.rs`: canonical transaction, output, packet, and asset indexes;
-- `src/player.rs`: player state encoding, chop covenant, and signer verification;
-- `src/tree.rs`: shared chop, regrowth, renewal covenants, and host mirrors;
+- `src/player.rs`: player state encoding, chop and withdrawal covenants, and signer verification;
+- `src/tree.rs`: shared chop, renewal, and retire covenants, and host mirrors;
+- `src/vault.rs`: supply vault restock and renewal covenants;
 - `src/world.rs`: mandatory manifest validation and contract reconstruction;
 - `src/renewal.rs`: exact-self-send intent construction and approval checks;
 - `src/asset_packet.rs`: strict indexed-asset reconstruction;
@@ -124,17 +172,23 @@ actually exists.
 
 ## Network Architecture
 
-The manifest pins the Arkade and emulator service URLs and signer keys. Gameplay
-calls those services directly. The default deployment serves the static bundle,
-leaderboard, presence, chat, and delegation API from one Axum origin; the
-server receives no deployer, maintenance, or player secret.
+The manifest pins the Arkade and emulator service URLs and signer keys. It also
+pins the Arkade forfeit key and address: renewal clients recompute every batch
+tree sweep leaf from the pinned forfeit key, sign forfeits only to the pinned
+address, and require the renewed output to be the byte-exact covenant self-send,
+so a spoofed or redirected Arkade endpoint cannot substitute its own sweep key
+or forfeit payout. Gameplay calls those services directly. The default deployment
+serves the static bundle, leaderboard, presence, chat, and delegation API from
+one Axum origin; the server receives no deployer or player secret. Trees have no
+autonomous refill clock: stumps refill health on any batch renewal, and a
+covenant vault replaces depleted trees atomically with no project-held key.
 
 ```text
 browser ──same origin──> Axum server: static app + social API
         ──direct───────> Arkade service
         ──direct───────> Arkade emulator
 
-maintenance host ──> tree regrowth and tree rollover
+renewal watcher ──> tree and vault renewal (stumps refill on renewal)
 ```
 
 GitHub Pages remains an optional separate static origin. In that mode the
@@ -208,18 +262,21 @@ Browser storage uses `woodland.sh:web:v1:*`. **New test wallet** clears the
 local key, profile (including PLAYER_ID), pending swing, and position. It does
 not delete a durable server registration.
 
-For the public Mutinynet world, `run-mutinynet.sh` deploys or resumes the world,
-builds the same-origin bundle, and runs both maintenance and Axum:
+For a public protocol-v1 Mutinynet world, `run-mutinynet.sh` deploys or resumes
+the world, builds the same-origin bundle, and runs the renewal watcher and Axum:
 
 ```bash
 ./scripts/run-mutinynet.sh
 ```
 
-GitHub Pages deployment is available as a separate-static-host alternative. Set
-`WOODLAND_PAGES_MANIFEST` to the tracked manifest and `WOODLAND_SERVER_URL` to
-the canonical external Axum origin. The Pages artifact contains no secrets;
-gameplay still talks directly to the manifest-pinned Arkade and emulator
-services.
+GitHub Pages deployment is available as a separate-static-host alternative.
+Set `WOODLAND_PAGES_MANIFEST` to a verified, committed schema-1 manifest and
+`WOODLAND_SERVER_URL` to the canonical external Axum origin. With no manifest
+variable the Pages jobs stay disabled. Deployment tools write their live
+manifest as ignored runtime output; copy a verified public manifest to a
+deliberate tracked deployment path before enabling Pages. The Pages artifact
+contains no secrets; gameplay still talks directly to the manifest-pinned
+Arkade and emulator services.
 
 ## Verification
 
@@ -250,14 +307,16 @@ Long configurable same-tree contention profile:
 It defaults to 12 players and 30 rounds. See [`TESTING.md`](TESTING.md) for
 bounded remote-service settings and report output.
 
-Eight-hour alternating full/soak runner with per-cycle artifacts:
+Eight-hour v1 release soak. It rotates fresh worlds through the full,
+contention, burst, fanout, reload, stump-renewal, and vault-restock profiles,
+with per-cycle manifests and artifacts:
 
 ```bash
 ./scripts/test-overnight.sh
 ```
 
-Four-hour 24-player burst, multi-tree fanout, browser-reload, regrowth, and full
-adversarial matrix:
+Four-hour 24-player burst, multi-tree fanout, browser-reload, stump-renewal,
+vault-restock, and full adversarial matrix:
 
 ```bash
 ./scripts/test-aggressive.sh
@@ -274,12 +333,18 @@ The native operator manages only shared world lifecycle:
 ```text
 woodland-operator status <manifest>
 woodland-operator ensure <manifest>
-woodland-operator regrow-due <manifest>
-woodland-operator maintain-once <manifest>
+WOODLAND_RENEWAL_STARTUP=1 woodland-operator renew-once <manifest>
 woodland-operator watch <manifest>
 woodland-operator renew <manifest> tree <tree-id>
 woodland-operator renew <manifest> player <owner-pubkey> <player-asset> # optional watchtower
+woodland-operator restock <manifest> tree <tree-id>
+woodland-operator restock <manifest> due
 ```
+
+Shared-tree lifecycle authorization needs no dedicated project key: tree renewal
+(which also refills a zero-health stump), tree retirement, vault restock, and
+vault renewal are permissionless covenant paths closed over the Arkade operator
+and tweaked emulator. The watcher and restock commands are conveniences.
 
 Player activation and owner renewal are browser operations, not operator APIs.
 
@@ -291,8 +356,10 @@ independently verify every service URL, signer, version, and fee policy.
 
 Generate the deployer and operations roots offline with `woodland-keygen` and
 complete the recovery rehearsal in [`mainnet/README.md`](mainnet/README.md)
-before creating a funding address. Do not generate real mainnet roots on the
-online deployment or maintenance host.
+before creating a funding address. The hierarchy holds exactly two children:
+deployer for genesis and rollover for player-watchtower and tree/vault renewal
+triggers. Do not generate real mainnet roots on the online deployment or
+watcher host.
 
 Create an ignored configuration file such as `.cache/mainnet.env`:
 
@@ -305,7 +372,6 @@ WOODLAND_EXPECTED_ARKADE_VERSION="replace-with-verified-version"
 WOODLAND_EXPECTED_EMULATOR_SIGNER="replace-with-verified-xonly-key"
 WOODLAND_EXPECTED_EMULATOR_VERSION="replace-with-verified-version"
 WOODLAND_DEPLOYER_SECRET="replace-with-dedicated-32-byte-hex-key"
-WOODLAND_TREE_MAINTENANCE_SECRET="replace-with-dedicated-32-byte-hex-key"
 WOODLAND_ROLLOVER_SECRET="replace-with-dedicated-32-byte-hex-key"
 WOODLAND_WORLD_MANIFEST="/absolute/path/to/woodland-mainnet.json"
 ```
@@ -354,8 +420,8 @@ evaluation requires a compromised emulator plus every other signer required by
 the selected leaf.
 
 Protocol v1 does not claim hidden randomness, covenant-enforced movement,
-unique humans, Sybil resistance, a canonical leaderboard, or service
-availability.
+unique humans, Sybil resistance, pre-covenant PLAYER_ID ancestry, a canonical
+leaderboard, or service availability.
 
 ## Security and License
 
@@ -369,7 +435,7 @@ PGP fingerprint. The project is available under the [MIT License](LICENSE).
 - [HOW_IT_WORKS.md](HOW_IT_WORKS.md): transaction walkthrough
 - [CLIENT.md](CLIENT.md): alternate client integration
 - [PLAYER.md](PLAYER.md): recursive player state and self-renewal
-- [TREE.md](TREE.md): tree covenant, regrowth, and rollover
+- [TREE.md](TREE.md): tree covenant, stump refill, retirement, and restock
 - [SCALING.md](SCALING.md): contention and capacity analysis
 - [TESTING.md](TESTING.md): verification strategy
-- [mainnet/README.md](mainnet/README.md): offline key ceremony, recovery, deployment, and maintenance
+- [mainnet/README.md](mainnet/README.md): offline key ceremony, recovery, deployment, and watcher operation

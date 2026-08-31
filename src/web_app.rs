@@ -1,26 +1,31 @@
 //! Browser/WASM application for direct interaction with woodland.sh covenants.
 
 use crate::arkade::{ArkadeRest, EmulatorParams, EmulatorRest, ServerParams, VtxoRecord};
-use crate::chop::PendingChop;
+use crate::chop::{require_asset_amount, ChopMutation, ExpectedChop, PendingChop};
 use crate::keys::Keys;
 use crate::player::{self, PlayerChopTransition, PlayerContract, PlayerState};
 use crate::tree::{self, TreeContract, TreeHealth, TreeState};
 use crate::txbuild;
 use crate::world::{ValidatedTree, ValidatedWorld, WorldManifest};
 use anyhow::{anyhow, Context, Result};
-use ark_core::asset::packet::{AssetGroup, AssetInput, AssetOutput, AssetRef, Packet};
+use ark_core::asset::packet::{AssetGroup, AssetOutput, Packet};
 use ark_core::asset::AssetId;
-use ark_core::send::{
-    build_offchain_transactions, sign_ark_transaction, sign_checkpoint_transaction, SendReceiver,
-    VtxoInput,
-};
+use ark_core::send::{build_offchain_transactions, SendReceiver};
 use ark_core::Asset;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Amount, OutPoint, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 const INDEX_ATTEMPTS: usize = 80;
 const INDEX_POLL_MS: u64 = 250;
+/// A submitted swing whose response was lost may still land; poll the
+/// indexer for the journaled outpoints for this long before resubmitting,
+/// because a resubmission that races the original can trip the service's
+/// concurrent-spend protection.
+const RESUME_RECONCILE_ATTEMPTS: u32 = 15;
+const RESUME_RECONCILE_DELAY_MS: u64 = 2_000;
+#[cfg(feature = "regtest-e2e")]
+const E2E_INITIAL_TREE_RESERVE: Option<&str> = option_env!("WOODLAND_E2E_INITIAL_TREE_RESERVE");
 
 // Spendable-only queries can briefly expose both sides of a just-committed
 // transition. Retry that snapshot, but keep persistent forks fail-closed.
@@ -54,7 +59,6 @@ struct World {
 #[derive(Clone)]
 struct LiveTree {
     state: TreeState,
-    roll: tree::TreeRoll,
     health: TreeHealth,
     deployment_txid: Txid,
     record: VtxoRecord,
@@ -133,6 +137,7 @@ struct AppSnapshot {
     player_xp: u64,
     player_level: u64,
     player_next_level_xp: Option<u64>,
+    player_luck_credit: Option<u64>,
     season_xp_remaining: u64,
     player_state_expires_in_seconds: Option<i64>,
     player_rollover_margin_seconds: Option<i64>,
@@ -161,12 +166,6 @@ struct AttemptView {
     success: bool,
 }
 
-struct ExpectedChop {
-    tree_outpoint: String,
-    player_state_outpoint: String,
-    drop: bool,
-}
-
 #[derive(Clone, Copy)]
 struct TreeViewport {
     min_x: u16,
@@ -181,173 +180,6 @@ impl TreeViewport {
             && state.x <= self.max_x
             && state.y >= self.min_y
             && state.y <= self.max_y
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ChopMutation {
-    None,
-    InvertXp,
-    NonCanonicalXp,
-    NonCanonicalHealth,
-    SwapWorldGroups,
-    SwapLogXpGroups,
-    ReplaceXpGroup,
-    WrongRoll,
-    WrongLogDelta,
-    WrongXpDelta,
-    DoubleTreeMarker,
-    WrongPlayerPosition,
-    ExtraOutput,
-    WrongAnchor,
-    AssetMetadata,
-    PlayerMarkerMetadata,
-    AssetControl,
-    FundExtension,
-    SubmissionFailure,
-}
-
-impl ChopMutation {
-    fn parse(name: &str) -> Result<Self> {
-        match name {
-            "wrong-roll" => Ok(Self::WrongRoll),
-            "wrong-log-delta" => Ok(Self::WrongLogDelta),
-            "wrong-xp-delta" => Ok(Self::WrongXpDelta),
-            "noncanonical-xp-zero" => Ok(Self::NonCanonicalXp),
-            "noncanonical-health-zero" => Ok(Self::NonCanonicalHealth),
-            "double-tree-marker" => Ok(Self::DoubleTreeMarker),
-            "wrong-player-position" => Ok(Self::WrongPlayerPosition),
-            "extra-output" => Ok(Self::ExtraOutput),
-            "wrong-anchor" => Ok(Self::WrongAnchor),
-            "asset-metadata" => Ok(Self::AssetMetadata),
-            "player-marker-metadata" => Ok(Self::PlayerMarkerMetadata),
-            "asset-control" => Ok(Self::AssetControl),
-            "fund-extension" => Ok(Self::FundExtension),
-            _ => Err(anyhow!("unknown chop mutation {name}")),
-        }
-    }
-
-    fn mutate_groups(self, groups: &mut [AssetGroup], tree_asset: AssetId) {
-        match self {
-            Self::PlayerMarkerMetadata => {
-                groups[crate::protocol::PLAYER_ID_ASSET_GROUP_INDEX].metadata =
-                    Some(vec![("forged".to_owned(), "metadata".to_owned())]);
-            }
-            Self::AssetMetadata => {
-                groups[crate::protocol::LOG_ASSET_GROUP_INDEX].metadata =
-                    Some(vec![("forged".to_owned(), "metadata".to_owned())]);
-            }
-            Self::AssetControl => {
-                groups[crate::protocol::LOG_ASSET_GROUP_INDEX].control_asset =
-                    Some(AssetRef::ById(tree_asset));
-            }
-            Self::SwapWorldGroups => groups.swap(
-                crate::protocol::TREE_ASSET_GROUP_INDEX,
-                crate::protocol::LOG_ASSET_GROUP_INDEX,
-            ),
-            Self::SwapLogXpGroups => groups.swap(
-                crate::protocol::LOG_ASSET_GROUP_INDEX,
-                crate::protocol::XP_ASSET_GROUP_INDEX,
-            ),
-            Self::ReplaceXpGroup => {
-                groups[crate::protocol::XP_ASSET_GROUP_INDEX].asset_id = Some(AssetId {
-                    txid: tree_asset.txid,
-                    group_index: u16::MAX,
-                });
-            }
-            Self::DoubleTreeMarker => {
-                groups[crate::protocol::TREE_ASSET_GROUP_INDEX].outputs[0].amount = 2;
-            }
-            _ => {}
-        }
-    }
-
-    fn mutate_extensions(
-        self,
-        psbt: &mut bitcoin::Psbt,
-        success: bool,
-        previous_state: PlayerState,
-        next_state: PlayerState,
-        next_tree_roll: tree::TreeRoll,
-        map_width: u16,
-    ) -> Result<()> {
-        match self {
-            Self::InvertXp => {
-                let wrong_xp = if success {
-                    previous_state.xp
-                } else {
-                    previous_state.xp.increment()?
-                };
-                replace_extension_packet(
-                    psbt,
-                    crate::protocol::PLAYER_XP_PACKET_TYPE,
-                    &wrong_xp.encode(),
-                )?;
-            }
-            Self::NonCanonicalXp => {
-                let mut negative_zero = [0_u8; 9];
-                negative_zero[8] = 0x80;
-                replace_extension_packet(
-                    psbt,
-                    crate::protocol::PLAYER_XP_PACKET_TYPE,
-                    &negative_zero,
-                )?;
-            }
-            Self::NonCanonicalHealth => {
-                let mut negative_zero = [0_u8; 9];
-                negative_zero[8] = 0x80;
-                replace_extension_packet(
-                    psbt,
-                    crate::protocol::TREE_HEALTH_PACKET_TYPE,
-                    &negative_zero,
-                )?;
-            }
-            Self::WrongRoll => replace_extension_packet(
-                psbt,
-                crate::protocol::TREE_ROLL_PACKET_TYPE,
-                &next_tree_roll.next().encode(),
-            )?,
-            Self::WrongPlayerPosition => {
-                let mut position = next_state.position;
-                position.x = (position.x + 1) % map_width;
-                replace_extension_packet(
-                    psbt,
-                    crate::protocol::PLAYER_POSITION_PACKET_TYPE,
-                    &position.encode(),
-                )?;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn mutate_outputs(self, psbt: &mut bitcoin::Psbt) -> Result<()> {
-        match self {
-            Self::ExtraOutput => {
-                psbt.unsigned_tx.output.push(TxOut {
-                    value: Amount::ZERO,
-                    script_pubkey: ScriptBuf::new(),
-                });
-                psbt.outputs.push(Default::default());
-            }
-            Self::WrongAnchor => {
-                psbt.unsigned_tx.output[crate::protocol::CHOP_ANCHOR_OUTPUT_INDEX as usize]
-                    .script_pubkey = ScriptBuf::new();
-            }
-            Self::FundExtension => {
-                let state_index = crate::protocol::PLAYER_STATE_OUTPUT_INDEX as usize;
-                let extension_index = crate::protocol::CHOP_EXTENSION_OUTPUT_INDEX as usize;
-                let state_sats = psbt.unsigned_tx.output[state_index]
-                    .value
-                    .to_sat()
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow!("player state cannot fund extension mutation"))?;
-                psbt.unsigned_tx.output[state_index].value = Amount::from_sat(state_sats);
-                psbt.unsigned_tx.output[extension_index].value = Amount::from_sat(1);
-            }
-            _ => {}
-        }
-        Ok(())
     }
 }
 
@@ -379,11 +211,17 @@ struct TreeView {
     tree_outpoint: String,
     deployment_txid: String,
     last_attempt_txid: Option<String>,
+    /// Drop prediction exists only for the adversarial e2e build; a
+    /// production snapshot exposes observed state, never future outcomes.
+    #[cfg(feature = "regtest-e2e")]
     next_roll_bucket: u64,
+    #[cfg(feature = "regtest-e2e")]
     next_drop: bool,
     expires_in_seconds: Option<i64>,
-    respawn_at: Option<i64>,
-    respawn_in_seconds: Option<i64>,
+    /// True when the LOG reserve is empty: this tree is out until the vault
+    /// restocks its coordinate. A zero-health tree with reserve left is a
+    /// stump that refills on its next batch renewal.
+    depleted: bool,
 }
 
 #[wasm_bindgen]
@@ -700,6 +538,19 @@ impl WoodlandApp {
         self.renew_player_inner().await.map_err(js_err)?;
         self.refresh().await
     }
+
+    #[wasm_bindgen(js_name = withdrawLog)]
+    pub async fn withdraw_log(&mut self, amount: f64) -> Result<JsValue, JsValue> {
+        if amount.fract() != 0.0 || !(1.0..=u64::MAX as f64).contains(&amount) {
+            return Err(JsValue::from_str(
+                "withdraw amount must be a positive integer",
+            ));
+        }
+        self.withdraw_log_inner(amount as u64)
+            .await
+            .map_err(js_err)?;
+        self.refresh().await
+    }
     pub async fn refresh(&mut self) -> Result<JsValue, JsValue> {
         self.sync_player().await.map_err(js_err)?;
         serde_wasm_bindgen::to_value(&self.snapshot())
@@ -726,6 +577,7 @@ impl WoodlandApp {
         self.refresh().await
     }
 
+    #[cfg(feature = "regtest-e2e")]
     #[wasm_bindgen(js_name = chopExpected)]
     pub async fn chop_expected(
         &mut self,
@@ -875,6 +727,11 @@ impl WoodlandApp {
                     .collect(),
             })
             .collect();
+        #[cfg(feature = "regtest-e2e")]
+        let next_luck = self
+            .player_state
+            .as_ref()
+            .map(|player| player.state.luck.advance(player_xp));
         let trees = self
             .trees
             .iter()
@@ -882,11 +739,12 @@ impl WoodlandApp {
             .map(|tree| {
                 let logs = tree.record.asset_amount(self.world.log_asset).unwrap_or(0);
                 let xp_balance = tree.record.asset_amount(self.world.xp_asset).unwrap_or(0);
-                let (next_roll, raw_drop) = tree.roll.advance(player_xp);
+                #[cfg(feature = "regtest-e2e")]
+                let (next_roll_bucket, raw_drop) = next_luck
+                    .map(|(luck, drop)| (luck.roll.bucket(), drop))
+                    .unwrap_or((0, false));
+                #[cfg(feature = "regtest-e2e")]
                 let next_drop = raw_drop && tree.health.value() > 0 && logs > 0 && xp_balance > 0;
-                let can_regrow = tree.health.value() == 0
-                    && logs >= self.world.manifest.active_logs_per_tree
-                    && xp_balance >= self.world.manifest.active_logs_per_tree;
                 TreeView {
                     tree_id: tree.state.tree_id,
                     x: tree.state.x,
@@ -898,32 +756,15 @@ impl WoodlandApp {
                     tree_outpoint: tree.record.outpoint.to_string(),
                     deployment_txid: tree.deployment_txid.to_string(),
                     last_attempt_txid: tree.last_attempt_txid.map(|txid| txid.to_string()),
-                    next_roll_bucket: next_roll.bucket(),
+                    #[cfg(feature = "regtest-e2e")]
+                    next_roll_bucket,
+                    #[cfg(feature = "regtest-e2e")]
                     next_drop,
                     expires_in_seconds: tree.record.expires_in(now),
-                    respawn_at: can_regrow
-                        .then(|| {
-                            tree::respawn_at(
-                                tree.state,
-                                tree.record.outpoint,
-                                tree.record.created_at,
-                            )
-                        })
-                        .transpose()
-                        .ok()
-                        .flatten(),
-                    respawn_in_seconds: can_regrow
-                        .then(|| {
-                            tree::respawn_at(
-                                tree.state,
-                                tree.record.outpoint,
-                                tree.record.created_at,
-                            )
-                            .map(|deadline| (deadline - now).max(0))
-                        })
-                        .transpose()
-                        .ok()
-                        .flatten(),
+                    // A stump (health zero with reserve left) refills on its
+                    // next batch renewal; a tree with no LOG left is depleted
+                    // until the vault restocks it.
+                    depleted: logs == 0,
                 }
             })
             .collect();
@@ -963,12 +804,16 @@ impl WoodlandApp {
             player_xp,
             player_level,
             player_next_level_xp: player::xp_for_level(player_level.saturating_add(1)),
+            player_luck_credit: self
+                .player_state
+                .as_ref()
+                .map(|player| player.state.luck.credit.value()),
             season_xp_remaining: self.trees.iter().fold(0_u64, |total, tree| {
                 total.saturating_add(tree.record.asset_amount(self.world.xp_asset).unwrap_or(0))
             }),
             player_state_expires_in_seconds,
             player_rollover_margin_seconds,
-            log_drop_basis_points: tree::log_drop_basis_points(player_xp),
+            log_drop_basis_points: player::log_drop_basis_points(player_xp),
             player_logs: self
                 .player_state
                 .as_ref()
@@ -978,8 +823,7 @@ impl WoodlandApp {
                 .player_state
                 .as_ref()
                 .map(|player| player.record.outpoint.to_string()),
-            full_tree_value_sats: tree::full_tree_value_sats(self.params.dust_sats)
-                .expect("validated full tree value"),
+            full_tree_value_sats: self.params.dust_sats,
             wallet_vtxos,
             map_width: self.world.manifest.map_width,
             map_height: self.world.manifest.map_height,
@@ -1115,7 +959,6 @@ impl WoodlandApp {
                 }
                 discovered.push(LiveTree {
                     state: declared.state,
-                    roll: tree::TreeRoll::initial(declared.state),
                     health: tree::TreeHealth::new(self.world.manifest.active_logs_per_tree)?,
                     deployment_txid: declared.deployment_txid,
                     record,
@@ -1150,8 +993,6 @@ impl WoodlandApp {
             record.validate_creating_transaction(&previous_tx)?;
             let state = tree::tree_state_from_tx(&previous_tx)?
                 .ok_or_else(|| anyhow!("current tree transaction has no state packet"))?;
-            let roll = tree::tree_roll_from_tx(&previous_tx)?
-                .ok_or_else(|| anyhow!("current tree transaction has no roll packet"))?;
             let health = tree::tree_health_from_tx(&previous_tx)?
                 .ok_or_else(|| anyhow!("current tree transaction has no health packet"))?;
             let declared = declared_by_state
@@ -1159,19 +1000,9 @@ impl WoodlandApp {
                 .copied()
                 .ok_or_else(|| anyhow!("current tree has an unknown world identity"))?;
             let is_deployment = record.outpoint.txid == declared.deployment_txid;
-            let expected_vout = if is_deployment {
-                0
-            } else {
-                match previous_tx.input.len() {
-                    1 => u32::from(crate::protocol::RENEWAL_STATE_OUTPUT_INDEX),
-                    crate::protocol::CHOP_INPUT_COUNT => {
-                        u32::from(crate::protocol::TREE_OUTPUT_INDEX)
-                    }
-                    _ => return Err(anyhow!("current tree transaction has an invalid shape")),
-                }
-            };
+            let transition = tree::classify_transition(&previous_tx, is_deployment)?;
+            let expected_vout = transition.output_index();
             if record.outpoint.vout != expected_vout
-                || (is_deployment && roll != tree::TreeRoll::initial(state))
                 || (is_deployment && health.value() != self.world.manifest.active_logs_per_tree)
             {
                 return Err(anyhow!("current tree record has an invalid lineage"));
@@ -1184,11 +1015,9 @@ impl WoodlandApp {
             }
             discovered.push(LiveTree {
                 state,
-                roll,
                 health,
                 deployment_txid: declared.deployment_txid,
-                last_attempt_txid: (!is_deployment
-                    && previous_tx.input.len() == crate::protocol::CHOP_INPUT_COUNT)
+                last_attempt_txid: (transition == tree::TreeTransition::Chop)
                     .then_some(record.outpoint.txid),
                 record,
                 previous_tx: Some(previous_tx),
@@ -1300,24 +1129,17 @@ impl WoodlandApp {
         if state != current.state {
             return Err(anyhow!("selected tree successor changed identity"));
         }
-        let roll = tree::tree_roll_from_tx(&previous_tx)?
-            .ok_or_else(|| anyhow!("selected tree transaction has no roll packet"))?;
         let health = tree::tree_health_from_tx(&previous_tx)?
             .ok_or_else(|| anyhow!("selected tree transaction has no health packet"))?;
-        let expected_vout = match previous_tx.input.len() {
-            1 => u32::from(crate::protocol::RENEWAL_STATE_OUTPUT_INDEX),
-            crate::protocol::CHOP_INPUT_COUNT => u32::from(crate::protocol::TREE_OUTPUT_INDEX),
-            _ => return Err(anyhow!("selected tree transaction has an invalid shape")),
-        };
-        if record.outpoint.vout != expected_vout {
+        let transition = tree::classify_transition(&previous_tx, false)?;
+        if record.outpoint.vout != transition.output_index() {
             return Err(anyhow!("selected tree successor has an invalid output"));
         }
         self.trees[tree_index] = LiveTree {
             state,
-            roll,
             health,
             deployment_txid: current.deployment_txid,
-            last_attempt_txid: (previous_tx.input.len() == crate::protocol::CHOP_INPUT_COUNT)
+            last_attempt_txid: (transition == tree::TreeTransition::Chop)
                 .then_some(record.outpoint.txid),
             record,
             previous_tx: Some(previous_tx),
@@ -1429,6 +1251,26 @@ impl WoodlandApp {
             .ok_or_else(|| anyhow!("player activation has not issued a PLAYER_ID"))
     }
 
+    fn profile_storage_key(&self) -> Result<String> {
+        let origin = web_sys::window()
+            .ok_or_else(|| anyhow!("no browser window"))?
+            .location()
+            .origin()
+            .map_err(|error| anyhow!("read browser location origin: {error:?}"))?;
+        Ok(format!(
+            "woodland.sh:web:v1:profile:{origin}:{}",
+            self.world.genesis_txid
+        ))
+    }
+
+    fn persist_profile(&self) -> Result<()> {
+        let json = serde_json::to_string(&self.profile).context("serialize player profile")?;
+        browser_storage()?
+            .set_item(&self.profile_storage_key()?, &json)
+            .map_err(|error| anyhow!("persist player profile: {error:?}"))?;
+        Ok(())
+    }
+
     fn persist_pending_chop(&mut self, pending: PendingChop) -> Result<()> {
         let json = pending.to_json()?;
         browser_storage()?
@@ -1493,23 +1335,31 @@ impl WoodlandApp {
     }
 
     async fn resume_pending_chop_inner(&mut self) -> Result<bool> {
-        let pending_before_sync = self.pending_chop.clone();
-        self.sync().await?;
+        for attempt in 0..RESUME_RECONCILE_ATTEMPTS {
+            let pending_before_sync = self.pending_chop.clone();
+            self.sync().await?;
+            if self.pending_chop.is_none() {
+                let Some(previously_pending) = pending_before_sync else {
+                    return Ok(false);
+                };
+                let expected_txid = previously_pending.txid()?;
+                let accepted = self
+                    .player_state
+                    .as_ref()
+                    .is_some_and(|state| state.record.outpoint.txid == expected_txid)
+                    && self
+                        .trees
+                        .iter()
+                        .find(|tree| tree.state.tree_id == previously_pending.tree_id)
+                        .is_some_and(|tree| tree.record.outpoint.txid == expected_txid);
+                return Ok(accepted);
+            }
+            if attempt + 1 < RESUME_RECONCILE_ATTEMPTS {
+                txbuild::sleep_ms(RESUME_RECONCILE_DELAY_MS).await;
+            }
+        }
         let Some(pending) = self.pending_chop.clone() else {
-            let Some(previously_pending) = pending_before_sync else {
-                return Ok(false);
-            };
-            let expected_txid = previously_pending.txid()?;
-            let accepted = self
-                .player_state
-                .as_ref()
-                .is_some_and(|state| state.record.outpoint.txid == expected_txid)
-                && self
-                    .trees
-                    .iter()
-                    .find(|tree| tree.state.tree_id == previously_pending.tree_id)
-                    .is_some_and(|tree| tree.record.outpoint.txid == expected_txid);
-            return Ok(accepted);
+            return Ok(false);
         };
         let contract = self.player_contract()?;
         let (expected_ark, expected_checkpoints) = pending.decode_psbts()?;
@@ -1611,17 +1461,17 @@ impl WoodlandApp {
             },
         )
         .map_err(|error| anyhow!("attach PLAYER_ID issuance packet: {error}"))?;
+        let identity =
+            player::derive_player_identity(self.keys.owner_pk(), self.world.genesis_txid);
         player::attach_player_state_packets(
             &mut activation.ark_tx,
             PlayerState {
-                identity: player::derive_player_identity(
-                    self.keys.owner_pk(),
-                    self.world.genesis_txid,
-                ),
+                identity,
                 position: player::PlayerPosition {
                     x: crate::world::PLAYER_SPAWN_X,
                     y: crate::world::PLAYER_SPAWN_Y,
                 },
+                luck: player::PlayerLuck::initial(identity),
                 xp: player::PlayerXp::new(0),
             },
         )?;
@@ -1641,6 +1491,10 @@ impl WoodlandApp {
             }
         }
         self.profile.player_asset = Some(player_asset.to_string());
+        // Persist the derived PLAYER_ID before submission: the JavaScript
+        // side only writes the profile after the action settles, so a crash
+        // in between would otherwise strand the activated state.
+        self.persist_profile()?;
         txbuild::run_tx(
             &self.keys,
             &self.rest,
@@ -1664,6 +1518,73 @@ impl WoodlandApp {
         }
         Ok(())
     }
+    async fn withdraw_log_inner(&mut self, amount: u64) -> Result<()> {
+        self.sync_player().await?;
+        let state = self
+            .player_state
+            .clone()
+            .ok_or_else(|| anyhow!("activate the player before withdrawing"))?;
+        let player_asset = self.require_player_asset()?;
+        let wallet = player_vtxo(&self.keys, &self.params)?;
+        let funding = self
+            .wallet_records
+            .iter()
+            .filter(|record| {
+                record.assets.is_empty() && record.amount_sats == self.params.dust_sats
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let [funding] = funding.as_slice() else {
+            return Err(anyhow!(
+                "keep exactly one {}-sat wallet VTXO for withdrawal funding",
+                self.params.dust_sats
+            ));
+        };
+        let destination =
+            bitcoin::Address::from_script(&wallet.script_pubkey(), self.params.network)
+                .map_err(|error| anyhow!("derive wallet address: {error}"))?;
+        let funding_previous_tx = self
+            .rest
+            .get_virtual_txs(&[funding.outpoint.txid])
+            .await?
+            .remove(&funding.outpoint.txid)
+            .ok_or_else(|| anyhow!("indexer omitted the funding transaction"))?;
+        let prepared = crate::chop::prepare_withdraw(
+            &self.keys,
+            &self.info,
+            &state.contract,
+            player_asset,
+            &state.record,
+            &state.previous_tx,
+            state.state,
+            funding,
+            &funding_previous_tx,
+            &wallet,
+            amount,
+            destination,
+        )?;
+        let txid = prepared.ark_tx.unsigned_tx.compute_txid();
+        let (returned_ark, _) = self
+            .emulator
+            .submit_tx(&prepared.ark_tx, &prepared.checkpoint_txs)
+            .await
+            .context("submit withdraw to emulator")?;
+        if returned_ark.unsigned_tx != prepared.ark_tx.unsigned_tx {
+            return Err(anyhow!("emulator changed the submitted withdraw"));
+        }
+        wait_for_vtxo(
+            &self.rest,
+            &state.contract.vtxo.script_pubkey().to_hex_string(),
+            OutPoint {
+                txid,
+                vout: u32::from(crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX),
+            },
+        )
+        .await?;
+        self.sync_player().await?;
+        Ok(())
+    }
+
     async fn renew_player_inner(&mut self) -> Result<()> {
         self.sync_player().await?;
         let state = self
@@ -1680,35 +1601,23 @@ impl WoodlandApp {
             &state.previous_tx,
             &state.contract,
             player_asset,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )?;
-        let cosigner = Keys::generate()?;
-        let prepared = crate::renewal::bind(
-            &self.keys,
-            prepared,
-            &state.previous_tx,
-            cosigner.keypair.public_key(),
-        )?;
-        let approved = crate::renewal::approve(
-            &self.keys,
-            &self.emulator,
-            self.emulator_params.signer_pk,
-            prepared,
-        )
-        .await?;
         let services = crate::batch::BatchServices::connect(
             &self.world.manifest.arkade_service_url,
             self.emulator.clone(),
             self.params.clone(),
+            self.world.manifest.pins(self.params.network)?,
         )
         .await?;
-        let outcome = crate::batch::join_batch_with_intent(
-            &services,
-            &self.keys,
-            &cosigner,
-            self.emulator_params.signer_pk,
-            &approved,
-        )
-        .await?;
+        let outcome = services
+            .settle_renewal(
+                &self.keys,
+                self.emulator_params.signer_pk,
+                prepared,
+                &state.previous_tx,
+            )
+            .await?;
         let renewed = wait_for_vtxo(
             &self.rest,
             &state.contract.vtxo.script_pubkey().to_hex_string(),
@@ -1812,35 +1721,8 @@ impl WoodlandApp {
             tree.record.validate_creating_transaction(&previous_tx)?;
             tree.previous_tx = Some(previous_tx);
         }
-        let player_logs_before = state.record.asset_amount(self.world.log_asset).unwrap_or(0);
-        let player_xp_balance_before = state.record.asset_amount(self.world.xp_asset).unwrap_or(0);
-        if state.state.xp.value() != player_xp_balance_before {
-            return Err(anyhow!("player XP counter is not backed by the XP asset"));
-        }
-        require_asset_amount(&state.record, player_asset, 1, "PLAYER_ID")?;
-        let tree_logs_before = require_nonzero_asset(
-            &tree.record,
-            self.world.log_asset,
-            "tree has no LOG reserve",
-        )?;
-        let tree_xp_balance_before =
-            require_nonzero_asset(&tree.record, self.world.xp_asset, "tree has no XP")?;
-        if tree.health.value() == 0 {
-            return Err(anyhow!("tree is a stump awaiting regrowth"));
-        }
-        require_asset_amount(&tree.record, self.world.tree_asset, 1, "tree marker")?;
-        let tree_value = tree::full_tree_value_sats(self.params.dust_sats)?;
-        if tree.record.amount_sats != tree_value {
-            return Err(anyhow!("tree does not retain its fixed value"));
-        }
-        let now = crate::arkade::now_unix();
-        for (record, label) in [(&state.record, "player state"), (&tree.record, "tree")] {
-            record
-                .ensure_live(now, crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS)
-                .with_context(|| format!("{label} input"))?;
-        }
-        let (next_tree_roll, success) = tree.roll.advance(state.state.xp.value());
         if let Some(expected) = expected {
+            let (_, success) = state.state.luck.advance(state.state.xp.value());
             if tree.record.outpoint.to_string() != expected.tree_outpoint
                 || state.record.outpoint.to_string() != expected.player_state_outpoint
                 || success != expected.drop
@@ -1850,157 +1732,42 @@ impl WoodlandApp {
                 ));
             }
         }
-        let reward = u64::from(success);
-        let log_reward = if matches!(mutation, ChopMutation::WrongLogDelta) {
-            1 - reward
-        } else {
-            reward
-        };
-        let xp_reward = if matches!(mutation, ChopMutation::WrongXpDelta) {
-            1 - reward
-        } else {
-            reward
-        };
-        let tree_logs_after = tree_logs_before - log_reward;
-        let player_logs_after = player_logs_before
-            .checked_add(log_reward)
-            .ok_or_else(|| anyhow!("player LOG balance overflow"))?;
-        let tree_xp_balance_after = tree_xp_balance_before - xp_reward;
-        let player_xp_balance_after = player_xp_balance_before
-            .checked_add(xp_reward)
-            .ok_or_else(|| anyhow!("player XP balance overflow"))?;
-        let next_xp = if success {
-            state.state.xp.increment()?
-        } else {
-            state.state.xp
-        };
-        let next_state = PlayerState {
-            xp: next_xp,
-            ..state.state
-        };
-
-        let inputs = [
-            player::player_state_vtxo_input(&state.record, &state.contract, player_asset)?,
-            tree_vtxo_input(&tree.record, &self.world.contract)?,
-        ];
-        let mut chop = build_offchain_transactions(
-            &[
-                SendReceiver::bitcoin(
-                    state.contract.vtxo.to_ark_address(),
-                    Amount::from_sat(self.params.dust_sats),
-                ),
-                SendReceiver::bitcoin(
-                    self.world.contract.vtxo.to_ark_address(),
-                    Amount::from_sat(tree_value),
-                ),
-            ],
-            &state.contract.vtxo.to_ark_address(),
-            &inputs,
+        let prepared = crate::chop::prepare_chop(
+            &self.keys,
             &self.info,
-        )
-        .map_err(|error| anyhow!("build chop transaction: {error}"))?;
-        if chop.ark_tx.unsigned_tx.output.len()
-            != crate::protocol::CHOP_OUTPUT_COUNT_BEFORE_EXTENSION
-        {
-            return Err(anyhow!("chop builder produced an unexpected change output"));
-        }
-
-        let mut log_inputs = Vec::new();
-        if player_logs_before > 0 {
-            log_inputs.push((
-                crate::protocol::PLAYER_STATE_INPUT_INDEX as u16,
-                player_logs_before,
-            ));
-        }
-        log_inputs.push((crate::protocol::TREE_INPUT_INDEX as u16, tree_logs_before));
-        let mut log_outputs = Vec::new();
-        if player_logs_after > 0 {
-            log_outputs.push((
-                crate::protocol::PLAYER_STATE_OUTPUT_INDEX,
-                player_logs_after,
-            ));
-        }
-        if tree_logs_after > 0 {
-            log_outputs.push((crate::protocol::TREE_OUTPUT_INDEX, tree_logs_after));
-        }
-        let mut xp_inputs = Vec::new();
-        if player_xp_balance_before > 0 {
-            xp_inputs.push((
-                crate::protocol::PLAYER_STATE_INPUT_INDEX as u16,
-                player_xp_balance_before,
-            ));
-        }
-        xp_inputs.push((
-            crate::protocol::TREE_INPUT_INDEX as u16,
-            tree_xp_balance_before,
-        ));
-        let mut xp_outputs = Vec::new();
-        if player_xp_balance_after > 0 {
-            xp_outputs.push((
-                crate::protocol::PLAYER_STATE_OUTPUT_INDEX,
-                player_xp_balance_after,
-            ));
-        }
-        if tree_xp_balance_after > 0 {
-            xp_outputs.push((crate::protocol::TREE_OUTPUT_INDEX, tree_xp_balance_after));
-        }
-        let mut groups = vec![
-            transfer_group(
+            &crate::chop::ChopWorld {
+                contract: &self.world.contract,
+                tree_asset: self.world.tree_asset,
+                log_asset: self.world.log_asset,
+                xp_asset: self.world.xp_asset,
+                dust_sats: self.params.dust_sats,
+                map_width: self.world.manifest.map_width,
+            },
+            &crate::chop::PlayerChopState {
+                record: &state.record,
+                previous_tx: &state.previous_tx,
+                contract: &state.contract,
+                state: state.state,
                 player_asset,
-                vec![(crate::protocol::PLAYER_STATE_INPUT_INDEX as u16, 1)],
-                vec![(crate::protocol::PLAYER_STATE_OUTPUT_INDEX, 1)],
-            ),
-            transfer_group(
-                self.world.tree_asset,
-                vec![(crate::protocol::TREE_INPUT_INDEX as u16, 1)],
-                vec![(crate::protocol::TREE_OUTPUT_INDEX, 1)],
-            ),
-            transfer_group(self.world.log_asset, log_inputs, log_outputs),
-            transfer_group(self.world.xp_asset, xp_inputs, xp_outputs),
-        ];
-        mutation.mutate_groups(&mut groups, self.world.tree_asset);
-        ark_core::asset::packet::add_asset_packet_to_psbt(&mut chop.ark_tx, &Packet { groups })
-            .map_err(|error| anyhow!("attach chop asset packet: {error}"))?;
-        player::attach_player_chop_context(
-            &mut chop.ark_tx,
-            &chop.checkpoint_txs,
-            &state.contract,
-            &self.world.contract,
-            [
-                &state.previous_tx,
-                tree.previous_tx
+            },
+            &crate::chop::TreeChopState {
+                record: &tree.record,
+                previous_tx: tree
+                    .previous_tx
                     .as_ref()
                     .expect("selected tree transaction was loaded"),
-            ],
-            next_state,
-            next_tree_roll,
+                health: tree.health,
+            },
+            mutation,
         )?;
-        mutation.mutate_extensions(
-            &mut chop.ark_tx,
-            success,
-            state.state,
-            next_state,
-            next_tree_roll,
-            self.world.manifest.map_width,
-        )?;
-        if chop.ark_tx.unsigned_tx.output.len() != crate::protocol::CHOP_OUTPUT_COUNT {
-            return Err(anyhow!("chop transaction has an invalid output count"));
-        }
-        mutation.mutate_outputs(&mut chop.ark_tx)?;
-        sign_ark_transaction(
-            |_, message| Ok(self.keys.sign_msg(&message)),
-            &mut chop.ark_tx,
-            crate::protocol::PLAYER_STATE_INPUT_INDEX,
-        )
-        .map_err(|error| anyhow!("sign player Ark input: {error}"))?;
-        sign_checkpoint_transaction(
-            |_, message| Ok(self.keys.sign_msg(&message)),
-            &mut chop.checkpoint_txs[crate::protocol::PLAYER_STATE_INPUT_INDEX],
-        )
-        .map_err(|error| anyhow!("sign player checkpoint: {error}"))?;
+        let success = prepared.success;
+        let player_logs_before = state.record.asset_amount(self.world.log_asset).unwrap_or(0);
+        let player_xp_balance_before = state.record.asset_amount(self.world.xp_asset).unwrap_or(0);
+        let tree_logs_before = tree.record.asset_amount(self.world.log_asset).unwrap_or(0);
+        let tree_xp_balance_before = tree.record.asset_amount(self.world.xp_asset).unwrap_or(0);
 
-        let expected_ark = chop.ark_tx.clone();
-        let expected_checkpoints = chop.checkpoint_txs.clone();
+        let expected_ark = prepared.ark_tx.clone();
+        let expected_checkpoints = prepared.checkpoint_txs.clone();
         let chop_tx = expected_ark.unsigned_tx.clone();
         let chop_txid = chop_tx.compute_txid();
         let recoverable_submission = matches!(
@@ -2082,16 +1849,14 @@ impl WoodlandApp {
             },
         )
         .await?;
+        let next_state = player::player_state_from_tx(&chop_tx)?
+            .ok_or_else(|| anyhow!("chop transaction omitted player state"))?;
         PlayerChopTransition {
             previous_state: state.state,
-            next_state: player::player_state_from_tx(&chop_tx)?
-                .ok_or_else(|| anyhow!("chop transaction omitted player state"))?,
+            next_state,
             previous_tree_state: tree.state,
             next_tree_state: tree::tree_state_from_tx(&chop_tx)?
                 .ok_or_else(|| anyhow!("chop transaction omitted tree state"))?,
-            previous_tree_roll: tree.roll,
-            next_tree_roll: tree::tree_roll_from_tx(&chop_tx)?
-                .ok_or_else(|| anyhow!("chop transaction omitted tree roll"))?,
             previous_tree_health: tree.health,
             next_tree_health: tree::tree_health_from_tx(&chop_tx)?
                 .ok_or_else(|| anyhow!("chop transaction omitted tree health"))?,
@@ -2115,7 +1880,6 @@ impl WoodlandApp {
         .validate()?;
         self.trees[tree_index] = LiveTree {
             state: tree.state,
-            roll: next_tree_roll,
             health: tree::tree_health_from_tx(&chop_tx)?
                 .ok_or_else(|| anyhow!("accepted chop omitted tree health"))?,
             deployment_txid: tree.deployment_txid,
@@ -2136,19 +1900,38 @@ impl WoodlandApp {
     }
 }
 
+fn expected_initial_tree_reserve(world: &World) -> Result<u64> {
+    #[cfg(feature = "regtest-e2e")]
+    if let Some(raw) = E2E_INITIAL_TREE_RESERVE {
+        let reserve = raw
+            .parse::<u64>()
+            .context("WOODLAND_E2E_INITIAL_TREE_RESERVE must be a positive whole number")?;
+        if !(tree::LOGS_PER_TREE..=world.manifest.log_reserve_per_tree).contains(&reserve) {
+            return Err(anyhow!(
+                "WOODLAND_E2E_INITIAL_TREE_RESERVE must be between {} and {}",
+                tree::LOGS_PER_TREE,
+                world.manifest.log_reserve_per_tree
+            ));
+        }
+        return Ok(reserve);
+    }
+    Ok(world.manifest.log_reserve_per_tree)
+}
+
 fn validate_initial_tree_record(
     record: &VtxoRecord,
     world: &World,
     state: TreeState,
     deployment_txid: Txid,
 ) -> Result<()> {
+    let initial_tree_reserve = expected_initial_tree_reserve(world)?;
     if record.outpoint
         != (OutPoint {
             txid: deployment_txid,
             vout: 0,
         })
         || record.script != world.contract.vtxo.script_pubkey()
-        || record.amount_sats != tree::full_tree_value_sats(world.manifest.dust_sats)?
+        || record.amount_sats != world.manifest.dust_sats
         || record.assets.len() != 3
     {
         return Err(anyhow!(
@@ -2160,13 +1943,13 @@ fn validate_initial_tree_record(
     require_asset_amount(
         record,
         world.log_asset,
-        world.manifest.log_reserve_per_tree,
+        initial_tree_reserve,
         "tree LOG reserve",
     )?;
     require_asset_amount(
         record,
         world.xp_asset,
-        world.manifest.xp_per_tree,
+        initial_tree_reserve,
         "tree XP reserve",
     )
 }
@@ -2177,7 +1960,8 @@ async fn load_current_tree_records(
     cached: &[LiveTree],
 ) -> Result<Vec<VtxoRecord>> {
     if cached.is_empty() {
-        let value = tree::full_tree_value_sats(world.manifest.dust_sats)?;
+        let value = world.manifest.dust_sats;
+        let initial_tree_reserve = expected_initial_tree_reserve(world)?;
         return Ok(world
             .declared_trees
             .iter()
@@ -2195,11 +1979,11 @@ async fn load_current_tree_records(
                     },
                     Asset {
                         asset_id: world.log_asset,
-                        amount: world.manifest.log_reserve_per_tree,
+                        amount: initial_tree_reserve,
                     },
                     Asset {
                         asset_id: world.xp_asset,
-                        amount: world.manifest.xp_per_tree,
+                        amount: initial_tree_reserve,
                     },
                 ],
                 created_at: None,
@@ -2328,7 +2112,7 @@ fn select_tree_records(
             .count();
         let logs = record.asset_amount(world.log_asset).unwrap_or(0);
         let xp_balance = record.asset_amount(world.xp_asset).unwrap_or(0);
-        if record.amount_sats != tree::full_tree_value_sats(dust_sats)?
+        if record.amount_sats != dust_sats
             || tree_entries != 1
             || log_entries > 1
             || xp_entries > 1
@@ -2397,119 +2181,6 @@ fn player_vtxo(keys: &Keys, params: &ServerParams) -> Result<ark_core::Vtxo> {
     txbuild::player_vtxo(keys, params)
 }
 
-fn transfer_group(
-    asset_id: AssetId,
-    inputs: Vec<(u16, u64)>,
-    outputs: Vec<(u16, u64)>,
-) -> AssetGroup {
-    AssetGroup {
-        asset_id: Some(asset_id),
-        control_asset: None,
-        metadata: None,
-        inputs: inputs
-            .into_iter()
-            .map(|(input_index, amount)| AssetInput {
-                input_index,
-                amount,
-            })
-            .collect(),
-        outputs: outputs
-            .into_iter()
-            .map(|(output_index, amount)| AssetOutput {
-                output_index,
-                amount,
-            })
-            .collect(),
-    }
-}
-
-fn replace_extension_packet(
-    psbt: &mut bitcoin::Psbt,
-    packet_type: u8,
-    replacement: &[u8],
-) -> Result<()> {
-    let output_index = psbt
-        .unsigned_tx
-        .output
-        .iter()
-        .position(|output| ark_core::extension::is_extension(&output.script_pubkey))
-        .ok_or_else(|| anyhow!("transaction has no extension output"))?;
-    let payload = ark_core::extension::extension_payload(
-        &psbt.unsigned_tx.output[output_index].script_pubkey,
-    )
-    .ok_or_else(|| anyhow!("transaction extension payload is invalid"))?;
-    let packets = ark_core::extension::iter_packets(payload).context("parse extension packets")?;
-    let mut encoded = ark_core::extension::MAGIC_BYTES.to_vec();
-    let mut replaced = false;
-    for (current_type, current_payload) in packets {
-        let current_payload = if current_type == packet_type {
-            replaced = true;
-            replacement
-        } else {
-            current_payload
-        };
-        encoded.push(current_type);
-        ark_core::extension::encode_uvarint(&mut encoded, current_payload.len() as u64);
-        encoded.extend_from_slice(current_payload);
-    }
-    if !replaced {
-        return Err(anyhow!("extension packet {packet_type} is missing"));
-    }
-    psbt.unsigned_tx.output[output_index].script_pubkey = op_return_script(&encoded);
-    Ok(())
-}
-
-fn op_return_script(data: &[u8]) -> ScriptBuf {
-    let mut script = vec![bitcoin::opcodes::all::OP_RETURN.to_u8()];
-    let len = data.len();
-    if len <= 75 {
-        script.push(len as u8);
-    } else if len <= 0xff {
-        script.extend_from_slice(&[0x4c, len as u8]);
-    } else if len <= 0xffff {
-        script.push(0x4d);
-        script.extend_from_slice(&(len as u16).to_le_bytes());
-    } else {
-        script.push(0x4e);
-        script.extend_from_slice(&(len as u32).to_le_bytes());
-    }
-    script.extend_from_slice(data);
-    ScriptBuf::from_bytes(script)
-}
-
-fn tree_vtxo_input(record: &VtxoRecord, contract: &TreeContract) -> Result<VtxoInput> {
-    if record.script != contract.vtxo.script_pubkey() {
-        return Err(anyhow!("tree record does not match the covenant script"));
-    }
-    let control_block = contract
-        .vtxo
-        .get_spend_info(contract.chop_spend_script.clone())
-        .map_err(|error| anyhow!("tree spend info: {error}"))?;
-    let assets = record
-        .assets
-        .iter()
-        .map(|asset| {
-            if asset.amount == 0 {
-                return Err(anyhow!(
-                    "indexed tree record has zero asset {}",
-                    asset.asset_id
-                ));
-            }
-            Ok(asset.clone())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(VtxoInput::new(
-        contract.chop_spend_script.clone(),
-        None,
-        control_block,
-        contract.vtxo.tapscripts(),
-        contract.vtxo.script_pubkey(),
-        Amount::from_sat(record.amount_sats),
-        record.outpoint,
-        assets,
-    ))
-}
-
 async fn wait_for_vtxo(rest: &ArkadeRest, script: &str, outpoint: OutPoint) -> Result<VtxoRecord> {
     for _ in 0..INDEX_ATTEMPTS {
         let records = rest.get_vtxos(script, "spendableOnly").await?;
@@ -2522,26 +2193,6 @@ async fn wait_for_vtxo(rest: &ArkadeRest, script: &str, outpoint: OutPoint) -> R
         txbuild::sleep_ms(INDEX_POLL_MS).await;
     }
     Err(anyhow!("indexer did not expose VTXO {outpoint}"))
-}
-
-fn require_nonzero_asset(record: &VtxoRecord, asset_id: AssetId, message: &str) -> Result<u64> {
-    record
-        .asset_amount(asset_id)
-        .filter(|amount| *amount > 0)
-        .ok_or_else(|| anyhow!(message.to_string()))
-}
-
-fn require_asset_amount(
-    record: &VtxoRecord,
-    asset_id: AssetId,
-    expected: u64,
-    label: &str,
-) -> Result<()> {
-    let actual = record.asset_amount(asset_id).unwrap_or(0);
-    if actual != expected {
-        return Err(anyhow!("{label} amount is {actual}, expected {expected}"));
-    }
-    Ok(())
 }
 
 fn browser_storage() -> Result<web_sys::Storage> {

@@ -6,9 +6,10 @@
 pub const TREE_STATE_PACKET_TYPE: u8 = 2;
 pub const PLAYER_IDENTITY_PACKET_TYPE: u8 = 3;
 pub const PLAYER_POSITION_PACKET_TYPE: u8 = 4;
-pub const TREE_ROLL_PACKET_TYPE: u8 = 5;
+pub const PLAYER_ROLL_PACKET_TYPE: u8 = 5;
 pub const PLAYER_XP_PACKET_TYPE: u8 = 6;
 pub const TREE_HEALTH_PACKET_TYPE: u8 = 7;
+pub const PLAYER_LUCK_CREDIT_PACKET_TYPE: u8 = 8;
 
 pub const PLAYER_STATE_INPUT_INDEX: usize = 0;
 pub const TREE_INPUT_INDEX: usize = 1;
@@ -29,13 +30,6 @@ pub const CHOP_ASSET_GROUP_COUNT: usize = 4;
 pub const ACTIVATION_STATE_OUTPUT_INDEX: u16 = 0;
 pub const ACTIVATION_OUTPUT_COUNT: usize = 3;
 
-pub const REGROW_TREE_INPUT_INDEX: usize = 0;
-pub const REGROW_TREE_OUTPUT_INDEX: u16 = 0;
-pub const REGROW_EXTENSION_OUTPUT_INDEX: u16 = 1;
-pub const REGROW_ANCHOR_OUTPUT_INDEX: u16 = 2;
-pub const REGROW_INPUT_COUNT: usize = 1;
-pub const REGROW_OUTPUT_COUNT: usize = 3;
-
 /// Batch-renewal intents carry the fake message input at index zero, so the
 /// renewed state VTXO is always physical input one. The proof has no anchor.
 pub const RENEWAL_STATE_INPUT_INDEX: usize = 1;
@@ -43,6 +37,34 @@ pub const RENEWAL_STATE_OUTPUT_INDEX: u16 = 0;
 pub const RENEWAL_EXTENSION_OUTPUT_INDEX: u16 = 1;
 pub const RENEWAL_INPUT_COUNT: usize = 2;
 pub const RENEWAL_OUTPUT_COUNT: usize = 2;
+
+/// Restock replaces one depleted tree in a single transaction: the dead tree
+/// (zero LOG reserve) and the supply vault in, the fresh tree at the same
+/// coordinate and the vault change out. The extension carries the new tree's
+/// state and health packets.
+pub const RESTOCK_TREE_INPUT_INDEX: usize = 0;
+pub const RESTOCK_VAULT_INPUT_INDEX: usize = 1;
+pub const RESTOCK_TREE_OUTPUT_INDEX: u16 = 0;
+pub const RESTOCK_VAULT_OUTPUT_INDEX: u16 = 1;
+pub const RESTOCK_EXTENSION_OUTPUT_INDEX: u16 = 2;
+pub const RESTOCK_ANCHOR_OUTPUT_INDEX: u16 = 3;
+pub const RESTOCK_INPUT_COUNT: usize = 2;
+pub const RESTOCK_OUTPUT_COUNT: usize = 4;
+pub const RESTOCK_ASSET_GROUP_COUNT: usize = 3;
+
+/// Owner-authorized LOG withdrawal: player state plus a wallet dust input in,
+/// the LOG-depleted player state, the withdrawn LOG destination, extension,
+/// and anchor out. XP, sats, PLAYER_ID, and all packets stay in the state, so
+/// XP can never move.
+pub const WITHDRAW_STATE_INPUT_INDEX: usize = 0;
+pub const WITHDRAW_FUNDING_INPUT_INDEX: usize = 1;
+pub const WITHDRAW_STATE_OUTPUT_INDEX: u16 = 0;
+pub const WITHDRAW_DESTINATION_OUTPUT_INDEX: u16 = 1;
+pub const WITHDRAW_EXTENSION_OUTPUT_INDEX: u16 = 2;
+pub const WITHDRAW_ANCHOR_OUTPUT_INDEX: u16 = 3;
+pub const WITHDRAW_INPUT_COUNT: usize = 2;
+pub const WITHDRAW_OUTPUT_COUNT: usize = 4;
+pub const WITHDRAW_ASSET_GROUP_COUNT: usize = 3;
 
 #[cfg(test)]
 mod tests {

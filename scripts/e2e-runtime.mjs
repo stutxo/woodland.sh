@@ -4,13 +4,53 @@ import net from 'node:net';
 import path from 'node:path';
 
 export const E2E_PROFILE = process.env.WOODLAND_E2E_PROFILE || 'full';
-if (!['smoke', 'full', 'soak'].includes(E2E_PROFILE)) {
-  throw new Error(`WOODLAND_E2E_PROFILE must be smoke, full, or soak; got ${E2E_PROFILE}`);
+if (!['smoke', 'full', 'soak', 'restock'].includes(E2E_PROFILE)) {
+  throw new Error(`WOODLAND_E2E_PROFILE must be smoke, full, soak, or restock; got ${E2E_PROFILE}`);
 }
 export const FULL_E2E = E2E_PROFILE === 'full';
 export const SOAK_E2E = E2E_PROFILE === 'soak';
+export const RESTOCK_E2E = E2E_PROFILE === 'restock';
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export function decodeAssetMetadata(hex) {
+  if (typeof hex !== 'string' || hex.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(hex)) {
+    throw new Error('asset metadata must be an even-length hex string');
+  }
+  const data = Buffer.from(hex, 'hex');
+  let offset = 0;
+  const readUvarint = () => {
+    let value = 0;
+    let factor = 1;
+    for (let byteIndex = 0; byteIndex < 10; byteIndex += 1) {
+      if (offset >= data.length) throw new Error('truncated asset metadata uvarint');
+      const byte = data[offset];
+      offset += 1;
+      value += (byte & 0x7f) * factor;
+      if ((byte & 0x80) === 0) {
+        if (!Number.isSafeInteger(value)) throw new Error('asset metadata uvarint overflows');
+        return value;
+      }
+      factor *= 128;
+    }
+    throw new Error('asset metadata uvarint is too long');
+  };
+  const readText = () => {
+    const length = readUvarint();
+    if (offset + length > data.length) throw new Error('truncated asset metadata string');
+    const value = data.subarray(offset, offset + length).toString('utf8');
+    offset += length;
+    return value;
+  };
+  const entries = new Map();
+  const count = readUvarint();
+  for (let index = 0; index < count; index += 1) {
+    const key = readText();
+    if (entries.has(key)) throw new Error(`duplicate asset metadata key ${key}`);
+    entries.set(key, readText());
+  }
+  if (offset !== data.length) throw new Error('asset metadata has trailing bytes');
+  return entries;
+}
 
 const managedProcesses = new Set();
 const stopPromises = new WeakMap();
@@ -30,7 +70,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 
 export function startProcess(command, args, cwd) {
   // A dedicated process group lets stopProcess signal descendants too:
-  // geckodriver's Firefox children and the web server's maintenance watcher
+  // geckodriver's Firefox children and the web server's renewal watcher
   // must not survive a failed run.
   const child = spawn(command, args, {
     cwd,
@@ -106,7 +146,7 @@ export async function webdriverRequest(
   method,
   pathName,
   body,
-  timeoutMs = 130_000,
+  timeoutMs = Number(process.env.WOODLAND_E2E_DRIVER_TIMEOUT_MS || 600_000),
 ) {
   const response = await fetch(`${driverUrl}${pathName}`, {
     method,
@@ -141,11 +181,25 @@ export async function saveScreenshot(driverUrl, sessionId, filename) {
 export async function waitFor(label, inspect, accept, timeoutMs = 120_000) {
   const deadline = Date.now() + timeoutMs;
   let last;
+  let lastError;
   while (Date.now() < deadline) {
-    last = await inspect();
+    try {
+      last = await inspect();
+      lastError = undefined;
+    } catch (error) {
+      // Transient transport failures (driver busy, fetch timeouts while a
+      // page's main thread is blocked by a long sync) must not end the poll:
+      // retry until the deadline like any unmet condition.
+      lastError = error;
+      await sleep(250);
+      continue;
+    }
     if (last?.error) throw new Error(`${label} failed: ${last.error}\n${last.log || ''}`);
     if (accept(last)) return last;
     await sleep(250);
+  }
+  if (lastError && last === undefined) {
+    throw new Error(`${label} timed out after repeated failures: ${lastError}`);
   }
   throw new Error(`${label} timed out: ${JSON.stringify(last)}`);
 }

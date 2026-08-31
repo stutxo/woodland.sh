@@ -9,10 +9,10 @@ permissionless activation, owner renewal, and fixed world LOG/XP supply.
 
 The world contains:
 
-- one recursive VTXO per player, holding 330 sats, one PLAYER_ID, state packets,
-  LOG, and XP;
-- one recursive VTXO per tree, holding TREE, remaining LOG/XP, health, and
-  roll;
+- one recursive VTXO per player, holding 330 sats, one PLAYER_ID, identity,
+  position, player luck, LOG, and XP;
+- one recursive VTXO per tree, holding TREE, remaining LOG/XP, and health;
+- one supply-vault VTXO holding the undistributed LOG and XP;
 - no global player reserve, PLAYER_TICKET, allocator, or protocol registry.
 
 A swing spends one player and one tree. Different players on different trees
@@ -28,7 +28,7 @@ continuous physics simulation.
 State ownership stays explicit:
 
 ```text
-Arkade:         player/tree lineage, inventory, XP, health, roll
+Arkade:         player/tree lineage, inventory, XP, health, player luck
 browser:        camera, walking animation, focused tree
 server durable: signed registration and renewal delegation consent
 server live:    signed presence, bounded chat, replay clocks
@@ -57,15 +57,21 @@ user-owned 330-sat VTXO, issues one unique uncontrolled marker, and creates one
 owner-specific state. Capacity is bounded by Arkade throughput and
 client/indexer resources, not a protocol ticket count.
 
-Season rewards remain fixed for the expanded world:
+Season rewards remain fixed:
 
 ```text
-21,000 LOG
-21,000 XP
+21,000,000 LOG
+21,000,000 XP
 ```
 
-XP moves into player state rather than disappearing, so supply conservation
-also authenticates XP. Unlimited players do not imply unlimited rewards.
+The 2,100 trees hold 1,000 of each at genesis (2,100,000 total) and the supply
+vault holds the remaining 18,900,000 of each. Every restock draws exactly one
+tree reserve from the vault, so the vault funds 18,900 full tree replacements
+per asset before the undistributed supply runs out; each tree's 330-sat
+backing is recycled inside the restock transaction, so replacements need no
+new world funding. XP moves into player state rather than disappearing, and it
+is soulbound — supply conservation also authenticates XP because no covenant
+path transfers it. Unlimited players do not imply unlimited rewards.
 
 ## Transaction Cost
 
@@ -102,8 +108,10 @@ browser participates directly in Arkade batch signing. The optional watchtower
 uses a separate exact-self-send leaf and can be horizontally sharded by owner,
 PLAYER_ID, or outpoint.
 
-Tree renewal and regrowth contend per tree. The maintenance watcher can process
-independent trees concurrently with a fixed concurrency bound.
+Tree renewal contends per tree, and stump refills ride the same renewal path.
+The renewal watcher can process independent trees concurrently with a fixed
+concurrency bound. Restocks pair one depleted tree with the single vault
+lineage, so concurrent restocks serialize on the vault VTXO.
 Delegated player renewals are exact per-player self-sends. The server processes
 due delegations sequentially, so they share batch/service capacity but no
 gameplay input.
@@ -142,7 +150,9 @@ needs reverse-proxy request limits.
 - Loss of either the browser key or its PLAYER_ID profile prevents deterministic
   recovery; reference localStorage is not production custody.
 - A player can self-renew without Woodland infrastructure.
-- Tree maintenance failure affects regrowth/expiry but not player authorization.
+- Renewal-watcher failure delays tree/vault renewals and stump refills, but
+  every one of those paths — like restock — is permissionless; any caller can
+  step in, and player authorization is unaffected.
 - Game-server failure hides social state and rankings; online clients fall back
   to owner renewal and gameplay remains direct.
 - Operator or emulator retirement still strands NUMS-exit recursive state; no
@@ -151,6 +161,10 @@ needs reverse-proxy request limits.
 ## Launch Risks
 
 Production still needs hardened key custody, service pin rotation policy,
-emulator support commitments, monitoring for tree maintenance, and UX for batch
-renewal latency. Public deterministic rolls are game mechanics, not fair hidden
-randomness.
+emulator support commitments, monitoring for tree/vault renewal and vault
+drawdown, and UX for batch renewal latency. Player-bound deterministic rolls
+prevent tree-target grinding and bounded credit limits streaks; both remain
+public game mechanics, not fair hidden randomness. Permissionless PLAYER_ID
+creation means Sybil and identity grinding remain possible, and an intermediate
+marker output can choose any starting roll and credit within the corridor before
+the recursive covenant takes control.

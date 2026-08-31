@@ -2,27 +2,27 @@
 //!
 //! Tree health is a numeric packet separate from the tree's fixed LOG reserve.
 //! Successful chops reduce both health and the remaining LOG/XP inventory;
-//! regrowth resets health without issuing assets.
+//! renewal resets health without issuing assets.
 
 use crate::protocol::{
     CHOP_ANCHOR_OUTPUT_INDEX, CHOP_ASSET_GROUP_COUNT, CHOP_EXTENSION_OUTPUT_INDEX,
     CHOP_INPUT_COUNT, CHOP_OUTPUT_COUNT, LOG_ASSET_GROUP_INDEX, PLAYER_IDENTITY_PACKET_TYPE,
     PLAYER_ID_ASSET_GROUP_INDEX, PLAYER_POSITION_PACKET_TYPE, PLAYER_STATE_INPUT_INDEX,
-    PLAYER_STATE_OUTPUT_INDEX, REGROW_ANCHOR_OUTPUT_INDEX, REGROW_EXTENSION_OUTPUT_INDEX,
-    REGROW_INPUT_COUNT, REGROW_OUTPUT_COUNT, REGROW_TREE_INPUT_INDEX, REGROW_TREE_OUTPUT_INDEX,
-    RENEWAL_EXTENSION_OUTPUT_INDEX, RENEWAL_INPUT_COUNT, RENEWAL_OUTPUT_COUNT,
-    RENEWAL_STATE_INPUT_INDEX, RENEWAL_STATE_OUTPUT_INDEX, TREE_ASSET_GROUP_INDEX,
-    TREE_HEALTH_PACKET_TYPE, TREE_INPUT_INDEX, TREE_OUTPUT_INDEX, TREE_ROLL_PACKET_TYPE,
-    TREE_STATE_PACKET_TYPE, XP_ASSET_GROUP_INDEX,
+    PLAYER_STATE_OUTPUT_INDEX, RENEWAL_EXTENSION_OUTPUT_INDEX, RENEWAL_INPUT_COUNT,
+    RENEWAL_OUTPUT_COUNT, RENEWAL_STATE_INPUT_INDEX, RENEWAL_STATE_OUTPUT_INDEX,
+    RESTOCK_ANCHOR_OUTPUT_INDEX, RESTOCK_ASSET_GROUP_COUNT, RESTOCK_EXTENSION_OUTPUT_INDEX,
+    RESTOCK_INPUT_COUNT, RESTOCK_OUTPUT_COUNT, RESTOCK_TREE_INPUT_INDEX, RESTOCK_TREE_OUTPUT_INDEX,
+    RESTOCK_VAULT_INPUT_INDEX, TREE_ASSET_GROUP_INDEX, TREE_HEALTH_PACKET_TYPE, TREE_INPUT_INDEX,
+    TREE_OUTPUT_INDEX, TREE_STATE_PACKET_TYPE, XP_ASSET_GROUP_INDEX,
 };
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
 use ark_script::{op, ArkadeLeaf, ArkadeTapscript, ArkadeVtxoInput, ArkadeVtxoScript};
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::Hash;
 use bitcoin::opcodes::all::{
-    OP_2DROP, OP_ADD, OP_CAT, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUAL, OP_EQUALVERIFY,
-    OP_FROMALTSTACK, OP_GREATERTHAN, OP_IF, OP_LESSTHAN, OP_MOD, OP_NIP, OP_OVER, OP_ROT,
-    OP_SHA256, OP_SIZE, OP_TOALTSTACK, OP_VERIFY,
+    OP_2DROP, OP_ADD, OP_BOOLAND, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUAL, OP_EQUALVERIFY,
+    OP_FROMALTSTACK, OP_GREATERTHAN, OP_IF, OP_NIP, OP_NUMEQUAL, OP_OVER, OP_ROT, OP_SIZE, OP_SWAP,
+    OP_TOALTSTACK, OP_VERIFY,
 };
 use bitcoin::script::witness_version::WitnessVersion;
 use bitcoin::script::{Builder, PushBytesBuf};
@@ -30,38 +30,59 @@ use bitcoin::secp256k1::{Secp256k1, Verification};
 use bitcoin::{Network, Psbt, ScriptBuf, Sequence, Transaction, XOnlyPublicKey};
 
 pub const LOGS_PER_TREE: u64 = 5;
-pub const CHOP_ROLL_BASIS_POINTS: u64 = 10_000;
-pub const BASE_LOG_DROP_BASIS_POINTS: u64 = 2_500;
-pub const LEVEL_LOG_DROP_BONUS_BASIS_POINTS: u64 = 100;
-pub const LEVEL_LOG_DROP_XP_THRESHOLDS: [u64; 5] = [1_154, 4_470, 13_363, 37_224, 101_333];
-pub const MAX_LEVEL_LOG_DROP_BASIS_POINTS: u64 = 3_000;
-pub const RESPAWN_MIN_SECS: i64 = 20;
-pub const RESPAWN_MAX_SECS: i64 = 40;
 
-pub const fn log_drop_basis_points(player_xp: u64) -> u64 {
-    let mut basis_points = BASE_LOG_DROP_BASIS_POINTS;
-    let mut index = 0;
-    while index < LEVEL_LOG_DROP_XP_THRESHOLDS.len() {
-        if player_xp >= LEVEL_LOG_DROP_XP_THRESHOLDS[index] {
-            basis_points += LEVEL_LOG_DROP_BONUS_BASIS_POINTS;
+/// A tree carries exactly one dust of backing. LOG/XP are ledger entries with
+/// no sats collateral, and the covenant pins this value through every
+/// transition; on depletion the restock recycles it in-transaction.
+pub fn tree_value_sats(dust_sats: u64) -> u64 {
+    dust_sats
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeTransition {
+    Deployment,
+    Renewal,
+    Chop,
+    Restock,
+}
+
+impl TreeTransition {
+    pub(crate) const fn output_index(self) -> u32 {
+        match self {
+            Self::Deployment | Self::Renewal | Self::Restock => 0,
+            Self::Chop => TREE_OUTPUT_INDEX as u32,
         }
-        index += 1;
-    }
-    if basis_points > MAX_LEVEL_LOG_DROP_BASIS_POINTS {
-        MAX_LEVEL_LOG_DROP_BASIS_POINTS
-    } else {
-        basis_points
     }
 }
 
-/// Every health state keeps the full tree value; LOG has no sats collateral.
-pub fn full_tree_value_sats(dust_sats: u64) -> Result<u64> {
-    let value_units = LOGS_PER_TREE
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("tree value unit overflow"))?;
-    dust_sats
-        .checked_mul(value_units)
-        .ok_or_else(|| anyhow!("tree value overflow"))
+fn classify_transition_shape(
+    input_count: usize,
+    group_count: Option<usize>,
+    is_deployment: bool,
+) -> Result<TreeTransition> {
+    if is_deployment {
+        return Ok(TreeTransition::Deployment);
+    }
+    // The intent proof's fake input is not part of the settled renewal
+    // transaction, leaving the renewed tree's parent as its sole input.
+    if input_count == 1 {
+        return Ok(TreeTransition::Renewal);
+    }
+    match (input_count, group_count) {
+        (CHOP_INPUT_COUNT, Some(CHOP_ASSET_GROUP_COUNT)) => Ok(TreeTransition::Chop),
+        (RESTOCK_INPUT_COUNT, Some(RESTOCK_ASSET_GROUP_COUNT)) => Ok(TreeTransition::Restock),
+        _ => Err(anyhow!("current tree transaction has an invalid shape")),
+    }
+}
+
+pub(crate) fn classify_transition(
+    transaction: &Transaction,
+    is_deployment: bool,
+) -> Result<TreeTransition> {
+    let group_count = (!is_deployment && transaction.input.len() != 1)
+        .then(|| crate::asset_packet::asset_group_count(transaction))
+        .transpose()?;
+    classify_transition_shape(transaction.input.len(), group_count, is_deployment)
 }
 
 const TREE_STATE_MAGIC: &[u8; 2] = b"TR";
@@ -103,45 +124,6 @@ impl TreeState {
     }
 }
 
-/// Publicly predictable but covenant-enforced entropy for one tree. Every
-/// swing replaces this value with its SHA-256 digest; the digest's value modulo
-/// 10,000 is compared with the player's XP-derived LOG-drop threshold.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct TreeRoll([u8; 32]);
-
-impl TreeRoll {
-    pub fn initial(state: TreeState) -> Self {
-        let mut material = b"woodland.sh/tree-roll/v1".to_vec();
-        material.extend_from_slice(&state.encode());
-        Self(sha256::Hash::hash(&material).to_byte_array())
-    }
-
-    pub const fn encode(self) -> [u8; 32] {
-        self.0
-    }
-
-    pub fn decode(encoded: &[u8]) -> Result<Self> {
-        let bytes: [u8; 32] = encoded
-            .try_into()
-            .map_err(|_| anyhow!("invalid tree roll packet"))?;
-        Ok(Self(bytes))
-    }
-
-    pub fn next(self) -> Self {
-        Self(sha256::Hash::hash(&self.0).to_byte_array())
-    }
-
-    pub fn bucket(self) -> u64 {
-        self.0.iter().rev().fold(0_u64, |value, byte| {
-            (value * 256 + u64::from(*byte)) % CHOP_ROLL_BASIS_POINTS
-        })
-    }
-
-    pub fn advance(self, player_xp: u64) -> (Self, bool) {
-        let next = self.next();
-        (next, next.bucket() < log_drop_basis_points(player_xp))
-    }
-}
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct TreeHealth(u64);
 
@@ -208,35 +190,13 @@ fn push_tree_health_amounts(builder: Builder, input_index: usize) -> Builder {
     push_health_packet_value(builder, None)
 }
 
-pub fn respawn_delay_secs(state: TreeState, outpoint: bitcoin::OutPoint) -> i64 {
-    let mut material = b"woodland.sh/respawn-delay/v1".to_vec();
-    material.extend_from_slice(&state.encode());
-    material.extend_from_slice(&outpoint.txid.to_byte_array());
-    material.extend_from_slice(&outpoint.vout.to_le_bytes());
-    let digest = sha256::Hash::hash(&material).to_byte_array();
-    let spread = (RESPAWN_MAX_SECS - RESPAWN_MIN_SECS + 1) as u64;
-    let sample = u64::from_le_bytes(digest[..8].try_into().expect("fixed respawn digest"));
-    RESPAWN_MIN_SECS + (sample % spread) as i64
-}
-
-pub fn respawn_at(
-    state: TreeState,
-    outpoint: bitcoin::OutPoint,
-    created_at: Option<i64>,
-) -> Result<i64> {
-    created_at
-        .ok_or_else(|| anyhow!("stump has no server creation time"))?
-        .checked_add(respawn_delay_secs(state, outpoint))
-        .ok_or_else(|| anyhow!("tree respawn deadline overflow"))
-}
-
 /// Host-side mirror of the asset invariants enforced by the Arkade Script.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChopTransition {
     pub previous_state: TreeState,
     pub next_state: TreeState,
-    pub previous_roll: TreeRoll,
-    pub next_roll: TreeRoll,
+    pub previous_player_luck: crate::player::PlayerLuck,
+    pub next_player_luck: crate::player::PlayerLuck,
     pub previous_health: TreeHealth,
     pub next_health: TreeHealth,
     pub player_xp_before: u64,
@@ -274,9 +234,10 @@ impl ChopTransition {
         {
             return Err(anyhow!("cannot chop a depleted tree"));
         }
-        let (expected_roll, expected_success) = self.previous_roll.advance(self.player_xp_before);
-        if self.next_roll != expected_roll || self.success != expected_success {
-            return Err(anyhow!("tree chop roll is invalid"));
+        let (expected_luck, expected_success) =
+            self.previous_player_luck.advance(self.player_xp_before);
+        if self.next_player_luck != expected_luck || self.success != expected_success {
+            return Err(anyhow!("tree chop luck transition is invalid"));
         }
         let reward = u64::from(self.success);
         if self.state_xp_before != self.player_xp_before
@@ -299,7 +260,7 @@ impl ChopTransition {
                 .checked_sub(reward)
                 .ok_or_else(|| anyhow!("tree health underflow"))?
         {
-            return Err(anyhow!("tree health does not match the chop roll"));
+            return Err(anyhow!("tree health does not match the chop reward"));
         }
         if self.tree_logs_after
             != self
@@ -312,7 +273,7 @@ impl ChopTransition {
                     .checked_add(reward)
                     .ok_or_else(|| anyhow!("player LOG balance overflow"))?
         {
-            return Err(anyhow!("LOG balances do not match the chop roll"));
+            return Err(anyhow!("LOG balances do not match the chop reward"));
         }
         if self.tree_xp_balance_after
             != self
@@ -325,7 +286,7 @@ impl ChopTransition {
                     .checked_add(reward)
                     .ok_or_else(|| anyhow!("player XP balance overflow"))?
         {
-            return Err(anyhow!("XP asset balances do not match the chop roll"));
+            return Err(anyhow!("XP asset balances do not match the chop reward"));
         }
         if self.dust_sats == 0
             || self.player_value_before != self.dust_sats
@@ -333,63 +294,11 @@ impl ChopTransition {
         {
             return Err(anyhow!("player state must preserve one dust value"));
         }
-        let expected_tree_value = full_tree_value_sats(self.dust_sats)?;
+        let expected_tree_value = tree_value_sats(self.dust_sats);
         if self.tree_value_before != expected_tree_value
             || self.tree_value_after != expected_tree_value
         {
             return Err(anyhow!("tree value must remain fixed during chop"));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RegrowTransition {
-    pub previous_state: TreeState,
-    pub next_state: TreeState,
-    pub previous_roll: TreeRoll,
-    pub next_roll: TreeRoll,
-    pub previous_health: TreeHealth,
-    pub next_health: TreeHealth,
-    pub dust_sats: u64,
-    pub tree_markers_before: u64,
-    pub tree_markers_after: u64,
-    pub tree_logs_before: u64,
-    pub tree_logs_after: u64,
-    pub tree_xp_balance_before: u64,
-    pub tree_xp_balance_after: u64,
-    pub tree_value_before: u64,
-    pub tree_value_after: u64,
-}
-
-impl RegrowTransition {
-    pub fn validate(self) -> Result<()> {
-        if self.previous_state != self.next_state {
-            return Err(anyhow!("regrowth changed the tree identity or position"));
-        }
-        if self.previous_roll != self.next_roll {
-            return Err(anyhow!("regrowth changed the tree chop roll"));
-        }
-        if self.previous_health.value() != 0 || self.next_health.value() != LOGS_PER_TREE {
-            return Err(anyhow!(
-                "regrowth must reset zero health to {LOGS_PER_TREE}"
-            ));
-        }
-        if self.tree_markers_before != 1 || self.tree_markers_after != 1 {
-            return Err(anyhow!("regrowth must preserve one TREE marker"));
-        }
-        if self.tree_logs_before != self.tree_logs_after
-            || self.tree_xp_balance_before != self.tree_xp_balance_after
-            || self.tree_logs_before < LOGS_PER_TREE
-            || self.tree_xp_balance_before < LOGS_PER_TREE
-        {
-            return Err(anyhow!(
-                "regrowth must preserve at least {LOGS_PER_TREE} LOG and XP"
-            ));
-        }
-        let expected_value = full_tree_value_sats(self.dust_sats)?;
-        if self.tree_value_before != expected_value || self.tree_value_after != expected_value {
-            return Err(anyhow!("regrowth must preserve the fixed tree value"));
         }
         Ok(())
     }
@@ -401,31 +310,18 @@ pub struct TreeContract {
     pub vtxo: ark_core::Vtxo,
     pub chop_spend_script: ScriptBuf,
     pub chop_arkade_script: ScriptBuf,
-    pub regrow_spend_script: ScriptBuf,
-    pub regrow_arkade_script: ScriptBuf,
     pub renewal_spend_script: ScriptBuf,
     pub renewal_arkade_script: ScriptBuf,
+    pub retire_spend_script: ScriptBuf,
+    pub retire_arkade_script: ScriptBuf,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TreeServiceKeys {
-    pub operator: XOnlyPublicKey,
-    pub emulator: XOnlyPublicKey,
-    pub maintenance: XOnlyPublicKey,
-}
-
-/// Build the shared three-leaf tree contract: swing, maintained regrowth, and
-/// exact-self-send batch renewal.
+/// Build the shared three-leaf tree contract: swing, permissionless renewal
+/// with stump health refill, and permissionless retire-and-restock.
 ///
-/// `maintenance_pk` gates timed regrowth. `rollover_pk` gates renewal so a
-/// permissionless caller cannot continuously rotate the outpoint and starve
-/// gameplay; public services may accept rollover requests from anyone.
-///
-/// The three usable tapleaves have separate authority:
-///
-/// - chop: operator + covenant-tweaked emulator;
-/// - regrowth: maintenance + operator + covenant-tweaked emulator;
-/// - renewal: rollover + operator + covenant-tweaked emulator.
+/// Every usable tapleaf is operator + covenant-tweaked emulator. No project-held
+/// signer appears in the tree covenant: stumps refill when any renewal settles,
+/// and depleted trees are replaced atomically with the supply vault by anyone.
 ///
 /// The CSV exit is keyed to the NUMS point and is intentionally unusable as an
 /// escape from the recursive covenant.
@@ -434,13 +330,13 @@ pub fn build_tree_contract<C: Verification>(
     secp: &Secp256k1<C>,
     operator_pk: XOnlyPublicKey,
     emulator_pk: XOnlyPublicKey,
-    maintenance_pk: XOnlyPublicKey,
-    rollover_pk: XOnlyPublicKey,
     exit_delay: Sequence,
     network: Network,
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    log_reserve_per_tree: u64,
+    xp_per_tree: u64,
     dust_sats: u64,
 ) -> Result<TreeContract> {
     if [tree_asset, log_asset, xp_asset]
@@ -451,20 +347,47 @@ pub fn build_tree_contract<C: Verification>(
     {
         return Err(anyhow!("TREE, LOG, and XP asset IDs must differ"));
     }
-    if [operator_pk, emulator_pk, maintenance_pk, rollover_pk]
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>()
-        .len()
-        != 4
-    {
+    if operator_pk == emulator_pk {
         return Err(anyhow!("tree contract signers must be distinct"));
     }
-    script_int(full_tree_value_sats(dust_sats)?, "full tree value")?;
+    script_int(tree_value_sats(dust_sats), "tree value")?;
 
     let chop_arkade_script = tree_covenant_script(tree_asset, log_asset, xp_asset, dust_sats)?;
-    let regrow_arkade_script =
-        tree_regrow_covenant_script(tree_asset, log_asset, xp_asset, dust_sats)?;
     let renewal_arkade_script = tree_renewal_covenant_script(tree_asset, log_asset, xp_asset)?;
+    let retire_arkade_script = tree_retire_covenant_script(
+        tree_asset,
+        log_asset,
+        xp_asset,
+        log_reserve_per_tree,
+        xp_per_tree,
+        dust_sats,
+    )?;
+    // arkd requires a timelocked exit leaf on every batch VTXO. Shared trees
+    // key it to the NUMS owner: it satisfies the server's exit-delay
+    // accounting without giving anyone a unilateral path around the covenant.
+    let nums: bitcoin::PublicKey = ark_core::UNSPENDABLE_KEY
+        .parse()
+        .context("parse Arkade NUMS key")?;
+    let owner = nums.inner.x_only_public_key().0;
+    // Each covenant leaf's emulator position is the script-tweaked key
+    // emulator + H("ArkScriptHash", script)·G. A tweaked key equal to a plain
+    // signer of the same leaf lets that signer take the emulator path without
+    // covenant execution; equal to the NUMS exit owner the leaf is dead.
+    for (arkade_script, signers) in [
+        (&chop_arkade_script, [operator_pk].as_slice()),
+        (&renewal_arkade_script, [operator_pk].as_slice()),
+        (&retire_arkade_script, [operator_pk].as_slice()),
+    ] {
+        let tweaked_emulator =
+            ark_script::compute_arkade_script_public_key(&emulator_pk, arkade_script)
+                .context("derive tree emulator signer")?;
+        if signers.contains(&tweaked_emulator) {
+            return Err(anyhow!("tweaked emulator collides with a tree signer"));
+        }
+        if tweaked_emulator == owner {
+            return Err(anyhow!("tweaked emulator collides with the exit key"));
+        }
+    }
     let leaf = |arkade_script: ScriptBuf, pubkeys: Vec<XOnlyPublicKey>| {
         ArkadeVtxoInput::Arkade(ArkadeLeaf {
             arkade_script,
@@ -474,33 +397,20 @@ pub fn build_tree_contract<C: Verification>(
     };
     let processed = ArkadeVtxoScript::new(vec![
         leaf(chop_arkade_script.clone(), vec![operator_pk]),
-        leaf(
-            regrow_arkade_script.clone(),
-            vec![operator_pk, maintenance_pk],
-        ),
-        leaf(
-            renewal_arkade_script.clone(),
-            vec![operator_pk, rollover_pk],
-        ),
+        leaf(renewal_arkade_script.clone(), vec![operator_pk]),
+        leaf(retire_arkade_script.clone(), vec![operator_pk]),
     ])
     .context("build tree Arkade tapleaves")?;
-    let [chop_spend_script, regrow_spend_script, renewal_spend_script] =
+    let [chop_spend_script, renewal_spend_script, retire_spend_script] =
         processed.scripts.as_slice()
     else {
         return Err(anyhow!(
-            "tree contract must have chop, regrow, and renewal leaves"
+            "tree contract must have chop, renewal, and retire leaves"
         ));
     };
     let chop_spend_script = chop_spend_script.clone();
-    let regrow_spend_script = regrow_spend_script.clone();
     let renewal_spend_script = renewal_spend_script.clone();
-    let nums: bitcoin::PublicKey = ark_core::UNSPENDABLE_KEY
-        .parse()
-        .context("parse Arkade NUMS key")?;
-    let owner = nums.inner.x_only_public_key().0;
-    // arkd requires a timelocked exit leaf on every batch VTXO. Shared trees
-    // key it to the NUMS owner: it satisfies the server's exit-delay
-    // accounting without giving anyone a unilateral path around the covenant.
+    let retire_spend_script = retire_spend_script.clone();
     let scripts = processed
         .scripts
         .into_iter()
@@ -520,10 +430,10 @@ pub fn build_tree_contract<C: Verification>(
         vtxo,
         chop_spend_script,
         chop_arkade_script,
-        regrow_spend_script,
-        regrow_arkade_script,
         renewal_spend_script,
         renewal_arkade_script,
+        retire_spend_script,
+        retire_arkade_script,
     })
 }
 
@@ -540,8 +450,8 @@ pub fn build_tree_contract<C: Verification>(
 /// groups 0..3 PLAYER_ID | TREE | LOG | XP
 /// ```
 ///
-/// This half owns the global game rule: tree identity, roll advancement,
-/// success probability, health, reward movement, and fixed world-asset supply.
+/// This half owns the global game rule: tree identity, player-bound luck
+/// advancement, success probability, health, reward movement, and fixed supply.
 /// The personalized player half supplies the owner signature and pins this
 /// exact tree contract.
 pub fn tree_covenant_script(
@@ -562,7 +472,7 @@ pub fn tree_covenant_script(
         return Err(anyhow!("tree dust must be non-zero"));
     }
     let player_value = script_int(dust_sats, "player value")?;
-    let tree_value = script_int(full_tree_value_sats(dust_sats)?, "tree value")?;
+    let tree_value = script_int(tree_value_sats(dust_sats), "tree value")?;
     let anchor_program =
         witness_v1_program(&ark_core::anchor_output().script_pubkey, "Arkade anchor")?;
     let builder = Builder::new()
@@ -654,10 +564,18 @@ pub fn tree_covenant_script(
         PLAYER_POSITION_PACKET_TYPE,
         PLAYER_STATE_INPUT_INDEX,
     );
+    let builder =
+        crate::player::push_canonical_initial_player_luck(builder, PLAYER_STATE_INPUT_INDEX);
+    // Compute the canonical reward once. Keep one copy on the altstack while
+    // each conservation relation consumes a main-stack copy.
+    let builder = crate::player::push_advanced_player_luck(builder, PLAYER_STATE_INPUT_INDEX)
+        .push_opcode(OP_TOALTSTACK);
 
-    // XP advances exactly when the deterministic tree roll succeeds.
-    let builder = crate::player::push_player_xp_amounts(builder, PLAYER_STATE_INPUT_INDEX);
-    let builder = push_advanced_tree_roll(builder, TREE_INPUT_INDEX, PLAYER_STATE_INPUT_INDEX)
+    // XP advances exactly when the player-bound luck transition succeeds.
+    let builder = crate::player::push_player_xp_amounts(builder, PLAYER_STATE_INPUT_INDEX)
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
         .push_opcode(OP_ROT)
         .push_opcode(OP_ADD)
         .push_opcode(OP_EQUALVERIFY);
@@ -666,7 +584,10 @@ pub fn tree_covenant_script(
         .push_int(0)
         .push_opcode(OP_GREATERTHAN)
         .push_opcode(OP_VERIFY);
-    let builder = push_advanced_tree_roll(builder, TREE_INPUT_INDEX, PLAYER_STATE_INPUT_INDEX)
+    let builder = builder
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
         .push_opcode(OP_ADD)
         .push_opcode(OP_EQUALVERIFY);
     let builder = push_extension_and_anchor_shape(
@@ -700,14 +621,20 @@ pub fn tree_covenant_script(
         .push_opcode(OP_VERIFY);
     let builder = push_optional_output_asset_lookup(builder, TREE_OUTPUT_INDEX, log_asset)
         .push_opcode(OP_DROP);
-    let builder = push_advanced_tree_roll(builder, TREE_INPUT_INDEX, PLAYER_STATE_INPUT_INDEX)
+    let builder = builder
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
         .push_opcode(OP_ADD)
         .push_opcode(OP_EQUALVERIFY);
     let builder = push_optional_input_asset_lookup(builder, PLAYER_STATE_INPUT_INDEX, log_asset)
         .push_opcode(OP_DROP);
     let builder = push_optional_output_asset_lookup(builder, PLAYER_STATE_OUTPUT_INDEX, log_asset)
         .push_opcode(OP_DROP);
-    let builder = push_advanced_tree_roll(builder, TREE_INPUT_INDEX, PLAYER_STATE_INPUT_INDEX)
+    let builder = builder
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
         .push_opcode(OP_ROT)
         .push_opcode(OP_ADD)
         .push_opcode(OP_EQUALVERIFY);
@@ -722,7 +649,10 @@ pub fn tree_covenant_script(
         .push_opcode(OP_VERIFY);
     let builder = push_optional_output_asset_lookup(builder, TREE_OUTPUT_INDEX, xp_asset)
         .push_opcode(OP_DROP);
-    let builder = push_advanced_tree_roll(builder, TREE_INPUT_INDEX, PLAYER_STATE_INPUT_INDEX)
+    let builder = builder
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
         .push_opcode(OP_ADD)
         .push_opcode(OP_EQUALVERIFY);
     let builder = push_optional_input_asset_lookup(builder, PLAYER_STATE_INPUT_INDEX, xp_asset)
@@ -736,29 +666,52 @@ pub fn tree_covenant_script(
         .push_opcode(OP_DROP);
     let builder = push_optional_output_asset_lookup(builder, PLAYER_STATE_OUTPUT_INDEX, xp_asset)
         .push_opcode(OP_DROP);
-    Ok(
-        push_advanced_tree_roll(builder, TREE_INPUT_INDEX, PLAYER_STATE_INPUT_INDEX)
-            .push_opcode(OP_ROT)
-            .push_opcode(OP_ADD)
-            .push_opcode(OP_EQUAL)
-            .into_script(),
-    )
+    Ok(builder
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_ROT)
+        .push_opcode(OP_ADD)
+        .push_opcode(OP_EQUAL)
+        .into_script())
 }
 
-/// Maintenance-authorized respawn for one canonical stump. The maintenance
-/// host checks its wall-clock deadline before signing.
+/// Pin an asset group's single input cell to a local-typed assignment at the
+/// given input index, so restocked assets can only originate from the vault
+/// and the marker only from the dead tree.
+pub(crate) fn push_restock_asset_input(
+    builder: Builder,
+    asset: AssetId,
+    input_index: usize,
+) -> Builder {
+    push_asset_group_index(builder, asset)
+        .push_int(0)
+        .push_int(0)
+        .push_opcode(op::INSPECTASSETGROUP)
+        .push_opcode(OP_DROP)
+        .push_int(input_index as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+}
+
+/// Tree half of the atomic retire-and-restock. A fully depleted tree (its LOG
+/// and XP balances are gone, so it carries only the TREE marker) is spent
+/// together with the supply vault and replaced at the same coordinate: new
+/// full reserve and health, with the same recycled dust and marker. Player
+/// reward entropy is independent of tree restock. The vault half pins supply.
 ///
-/// A stump keeps one TREE marker, its remaining fixed-supply LOG and XP,
-/// and the tree's fixed sats. This covenant preserves every asset amount and
-/// resets only the health packet from zero to five.
+/// Canonical shape:
 ///
-/// Arkade Script has no wall-clock opcode here. The covenant proves only the
-/// zero-to-five reset and complete state/asset preservation; the maintenance
-/// signer waits for the host-computed deadline before authorizing it.
-pub fn tree_regrow_covenant_script(
+/// ```text
+/// vin 0 dead tree | vin 1 vault
+/// vout 0 new tree | vout 1 vault | vout 2 extension | vout 3 anchor
+/// groups 0..2 TREE | LOG | XP
+/// ```
+pub fn tree_retire_covenant_script(
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    log_reserve_per_tree: u64,
+    xp_per_tree: u64,
     dust_sats: u64,
 ) -> Result<ScriptBuf> {
     if [tree_asset, log_asset, xp_asset]
@@ -769,112 +722,105 @@ pub fn tree_regrow_covenant_script(
     {
         return Err(anyhow!("TREE, LOG, and XP asset IDs must differ"));
     }
-    let tree_value = script_int(full_tree_value_sats(dust_sats)?, "tree value")?;
+    let log_reserve = script_int(log_reserve_per_tree, "tree LOG reserve")?;
+    let xp_reserve = script_int(xp_per_tree, "tree XP reserve")?;
     let anchor_program =
         witness_v1_program(&ark_core::anchor_output().script_pubkey, "Arkade anchor")?;
     let builder = Builder::new()
         .push_opcode(op::PUSHCURRENTINPUTINDEX)
-        .push_int(REGROW_TREE_INPUT_INDEX as i64)
+        .push_int(RESTOCK_TREE_INPUT_INDEX as i64)
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(op::INSPECTNUMINPUTS)
-        .push_int(REGROW_INPUT_COUNT as i64)
+        .push_int(RESTOCK_INPUT_COUNT as i64)
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(op::INSPECTNUMOUTPUTS)
-        .push_int(REGROW_OUTPUT_COUNT as i64)
+        .push_int(RESTOCK_OUTPUT_COUNT as i64)
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(op::INSPECTNUMASSETGROUPS)
-        .push_int(3)
+        .push_int(RESTOCK_ASSET_GROUP_COUNT as i64)
         .push_opcode(OP_EQUALVERIFY)
-        .push_int(REGROW_TREE_INPUT_INDEX as i64)
+        // A depleted tree carries only its marker: LOG and XP hit zero
+        // together and zero-amount assets are never indexed.
+        .push_int(RESTOCK_TREE_INPUT_INDEX as i64)
         .push_opcode(op::INSPECTINASSETCOUNT)
-        .push_int(3)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_int(i64::from(REGROW_TREE_OUTPUT_INDEX))
-        .push_opcode(op::INSPECTOUTASSETCOUNT)
-        .push_int(3)
+        .push_int(1)
         .push_opcode(OP_EQUALVERIFY);
-    let builder =
-        push_equal_input_output_scripts(builder, REGROW_TREE_INPUT_INDEX, REGROW_TREE_OUTPUT_INDEX)
-            .push_int(i64::from(REGROW_TREE_OUTPUT_INDEX))
-            .push_opcode(op::INSPECTOUTPUTVALUE)
-            .push_int(tree_value)
-            .push_opcode(OP_EQUALVERIFY)
-            .push_int(REGROW_TREE_INPUT_INDEX as i64)
-            .push_opcode(op::INSPECTINPUTVALUE)
-            .push_int(tree_value)
-            .push_opcode(OP_EQUALVERIFY)
-            .push_int(TREE_STATE_PACKET_TYPE.into())
-            .push_int(REGROW_TREE_INPUT_INDEX as i64)
-            .push_opcode(op::INSPECTINPUTPACKET)
-            .push_int(1)
-            .push_opcode(OP_EQUALVERIFY)
-            .push_int(TREE_STATE_PACKET_TYPE.into())
-            .push_opcode(op::INSPECTPACKET)
-            .push_int(1)
-            .push_opcode(OP_EQUALVERIFY)
-            .push_opcode(OP_EQUALVERIFY);
-    let builder = push_preserved_tree_roll(builder, REGROW_TREE_INPUT_INDEX);
-    let builder = push_tree_health_amounts(builder, REGROW_TREE_INPUT_INDEX)
+    // The replacement keeps the exact covenant P2TR, the recycled dust, and
+    // the immutable identity packet.
+    let builder = push_equal_input_output_scripts(
+        builder,
+        RESTOCK_TREE_INPUT_INDEX,
+        RESTOCK_TREE_OUTPUT_INDEX,
+    )
+    .push_int(i64::from(RESTOCK_TREE_OUTPUT_INDEX))
+    .push_opcode(op::INSPECTOUTPUTVALUE)
+    .push_int(RESTOCK_TREE_INPUT_INDEX as i64)
+    .push_opcode(op::INSPECTINPUTVALUE)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_int(TREE_STATE_PACKET_TYPE.into())
+    .push_int(RESTOCK_TREE_INPUT_INDEX as i64)
+    .push_opcode(op::INSPECTINPUTPACKET)
+    .push_int(1)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_int(TREE_STATE_PACKET_TYPE.into())
+    .push_opcode(op::INSPECTPACKET)
+    .push_int(1)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_opcode(OP_EQUALVERIFY);
+    // Health resets to full, and the new tree carries exactly one dust.
+    let dust = script_int(dust_sats, "tree dust")?;
+    let builder = builder
+        .push_int(i64::from(RESTOCK_TREE_OUTPUT_INDEX))
+        .push_opcode(op::INSPECTOUTPUTVALUE)
+        .push_int(dust)
+        .push_opcode(OP_EQUALVERIFY);
+    let builder = push_health_packet_value(builder, None)
         .push_int(LOGS_PER_TREE as i64)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_int(0)
         .push_opcode(OP_EQUALVERIFY);
     let builder = push_extension_and_anchor_shape(
         builder,
-        REGROW_EXTENSION_OUTPUT_INDEX,
-        REGROW_ANCHOR_OUTPUT_INDEX,
+        RESTOCK_EXTENSION_OUTPUT_INDEX,
+        RESTOCK_ANCHOR_OUTPUT_INDEX,
         &anchor_program,
     )
-    .push_int(i64::from(REGROW_EXTENSION_OUTPUT_INDEX))
+    .push_int(i64::from(RESTOCK_EXTENSION_OUTPUT_INDEX))
     .push_opcode(op::INSPECTOUTASSETCOUNT)
     .push_int(0)
     .push_opcode(OP_EQUALVERIFY)
-    .push_int(i64::from(REGROW_ANCHOR_OUTPUT_INDEX))
+    .push_int(i64::from(RESTOCK_ANCHOR_OUTPUT_INDEX))
     .push_opcode(op::INSPECTOUTASSETCOUNT)
     .push_int(0)
     .push_opcode(OP_EQUALVERIFY);
 
     let builder = push_canonical_asset_group(builder, tree_asset, 1, 1);
-    let builder = push_canonical_asset_group(builder, log_asset, 1, 1);
-    let builder = push_canonical_asset_group(builder, xp_asset, 1, 1);
-    let builder = push_local_asset_group_inputs(builder, tree_asset, 1);
-    let builder = push_local_asset_group_inputs(builder, log_asset, 1);
-    let builder = push_local_asset_group_inputs(builder, xp_asset, 1);
+    let builder = push_restock_asset_input(builder, tree_asset, RESTOCK_TREE_INPUT_INDEX);
+    let builder = push_canonical_asset_group(builder, log_asset, 1, 2);
+    let builder = push_canonical_asset_group(builder, xp_asset, 1, 2);
+    // LOG and XP enter only from the vault input: the single input cell of
+    // each group is a local-typed assignment at the vault's vin.
+    let builder = push_restock_asset_input(builder, log_asset, RESTOCK_VAULT_INPUT_INDEX);
+    let builder = push_restock_asset_input(builder, xp_asset, RESTOCK_VAULT_INPUT_INDEX);
 
-    let builder = push_input_asset_lookup(builder, REGROW_TREE_INPUT_INDEX, tree_asset)
+    let builder = push_input_asset_lookup(builder, RESTOCK_TREE_INPUT_INDEX, tree_asset)
         .push_int(1)
         .push_opcode(OP_EQUALVERIFY)
         .push_int(1)
         .push_opcode(OP_EQUALVERIFY);
-    let builder = push_output_asset_lookup(builder, REGROW_TREE_OUTPUT_INDEX, tree_asset)
+    let builder = push_output_asset_lookup(builder, RESTOCK_TREE_OUTPUT_INDEX, tree_asset)
         .push_int(1)
         .push_opcode(OP_EQUALVERIFY)
         .push_int(1)
         .push_opcode(OP_EQUALVERIFY);
-
-    let builder = push_input_asset_lookup(builder, REGROW_TREE_INPUT_INDEX, log_asset)
+    let builder = push_output_asset_lookup(builder, RESTOCK_TREE_OUTPUT_INDEX, log_asset)
         .push_int(1)
         .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_DUP)
-        .push_int((LOGS_PER_TREE - 1) as i64)
-        .push_opcode(OP_GREATERTHAN)
-        .push_opcode(OP_VERIFY);
-    let builder = push_output_asset_lookup(builder, REGROW_TREE_OUTPUT_INDEX, log_asset)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
+        .push_int(log_reserve)
         .push_opcode(OP_EQUALVERIFY);
-
-    let builder = push_input_asset_lookup(builder, REGROW_TREE_INPUT_INDEX, xp_asset)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_DUP)
-        .push_int((LOGS_PER_TREE - 1) as i64)
-        .push_opcode(OP_GREATERTHAN)
-        .push_opcode(OP_VERIFY);
     Ok(
-        push_output_asset_lookup(builder, REGROW_TREE_OUTPUT_INDEX, xp_asset)
+        push_output_asset_lookup(builder, RESTOCK_TREE_OUTPUT_INDEX, xp_asset)
             .push_int(1)
             .push_opcode(OP_EQUALVERIFY)
+            .push_int(xp_reserve)
             .push_opcode(OP_EQUAL)
             .into_script(),
     )
@@ -882,8 +828,8 @@ pub fn tree_regrow_covenant_script(
 
 /// Covenant for the tree's batch-renewal leaf. It runs on a version-2 intent
 /// proof and only permits an exact self-send: identical P2TR, value, TREE/LOG/XP
-/// assets, and tree-state packets. Renewal changes nothing; it only re-enters the
-/// VTXO into a fresh batch for a new expiry.
+/// assets, identity, and health. A stump is refilled to health five; otherwise
+/// renewal changes nothing and only re-enters the VTXO into a fresh batch.
 ///
 /// Canonical intent proof shape:
 ///
@@ -916,8 +862,25 @@ pub fn tree_renewal_covenant_script(
     .push_opcode(op::INSPECTINPUTVALUE)
     .push_opcode(OP_EQUALVERIFY);
     let builder = push_equal_state_packet(builder, TREE_STATE_PACKET_TYPE);
-    let builder = push_equal_state_packet(builder, TREE_ROLL_PACKET_TYPE);
-    let builder = push_equal_state_packet(builder, TREE_HEALTH_PACKET_TYPE);
+    // Stumps with reserve left refill health on renewal; everything else
+    // preserves it exactly. The branch condition is the canonical 0/1
+    // MINIMALIF requires, ANDed with LOG presence so a depleted tree (no LOG
+    // group) keeps its terminal zero health and stays renewable for restock.
+    let builder = push_tree_health_amounts(builder, RENEWAL_STATE_INPUT_INDEX)
+        .push_opcode(OP_SWAP)
+        .push_opcode(OP_DUP)
+        .push_int(0)
+        .push_opcode(OP_NUMEQUAL);
+    let builder = push_optional_input_asset_lookup(builder, RENEWAL_STATE_INPUT_INDEX, log_asset)
+        .push_opcode(OP_DROP)
+        .push_opcode(OP_BOOLAND)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_DROP)
+        .push_int(LOGS_PER_TREE as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_ENDIF);
     let builder = push_renewal_asset_shell(builder)?;
     let builder = push_transfer_group_shell(builder, tree_asset);
     let builder = push_optional_transfer_group_shell(builder, log_asset);
@@ -969,91 +932,30 @@ pub(crate) fn push_renewal_shape(builder: Builder) -> Result<Builder> {
         .push_opcode(OP_EQUALVERIFY))
 }
 
+/// Require a state packet to be carried byte-for-byte from the given input
+/// into this transaction's merged extension.
+pub(crate) fn push_equal_state_packet_at(
+    builder: Builder,
+    packet_type: u8,
+    input_index: usize,
+) -> Builder {
+    builder
+        .push_int(packet_type.into())
+        .push_int(input_index as i64)
+        .push_opcode(op::INSPECTINPUTPACKET)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_int(packet_type.into())
+        .push_opcode(op::INSPECTPACKET)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_EQUALVERIFY)
+}
+
 /// Require the renewed state packet to be carried byte-for-byte from the
 /// previous transaction into this proof's merged extension.
 pub(crate) fn push_equal_state_packet(builder: Builder, packet_type: u8) -> Builder {
-    builder
-        .push_int(packet_type.into())
-        .push_int(RENEWAL_STATE_INPUT_INDEX as i64)
-        .push_opcode(op::INSPECTINPUTPACKET)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_int(packet_type.into())
-        .push_opcode(op::INSPECTPACKET)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_EQUALVERIFY)
-}
-
-/// Verify SHA256(input roll) is the output roll and leave the deterministic
-/// XP-adjusted success bit on the stack. XP is the numeric PLAYER packet.
-pub(crate) fn push_advanced_tree_roll(
-    builder: Builder,
-    tree_input_index: usize,
-    player_input_index: usize,
-) -> Builder {
-    let positive_sign = PushBytesBuf::try_from(vec![0]).expect("one-byte sign extension");
-    let builder = builder
-        .push_int(TREE_ROLL_PACKET_TYPE.into())
-        .push_int(tree_input_index as i64)
-        .push_opcode(op::INSPECTINPUTPACKET)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_SIZE)
-        .push_int(32)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_SHA256)
-        .push_opcode(OP_DUP)
-        .push_int(TREE_ROLL_PACKET_TYPE.into())
-        .push_opcode(op::INSPECTPACKET)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_EQUALVERIFY)
-        // Arkade BigNums are little-endian signed integers. Appending zero
-        // keeps every digest positive before taking the probability bucket.
-        .push_slice(positive_sign)
-        .push_opcode(OP_CAT)
-        .push_opcode(op::BIN2NUM)
-        .push_int(CHOP_ROLL_BASIS_POINTS as i64)
-        .push_opcode(OP_MOD);
-    // Add one so the strict comparison below is exactly `XP >= threshold`.
-    let builder = crate::player::push_player_input_xp(builder, player_input_index)
-        .push_int(1)
-        .push_opcode(OP_ADD)
-        .push_int(BASE_LOG_DROP_BASIS_POINTS as i64);
-    let mut builder = builder;
-    for threshold in LEVEL_LOG_DROP_XP_THRESHOLDS {
-        builder = builder
-            .push_opcode(OP_OVER)
-            .push_int(threshold as i64)
-            .push_opcode(OP_GREATERTHAN)
-            .push_opcode(OP_IF)
-            .push_int(LEVEL_LOG_DROP_BONUS_BASIS_POINTS as i64)
-            .push_opcode(OP_ADD)
-            .push_opcode(OP_ENDIF);
-    }
-    builder
-        .push_opcode(OP_TOALTSTACK)
-        .push_opcode(OP_DROP)
-        .push_opcode(OP_FROMALTSTACK)
-        .push_opcode(OP_LESSTHAN)
-}
-
-fn push_preserved_tree_roll(builder: Builder, tree_input_index: usize) -> Builder {
-    builder
-        .push_int(TREE_ROLL_PACKET_TYPE.into())
-        .push_int(tree_input_index as i64)
-        .push_opcode(op::INSPECTINPUTPACKET)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_SIZE)
-        .push_int(32)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_int(TREE_ROLL_PACKET_TYPE.into())
-        .push_opcode(op::INSPECTPACKET)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_EQUALVERIFY)
+    push_equal_state_packet_at(builder, packet_type, RENEWAL_STATE_INPUT_INDEX)
 }
 
 /// Pin the extension shape and prove assets cannot leak anywhere except the
@@ -1101,7 +1003,7 @@ pub(crate) fn push_equal_input_output_scripts(
         .push_opcode(OP_EQUALVERIFY)
 }
 
-fn push_extension_and_anchor_shape(
+pub(crate) fn push_extension_and_anchor_shape(
     builder: Builder,
     extension_output_index: u16,
     anchor_output_index: u16,
@@ -1279,7 +1181,7 @@ pub(crate) fn push_optional_transfer_group_shell(builder: Builder, asset: AssetI
         .push_opcode(OP_ENDIF)
 }
 
-fn push_canonical_asset_group(
+pub(crate) fn push_canonical_asset_group(
     builder: Builder,
     asset: AssetId,
     expected_inputs: usize,
@@ -1303,26 +1205,7 @@ fn push_canonical_asset_group(
         .push_opcode(OP_EQUALVERIFY)
 }
 
-fn push_local_asset_group_inputs(
-    mut builder: Builder,
-    asset: AssetId,
-    input_count: usize,
-) -> Builder {
-    for item_index in 0..input_count {
-        builder = push_asset_group_index(builder, asset)
-            .push_int(item_index as i64)
-            .push_int(0)
-            .push_opcode(op::INSPECTASSETGROUP)
-            // A local input pushes (type, vin, amount). An intent input has an
-            // extra txid, so this final comparison cannot consume type=1.
-            .push_opcode(OP_2DROP)
-            .push_int(1)
-            .push_opcode(OP_EQUALVERIFY);
-    }
-    builder
-}
-
-fn witness_v1_program(script: &ScriptBuf, name: &str) -> Result<PushBytesBuf> {
+pub(crate) fn witness_v1_program(script: &ScriptBuf, name: &str) -> Result<PushBytesBuf> {
     if script.witness_version() != Some(WitnessVersion::V1) {
         return Err(anyhow!("{name} must be a witness-v1 program"));
     }
@@ -1330,7 +1213,7 @@ fn witness_v1_program(script: &ScriptBuf, name: &str) -> Result<PushBytesBuf> {
         .map_err(|error| anyhow!("invalid {name} witness program: {error}"))
 }
 
-fn script_int(value: u64, name: &str) -> Result<i64> {
+pub(crate) fn script_int(value: u64, name: &str) -> Result<i64> {
     i64::try_from(value).map_err(|_| anyhow!("{name} does not fit an Arkade script integer"))
 }
 
@@ -1423,6 +1306,61 @@ fn asset_txid_bytes(asset: AssetId) -> PushBytesBuf {
         .expect("asset txid is a fixed-size push")
 }
 
+/// Attach both creating transactions, the replacement tree's state packets,
+/// and both covenant leaves' emulator introspector entries for one atomic
+/// retire-and-restock.
+pub fn attach_restock_context(
+    psbt: &mut Psbt,
+    checkpoints: &[Psbt],
+    contract: &TreeContract,
+    vault: &crate::vault::VaultContract,
+    tree_previous_tx: &Transaction,
+    vault_previous_tx: &Transaction,
+    state: TreeState,
+) -> Result<()> {
+    if psbt.unsigned_tx.input.len() != crate::protocol::RESTOCK_INPUT_COUNT {
+        return Err(anyhow!(
+            "tree restock requires exactly {} inputs",
+            crate::protocol::RESTOCK_INPUT_COUNT
+        ));
+    }
+    let mut updated = psbt.clone();
+    crate::txbuild::attach_previous_ark_transactions(
+        &mut updated,
+        checkpoints,
+        [tree_previous_tx, vault_previous_tx],
+    )?;
+    let previous_state = tree_state_from_tx(tree_previous_tx)?
+        .ok_or_else(|| anyhow!("previous tree transaction has no state packet"))?;
+    if previous_state != state {
+        return Err(anyhow!("tree restock must keep the tree identity"));
+    }
+    let previous_health = tree_health_from_tx(tree_previous_tx)?
+        .ok_or_else(|| anyhow!("previous tree transaction has no health packet"))?;
+    if previous_health.value() != 0 {
+        return Err(anyhow!("tree restock input is not depleted"));
+    }
+    attach_tree_state_packet(&mut updated, state)?;
+    attach_tree_health_packet(&mut updated, TreeHealth::new(LOGS_PER_TREE)?)?;
+    let packet = ark_core::introspector::packet::Packet::new(vec![
+        ark_core::introspector::packet::IntrospectorEntry {
+            vin: crate::protocol::RESTOCK_TREE_INPUT_INDEX as u16,
+            script: contract.retire_arkade_script.clone(),
+            witness: bitcoin::Witness::default(),
+        },
+        ark_core::introspector::packet::IntrospectorEntry {
+            vin: crate::protocol::RESTOCK_VAULT_INPUT_INDEX as u16,
+            script: vault.restock_arkade_script.clone(),
+            witness: bitcoin::Witness::default(),
+        },
+    ])
+    .context("build tree restock emulator packet")?;
+    ark_core::introspector::packet::add_packet_to_psbt(&mut updated, &packet)
+        .context("attach tree restock emulator packet")?;
+    *psbt = updated;
+    Ok(())
+}
+
 pub fn attach_tree_state_packet(psbt: &mut Psbt, state: TreeState) -> Result<()> {
     ark_core::extension::add_packet_to_psbt(psbt, TREE_STATE_PACKET_TYPE, &state.encode())
         .context("attach tree state packet")
@@ -1447,193 +1385,6 @@ pub fn tree_state_from_tx(tx: &Transaction) -> Result<Option<TreeState>> {
         .transpose()
 }
 
-pub fn attach_tree_roll_packet(psbt: &mut Psbt, roll: TreeRoll) -> Result<()> {
-    ark_core::extension::add_packet_to_psbt(psbt, TREE_ROLL_PACKET_TYPE, &roll.encode())
-        .context("attach tree roll packet")
-}
-
-pub fn tree_roll_from_tx(tx: &Transaction) -> Result<Option<TreeRoll>> {
-    ark_core::extension::find_packet_payload(tx, TREE_ROLL_PACKET_TYPE)
-        .context("read tree roll packet")?
-        .map(TreeRoll::decode)
-        .transpose()
-}
-
-/// Attach the stump's creating transaction, preserved identity/roll, reset
-/// health packet, and the regrowth leaf's emulator entry.
-pub fn attach_tree_regrow_context(
-    psbt: &mut Psbt,
-    checkpoints: &[Psbt],
-    contract: &TreeContract,
-    previous_tx: &Transaction,
-) -> Result<(TreeState, TreeRoll, TreeHealth)> {
-    if psbt.unsigned_tx.input.len() != REGROW_INPUT_COUNT {
-        return Err(anyhow!(
-            "tree regrowth requires exactly {REGROW_INPUT_COUNT} input"
-        ));
-    }
-    let mut updated = psbt.clone();
-    crate::txbuild::attach_previous_ark_transactions(
-        &mut updated,
-        checkpoints,
-        std::iter::once(previous_tx),
-    )?;
-    let state = tree_state_from_tx(previous_tx)?
-        .ok_or_else(|| anyhow!("previous stump transaction has no tree state packet"))?;
-    let roll = tree_roll_from_tx(previous_tx)?
-        .ok_or_else(|| anyhow!("previous stump transaction has no tree roll packet"))?;
-    let health = tree_health_from_tx(previous_tx)?
-        .ok_or_else(|| anyhow!("previous stump transaction has no tree health packet"))?;
-    if health.value() != 0 {
-        return Err(anyhow!("tree regrowth input is not a stump"));
-    }
-    attach_tree_state_packet(&mut updated, state)?;
-    attach_tree_roll_packet(&mut updated, roll)?;
-    attach_tree_health_packet(&mut updated, TreeHealth::new(LOGS_PER_TREE)?)?;
-    let packet = ark_core::introspector::packet::Packet::new(vec![
-        ark_core::introspector::packet::IntrospectorEntry {
-            vin: REGROW_TREE_INPUT_INDEX as u16,
-            script: contract.regrow_arkade_script.clone(),
-            witness: bitcoin::Witness::default(),
-        },
-    ])
-    .context("build tree regrowth emulator packet")?;
-    ark_core::introspector::packet::add_packet_to_psbt(&mut updated, &packet)
-        .context("attach tree regrowth emulator packet")?;
-    *psbt = updated;
-    Ok((state, roll, health))
-}
-
-/// Verify the exact maintenance/operator/emulator signature set on a timed
-/// regrowth transaction and its checkpoint.
-pub fn verify_regrow_response(
-    keys: &crate::Keys,
-    service_keys: TreeServiceKeys,
-    contract: &TreeContract,
-    expected_ark: &Psbt,
-    expected_checkpoints: &[Psbt],
-    returned_ark: &Psbt,
-    returned_checkpoints: Vec<Psbt>,
-) -> Result<()> {
-    if expected_ark.unsigned_tx != returned_ark.unsigned_tx
-        || expected_ark.inputs.len() != REGROW_INPUT_COUNT
-        || returned_ark.inputs.len() != REGROW_INPUT_COUNT
-    {
-        return Err(anyhow!(
-            "emulator changed the submitted tree regrowth transaction"
-        ));
-    }
-    let tweaked_emulator = ark_script::compute_arkade_script_public_key(
-        &service_keys.emulator,
-        &contract.regrow_arkade_script,
-    )
-    .context("derive tree regrowth emulator signer")?;
-    let signers = [
-        service_keys.operator,
-        service_keys.maintenance,
-        tweaked_emulator,
-    ];
-    let names = ["operator", "maintenance", "emulator"];
-    verify_exact_chop_signatures(
-        keys,
-        expected_ark,
-        returned_ark,
-        REGROW_TREE_INPUT_INDEX,
-        &signers,
-        &names,
-        "regrowth Ark input",
-    )?;
-
-    if expected_checkpoints.len() != REGROW_INPUT_COUNT
-        || returned_checkpoints.len() != REGROW_INPUT_COUNT
-    {
-        return Err(anyhow!(
-            "emulator returned an invalid regrowth checkpoint count"
-        ));
-    }
-    let expected = &expected_checkpoints[0];
-    let returned = &returned_checkpoints[0];
-    if expected.unsigned_tx != returned.unsigned_tx
-        || expected.inputs.len() != returned.inputs.len()
-    {
-        return Err(anyhow!("emulator changed the regrowth checkpoint"));
-    }
-    verify_exact_chop_signatures(
-        keys,
-        expected,
-        returned,
-        0,
-        &signers,
-        &names,
-        "regrowth checkpoint input",
-    )
-}
-
-fn verify_exact_chop_signatures(
-    keys: &crate::Keys,
-    expected: &Psbt,
-    returned: &Psbt,
-    input_index: usize,
-    signers: &[XOnlyPublicKey],
-    signer_names: &[&str],
-    label: &str,
-) -> Result<()> {
-    if signers.is_empty() || signers.len() != signer_names.len() {
-        return Err(anyhow!("invalid required signer set for {label}"));
-    }
-    let expected_input = expected
-        .inputs
-        .get(input_index)
-        .ok_or_else(|| anyhow!("expected PSBT is missing {label} {input_index}"))?;
-    let matching_scripts = expected_input
-        .tap_scripts
-        .values()
-        .filter(|(script, _)| {
-            let closure_signers = ark_core::script::extract_checksig_pubkeys(script);
-            closure_signers.len() == signers.len()
-                && signers
-                    .iter()
-                    .all(|signer| closure_signers.contains(signer))
-        })
-        .collect::<Vec<_>>();
-    if matching_scripts.len() != 1 {
-        return Err(anyhow!(
-            "expected {label} {input_index} must have exactly one spend script with the required signer set"
-        ));
-    }
-
-    let returned_input = returned
-        .inputs
-        .get(input_index)
-        .ok_or_else(|| anyhow!("returned PSBT is missing {label} {input_index}"))?;
-    if !returned_input.partial_sigs.is_empty()
-        || returned_input.tap_key_sig.is_some()
-        || returned_input.final_script_sig.is_some()
-        || returned_input.final_script_witness.is_some()
-    {
-        return Err(anyhow!(
-            "returned {label} {input_index} contains signatures outside the required script path"
-        ));
-    }
-    if returned_input.tap_script_sigs.len() != signers.len() {
-        return Err(anyhow!(
-            "returned {label} {input_index} has {} signatures, expected {}",
-            returned_input.tap_script_sigs.len(),
-            signers.len(),
-        ));
-    }
-    for (signer, name) in signers.iter().zip(signer_names) {
-        crate::txbuild::verified_signature_for_key(
-            keys,
-            expected,
-            returned,
-            input_index,
-            *signer,
-            name,
-        )?;
-    }
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,44 +1414,54 @@ mod tests {
         }
     }
 
-    fn roll_for(player_xp: u64, expected_success: bool) -> (TreeRoll, TreeRoll) {
-        let mut previous = TreeRoll::initial(state());
+    fn luck_for(
+        player_xp: u64,
+        expected_success: bool,
+    ) -> (crate::player::PlayerLuck, crate::player::PlayerLuck) {
+        let identity = crate::player::PlayerIdentity { player_id: [7; 32] };
+        let mut previous = crate::player::PlayerLuck::initial(identity);
+        previous.credit = crate::player::PlayerLuckCredit::new(
+            crate::player::CHOP_ROLL_BASIS_POINTS - crate::player::log_drop_basis_points(player_xp),
+        )
+        .unwrap();
         loop {
             let (next, success) = previous.advance(player_xp);
             if success == expected_success {
                 return (previous, next);
             }
-            previous = next;
+            previous.roll = next.roll;
         }
     }
 
     #[test]
-    fn tree_wire_and_hash_vectors_are_stable() {
+    fn transaction_shape_distinguishes_chops_from_restock() {
+        assert_eq!(
+            classify_transition_shape(0, None, true).unwrap(),
+            TreeTransition::Deployment
+        );
+        assert_eq!(
+            classify_transition_shape(1, None, false).unwrap(),
+            TreeTransition::Renewal
+        );
+        assert_eq!(
+            classify_transition_shape(CHOP_INPUT_COUNT, Some(CHOP_ASSET_GROUP_COUNT), false)
+                .unwrap(),
+            TreeTransition::Chop
+        );
+        assert_eq!(
+            classify_transition_shape(RESTOCK_INPUT_COUNT, Some(RESTOCK_ASSET_GROUP_COUNT), false)
+                .unwrap(),
+            TreeTransition::Restock
+        );
+        assert!(classify_transition_shape(CHOP_INPUT_COUNT, Some(2), false).is_err());
+    }
+
+    #[test]
+    fn tree_wire_vectors_are_stable() {
         let state = state();
         assert_eq!(
             state.encode().to_lower_hex_string(),
             "545201a101000007000d00"
-        );
-        let initial = TreeRoll::initial(state);
-        assert_eq!(
-            initial.encode().to_lower_hex_string(),
-            "f316acb9f17b68cf6ca7c5dfe372d660bf1a62b0f5f0a79f6ec6059e52d8690e"
-        );
-        let next = initial.next();
-        assert_eq!(
-            next.encode().to_lower_hex_string(),
-            "0f2cbd50926dacf90260117470f3d3fc313c34ff5f9cd7498002cf19dea42ba9"
-        );
-        assert_eq!(next.bucket(), 5_263);
-        assert_eq!(
-            respawn_delay_secs(
-                state,
-                bitcoin::OutPoint {
-                    txid: Txid::from_byte_array([1; 32]),
-                    vout: 2,
-                },
-            ),
-            24
         );
         let mut negative_zero = [0_u8; 9];
         negative_zero[8] = 0x80;
@@ -1708,12 +1469,12 @@ mod tests {
     }
     #[test]
     fn successful_chop_moves_xp_and_log_to_player() {
-        let (previous_roll, next_roll) = roll_for(0, true);
+        let (previous_player_luck, next_player_luck) = luck_for(0, true);
         let valid = ChopTransition {
             previous_state: state(),
             next_state: state(),
-            previous_roll,
-            next_roll,
+            previous_player_luck,
+            next_player_luck,
             previous_health: TreeHealth::new(5).unwrap(),
             next_health: TreeHealth::new(4).unwrap(),
             player_xp_before: 0,
@@ -1733,8 +1494,8 @@ mod tests {
             player_xp_balance_after: 1,
             player_value_before: 330,
             player_value_after: 330,
-            tree_value_before: 1_980,
-            tree_value_after: 1_980,
+            tree_value_before: 330,
+            tree_value_after: 330,
         };
         valid.validate().unwrap();
 
@@ -1753,13 +1514,13 @@ mod tests {
     }
 
     #[test]
-    fn missed_chop_advances_roll_without_burning_inventory() {
-        let (previous_roll, next_roll) = roll_for(0, false);
+    fn missed_chop_advances_player_luck_without_burning_inventory() {
+        let (previous_player_luck, next_player_luck) = luck_for(0, false);
         let valid = ChopTransition {
             previous_state: state(),
             next_state: state(),
-            previous_roll,
-            next_roll,
+            previous_player_luck,
+            next_player_luck,
             previous_health: TreeHealth::new(5).unwrap(),
             next_health: TreeHealth::new(5).unwrap(),
             player_xp_before: 0,
@@ -1779,8 +1540,8 @@ mod tests {
             player_xp_balance_after: 0,
             player_value_before: 330,
             player_value_after: 330,
-            tree_value_before: 1_980,
-            tree_value_after: 1_980,
+            tree_value_before: 330,
+            tree_value_after: 330,
         };
         valid.validate().unwrap();
         let mut forged_xp = valid;
@@ -1794,85 +1555,53 @@ mod tests {
     #[test]
     fn level_bonus_thresholds_and_cap_are_exact() {
         assert_eq!(
-            LEVEL_LOG_DROP_XP_THRESHOLDS,
+            crate::player::LEVEL_LOG_DROP_XP_THRESHOLDS,
             [10, 20, 30, 40, 50].map(|level| crate::player::xp_for_level(level).unwrap())
         );
         for (xp, basis_points) in [
-            (0, 2_500),
-            (1_153, 2_500),
-            (1_154, 2_600),
-            (4_469, 2_600),
-            (4_470, 2_700),
-            (13_363, 2_800),
-            (37_224, 2_900),
-            (101_332, 2_900),
+            (0, 2_000),
+            (1_153, 2_000),
+            (1_154, 2_200),
+            (4_469, 2_200),
+            (4_470, 2_400),
+            (13_362, 2_400),
+            (13_363, 2_600),
+            (37_223, 2_600),
+            (37_224, 2_800),
+            (101_332, 2_800),
             (101_333, 3_000),
             (u64::MAX, 3_000),
         ] {
-            assert_eq!(log_drop_basis_points(xp), basis_points, "XP {xp}");
+            assert_eq!(
+                crate::player::log_drop_basis_points(xp),
+                basis_points,
+                "XP {xp}"
+            );
         }
+    }
 
-        let mut previous = TreeRoll::initial(state());
-        loop {
-            let (level_nine_roll, level_nine_success) = previous.advance(1_153);
-            let (level_ten_roll, level_ten_success) = previous.advance(1_154);
-            assert_eq!(level_nine_roll, level_ten_roll);
-            if !level_nine_success && level_ten_success {
-                break;
+    #[test]
+    fn renewal_refills_only_zero_health() {
+        // Host mirror of the covenant's conditional refill branch: renewal
+        // preserves health unless the tree is a stump.
+        let refill = |health: u64| -> u64 {
+            if health == 0 {
+                LOGS_PER_TREE
+            } else {
+                health
             }
-            previous = level_nine_roll;
-        }
-    }
-
-    #[cfg(feature = "regtest-e2e")]
-    #[test]
-    fn respawn_delays_are_bounded_and_staggered() {
-        let delays = crate::world::tree_states()
-            .into_iter()
-            .enumerate()
-            .map(|(index, state)| {
-                respawn_delay_secs(
-                    state,
-                    bitcoin::OutPoint {
-                        txid: Txid::from_byte_array([(index + 1) as u8; 32]),
-                        vout: TREE_OUTPUT_INDEX.into(),
-                    },
-                )
-            })
-            .collect::<std::collections::HashSet<_>>();
-        assert!(delays.len() > 1);
-        assert!(delays
-            .iter()
-            .all(|delay| (RESPAWN_MIN_SECS..=RESPAWN_MAX_SECS).contains(delay)));
-    }
-
-    #[test]
-    fn regrowth_resets_health_without_issuing_assets() {
-        let roll = TreeRoll::initial(state());
-        let valid = RegrowTransition {
-            previous_state: state(),
-            next_state: state(),
-            previous_roll: roll,
-            next_roll: roll,
-            previous_health: TreeHealth::new(0).unwrap(),
-            next_health: TreeHealth::new(5).unwrap(),
-            dust_sats: 330,
-            tree_markers_before: 1,
-            tree_markers_after: 1,
-            tree_logs_before: 5,
-            tree_logs_after: 5,
-            tree_xp_balance_before: 5,
-            tree_xp_balance_after: 5,
-            tree_value_before: 1_980,
-            tree_value_after: 1_980,
         };
-        valid.validate().unwrap();
-        let mut issued = valid;
-        issued.tree_logs_after = 6;
-        assert!(issued.validate().is_err());
-        let mut low_reserve = valid;
-        low_reserve.tree_xp_balance_before = 4;
-        assert!(low_reserve.validate().is_err());
+        assert_eq!(refill(0), LOGS_PER_TREE);
+        for health in 1..=LOGS_PER_TREE {
+            assert_eq!(refill(health), health);
+        }
+        // The renewal script carries the conditional as an IF/ELSE branch.
+        let renewal = tree_renewal_covenant_script(asset(1, 0), asset(1, 1), asset(1, 2)).unwrap();
+        let asm = ark_script::to_asm(&renewal).unwrap();
+        assert!(asm.contains("OP_IF"));
+        assert!(asm.contains("OP_ELSE"));
+        assert!(asm.contains("OP_ENDIF"));
+        assert!(renewal.len() <= 10_000);
     }
 
     #[test]
@@ -1880,61 +1609,60 @@ mod tests {
         #[derive(Clone, Copy)]
         struct SimTree {
             state: TreeState,
-            roll: TreeRoll,
             health: TreeHealth,
             logs: u64,
             xp_balance: u64,
-            regrown: bool,
+            refills: u64,
+        }
+
+        #[derive(Clone, Copy)]
+        struct SimPlayer {
+            state: crate::player::PlayerState,
+            logs: u64,
+            xp_balance: u64,
         }
 
         for seed in 1_u64..=32 {
-            let mut players_xp_counters = [0_u64; 256];
-            let mut players_logs = [0_u64; 256];
-            let mut players_xp_balances = [0_u64; 256];
-            let mut trees = (0_u32..10)
+            let mut players = (0_u16..256)
                 .map(|index| {
-                    let state = TreeState {
+                    let identity = crate::player::PlayerIdentity {
+                        player_id: [index as u8; 32],
+                    };
+                    SimPlayer {
+                        state: crate::player::PlayerState {
+                            identity,
+                            position: crate::player::PlayerPosition { x: index, y: 17 },
+                            luck: crate::player::PlayerLuck::initial(identity),
+                            xp: crate::player::PlayerXp::new(0),
+                        },
+                        logs: 0,
+                        xp_balance: 0,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut trees = (0_u32..10)
+                .map(|index| SimTree {
+                    state: TreeState {
                         tree_id: 417 + index,
                         x: index as u16,
                         y: (index * 2) as u16,
-                    };
-                    SimTree {
-                        state,
-                        roll: TreeRoll::initial(state),
-                        health: TreeHealth::new(5).unwrap(),
-                        logs: 10,
-                        xp_balance: 10,
-                        regrown: false,
-                    }
+                    },
+                    health: TreeHealth::new(5).unwrap(),
+                    logs: 10,
+                    xp_balance: 10,
+                    refills: 0,
                 })
                 .collect::<Vec<_>>();
             let mut entropy = seed;
             let mut attempts = 0_u64;
 
             loop {
+                // Stumps refill on renewal as often as needed while reserve
+                // remains; player luck and tree reserve are untouched.
                 for tree in &mut trees {
-                    if tree.health.value() == 0 && tree.logs >= LOGS_PER_TREE && !tree.regrown {
-                        RegrowTransition {
-                            previous_state: tree.state,
-                            next_state: tree.state,
-                            previous_roll: tree.roll,
-                            next_roll: tree.roll,
-                            previous_health: tree.health,
-                            next_health: TreeHealth::new(LOGS_PER_TREE).unwrap(),
-                            dust_sats: 330,
-                            tree_markers_before: 1,
-                            tree_markers_after: 1,
-                            tree_logs_before: tree.logs,
-                            tree_logs_after: tree.logs,
-                            tree_xp_balance_before: tree.xp_balance,
-                            tree_xp_balance_after: tree.xp_balance,
-                            tree_value_before: 1_980,
-                            tree_value_after: 1_980,
-                        }
-                        .validate()
-                        .unwrap();
+                    if tree.health.value() == 0 && tree.logs > 0 {
                         tree.health = TreeHealth::new(LOGS_PER_TREE).unwrap();
-                        tree.regrown = true;
+                        tree.refills += 1;
                     }
                 }
 
@@ -1956,32 +1684,38 @@ mod tests {
                 entropy = entropy
                     .wrapping_mul(6_364_136_223_846_793_005)
                     .wrapping_add(1_442_695_040_888_963_407);
-                let player_index = (entropy as usize) % players_xp_counters.len();
+                let player_index = (entropy as usize) % players.len();
 
                 let tree = &mut trees[tree_index];
-                let previous_roll = tree.roll;
+                let player = &mut players[player_index];
                 let previous_health = tree.health;
                 let previous_logs = tree.logs;
-                let previous_xp_balance = tree.xp_balance;
-                let previous_xp = players_xp_counters[player_index];
-                let previous_player_logs = players_logs[player_index];
-                let previous_player_xp_balance = players_xp_balances[player_index];
-                let (next_roll, success) = previous_roll.advance(previous_xp);
+                let previous_tree_xp_balance = tree.xp_balance;
+                let previous_player_state = player.state;
+                let previous_player_logs = player.logs;
+                let previous_player_xp_balance = player.xp_balance;
+                let previous_xp = previous_player_state.xp.value();
+                let (next_player_luck, success) = previous_player_state.luck.advance(previous_xp);
                 let reward = u64::from(success);
                 let next_health =
                     TreeHealth::new(previous_health.value().checked_sub(reward).unwrap()).unwrap();
                 let next_logs = previous_logs.checked_sub(reward).unwrap();
-                let next_xp_balance = previous_xp_balance.checked_sub(reward).unwrap();
+                let next_tree_xp_balance = previous_tree_xp_balance.checked_sub(reward).unwrap();
                 let next_xp = previous_xp.checked_add(reward).unwrap();
                 let next_player_logs = previous_player_logs.checked_add(reward).unwrap();
                 let next_player_xp_balance =
                     previous_player_xp_balance.checked_add(reward).unwrap();
+                let next_player_state = crate::player::PlayerState {
+                    luck: next_player_luck,
+                    xp: crate::player::PlayerXp::new(next_xp),
+                    ..previous_player_state
+                };
 
                 ChopTransition {
                     previous_state: tree.state,
                     next_state: tree.state,
-                    previous_roll,
-                    next_roll,
+                    previous_player_luck: previous_player_state.luck,
+                    next_player_luck,
                     previous_health,
                     next_health,
                     player_xp_before: previous_xp,
@@ -1993,42 +1727,25 @@ mod tests {
                     tree_markers_after: 1,
                     tree_logs_before: previous_logs,
                     tree_logs_after: next_logs,
-                    tree_xp_balance_before: previous_xp_balance,
-                    tree_xp_balance_after: next_xp_balance,
+                    tree_xp_balance_before: previous_tree_xp_balance,
+                    tree_xp_balance_after: next_tree_xp_balance,
                     player_logs_before: previous_player_logs,
                     player_logs_after: next_player_logs,
                     player_xp_balance_before: previous_player_xp_balance,
                     player_xp_balance_after: next_player_xp_balance,
                     player_value_before: 330,
                     player_value_after: 330,
-                    tree_value_before: 1_980,
-                    tree_value_after: 1_980,
+                    tree_value_before: 330,
+                    tree_value_after: 330,
                 }
                 .validate()
                 .unwrap();
 
-                let identity = crate::player::PlayerIdentity {
-                    player_id: [player_index as u8; 32],
-                };
-                let position = crate::player::PlayerPosition {
-                    x: player_index as u16,
-                    y: 17,
-                };
                 crate::player::PlayerChopTransition {
-                    previous_state: crate::player::PlayerState {
-                        identity,
-                        position,
-                        xp: crate::player::PlayerXp::new(previous_xp),
-                    },
-                    next_state: crate::player::PlayerState {
-                        identity,
-                        position,
-                        xp: crate::player::PlayerXp::new(next_xp),
-                    },
+                    previous_state: previous_player_state,
+                    next_state: next_player_state,
                     previous_tree_state: tree.state,
                     next_tree_state: tree.state,
-                    previous_tree_roll: previous_roll,
-                    next_tree_roll: next_roll,
                     previous_tree_health: previous_health,
                     next_tree_health: next_health,
                     success,
@@ -2040,43 +1757,45 @@ mod tests {
                     tree_markers_after: 1,
                     tree_logs_before: previous_logs,
                     tree_logs_after: next_logs,
-                    tree_xp_balance_before: previous_xp_balance,
-                    tree_xp_balance_after: next_xp_balance,
+                    tree_xp_balance_before: previous_tree_xp_balance,
+                    tree_xp_balance_after: next_tree_xp_balance,
                     state_value_before: 330,
                     state_value_after: 330,
-                    tree_value_before: 1_980,
-                    tree_value_after: 1_980,
+                    tree_value_before: 330,
+                    tree_value_after: 330,
                     dust_sats: 330,
                 }
                 .validate()
                 .unwrap();
 
-                tree.roll = next_roll;
                 tree.health = next_health;
                 tree.logs = next_logs;
-                tree.xp_balance = next_xp_balance;
-                players_xp_counters[player_index] = next_xp;
-                players_logs[player_index] = next_player_logs;
-                players_xp_balances[player_index] = next_player_xp_balance;
+                tree.xp_balance = next_tree_xp_balance;
+                player.state = next_player_state;
+                player.logs = next_player_logs;
+                player.xp_balance = next_player_xp_balance;
                 attempts += 1;
                 assert!(attempts < 20_000, "schedule {seed} did not terminate");
             }
 
             assert!(trees.iter().all(|tree| {
-                tree.regrown && tree.health.value() == 0 && tree.logs == 0 && tree.xp_balance == 0
+                tree.refills > 0
+                    && tree.health.value() == 0
+                    && tree.logs == 0
+                    && tree.xp_balance == 0
             }));
-            assert!(players_xp_counters
-                .iter()
-                .zip(players_logs.iter())
-                .zip(players_xp_balances.iter())
-                .all(|((xp, logs), xp_balance)| *xp == *logs && *xp == *xp_balance));
+            assert!(players.iter().all(|player| {
+                player.state.xp.value() == player.logs
+                    && player.state.xp.value() == player.xp_balance
+            }));
             assert_eq!(
-                trees.iter().map(|tree| tree.logs).sum::<u64>() + players_logs.iter().sum::<u64>(),
+                trees.iter().map(|tree| tree.logs).sum::<u64>()
+                    + players.iter().map(|player| player.logs).sum::<u64>(),
                 100
             );
             assert_eq!(
                 trees.iter().map(|tree| tree.xp_balance).sum::<u64>()
-                    + players_xp_balances.iter().sum::<u64>(),
+                    + players.iter().map(|player| player.xp_balance).sum::<u64>(),
                 100
             );
         }
@@ -2088,14 +1807,18 @@ mod tests {
         let log = asset(1, 1);
         let xp_balance = asset(1, 2);
         let chop = tree_covenant_script(tree, log, xp_balance, 330).unwrap();
-        let regrow = tree_regrow_covenant_script(tree, log, xp_balance, 330).unwrap();
+        let retire = tree_retire_covenant_script(tree, log, xp_balance, 1_000, 1_000, 330).unwrap();
         let renewal = tree_renewal_covenant_script(tree, log, xp_balance).unwrap();
-        for script in [&chop, &regrow, &renewal] {
+        for script in [&chop, &retire, &renewal] {
             assert!(script.len() <= 10_000);
         }
-        let regrow_asm = ark_script::to_asm(&regrow).unwrap();
-        assert!(regrow_asm.contains("OP_INSPECTNUMINPUTS OP_PUSHNUM_1 OP_EQUALVERIFY"));
-        assert!(regrow_asm.contains("OP_INSPECTNUMASSETGROUPS"));
+        let retire_asm = ark_script::to_asm(&retire).unwrap();
+        assert!(retire_asm.contains("OP_INSPECTNUMINPUTS OP_PUSHNUM_2 OP_EQUALVERIFY"));
+        assert!(retire_asm.contains("OP_INSPECTNUMASSETGROUPS"));
+        assert!(retire_asm.contains("OP_INSPECTINASSETCOUNT OP_PUSHNUM_1 OP_EQUALVERIFY"));
+        let renewal_asm = ark_script::to_asm(&renewal).unwrap();
+        assert!(renewal_asm.contains("OP_IF"));
+        assert!(renewal_asm.contains("OP_ELSE"));
         let chop_asm = ark_script::to_asm(&chop).unwrap();
         assert!(chop_asm.contains("OP_SHA256"));
         assert!(chop_asm.contains("OP_BIN2NUM"));
@@ -2106,48 +1829,77 @@ mod tests {
         let secp = Secp256k1::new();
         let operator = xonly(&secp, 3);
         let emulator = xonly(&secp, 4);
-        let maintenance = xonly(&secp, 5);
-        let rollover = xonly(&secp, 6);
         let contract = build_tree_contract(
             &secp,
             operator,
             emulator,
-            maintenance,
-            rollover,
             Sequence::from_height(144),
             Network::Regtest,
             tree,
             log,
             xp_balance,
+            1_000,
+            1_000,
             330,
         )
         .unwrap();
-        let regrow_emulator =
-            ark_script::compute_arkade_script_public_key(&emulator, &contract.regrow_arkade_script)
-                .unwrap();
-        let regrow_signers =
-            ark_core::script::extract_checksig_pubkeys(&contract.regrow_spend_script);
-        assert_eq!(regrow_signers.len(), 3);
-        assert!(regrow_signers.contains(&operator));
-        assert!(regrow_signers.contains(&maintenance));
-        assert!(regrow_signers.contains(&regrow_emulator));
-        let renewal_emulator = ark_script::compute_arkade_script_public_key(
-            &emulator,
-            &contract.renewal_arkade_script,
-        )
-        .unwrap();
-        let renewal_signers =
-            ark_core::script::extract_checksig_pubkeys(&contract.renewal_spend_script);
-        assert_eq!(renewal_signers.len(), 3);
-        assert!(renewal_signers.contains(&operator));
-        assert!(renewal_signers.contains(&rollover));
-        assert!(renewal_signers.contains(&renewal_emulator));
-        assert!(!renewal_signers.contains(&maintenance));
+        assert_eq!(contract.vtxo.tapscripts().len(), 4);
+        for (spend, arkade) in [
+            (&contract.chop_spend_script, &contract.chop_arkade_script),
+            (
+                &contract.renewal_spend_script,
+                &contract.renewal_arkade_script,
+            ),
+            (
+                &contract.retire_spend_script,
+                &contract.retire_arkade_script,
+            ),
+        ] {
+            let tweaked = ark_script::compute_arkade_script_public_key(&emulator, arkade).unwrap();
+            let signers = ark_core::script::extract_checksig_pubkeys(spend);
+            assert_eq!(signers.len(), 2);
+            assert!(signers.contains(&operator));
+            assert!(signers.contains(&tweaked));
+        }
         let nums: bitcoin::PublicKey = ark_core::UNSPENDABLE_KEY.parse().unwrap();
         let disabled_exit = ark_core::script::csv_sig_script(
             Sequence::from_height(144),
             nums.inner.x_only_public_key().0,
         );
         assert!(contract.vtxo.tapscripts().contains(&disabled_exit));
+    }
+
+    #[test]
+    fn tree_contract_rejects_tweaked_emulator_collision() {
+        let secp = Secp256k1::new();
+        let emulator = xonly(&secp, 4);
+        let (tree, log, xp_balance) = (asset(1, 0), asset(1, 1), asset(1, 2));
+        let chop = tree_covenant_script(tree, log, xp_balance, 330).unwrap();
+        let retire = tree_retire_covenant_script(tree, log, xp_balance, 1_000, 1_000, 330).unwrap();
+        let renewal = tree_renewal_covenant_script(tree, log, xp_balance).unwrap();
+        // An operator key equal to a script-tweaked emulator key could
+        // satisfy the emulator position without executing the covenant.
+        for script in [&chop, &retire, &renewal] {
+            let operator = ark_script::compute_arkade_script_public_key(&emulator, script).unwrap();
+            let error = build_tree_contract(
+                &secp,
+                operator,
+                emulator,
+                Sequence::from_height(144),
+                Network::Regtest,
+                tree,
+                log,
+                xp_balance,
+                1_000,
+                1_000,
+                330,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "tweaked emulator collides with a tree signer"
+            );
+        }
     }
 }

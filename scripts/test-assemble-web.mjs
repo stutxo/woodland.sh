@@ -9,7 +9,14 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'woodland-web-test-'));
 const assembler = path.join(ROOT, 'scripts/assemble-web.mjs');
-const base = JSON.parse(await readFile(path.join(ROOT, 'mutinynet/woodland-world.json'), 'utf8'));
+const base = {
+  schemaVersion: 1,
+  protocolVersion: 1,
+  gameId: 'woodland.sh',
+  network: 'signet',
+  arkadeServiceUrl: 'https://arkade.example',
+  emulatorUrl: 'https://emulator.example',
+};
 
 function run(manifestPath, outputPath, env = {}) {
   return spawnSync(process.execPath, [assembler, manifestPath, outputPath], {
@@ -92,7 +99,7 @@ try {
   await writeFile(wrongProtocol, JSON.stringify({ ...base, protocolVersion: 2 }));
   const wrong = run(wrongProtocol, path.join(temporary, 'wrong'));
   assert.notEqual(wrong.status, 0);
-  assert.match(wrong.stderr, /requires a woodland\.sh protocol v1 manifest/);
+  assert.match(wrong.stderr, /requires a woodland\.sh protocol v1 schema 1 manifest/);
 
   console.log('GitHub Pages artifact tests passed');
 } finally {

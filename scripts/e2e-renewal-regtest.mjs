@@ -7,7 +7,12 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
-import { E2E_PROFILE, FULL_E2E, waitForHttp } from './e2e-runtime.mjs';
+import {
+  decodeAssetMetadata,
+  E2E_PROFILE,
+  FULL_E2E,
+  waitForHttp,
+} from './e2e-runtime.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MANIFEST = path.join(ROOT, 'regtest/_build/woodland-world.json');
@@ -153,30 +158,36 @@ async function main() {
   if (!fs.existsSync(MANIFEST)) {
     throw new Error('world manifest is missing; run ./scripts/regtest.sh start-tree first');
   }
-  const blockedMaintenance = spawnSync(
+  const blockedRenewal = spawnSync(
     path.join(ROOT, 'scripts/regtest.sh'),
-    ['maintain'],
+    ['renew-world'],
     { cwd: ROOT, encoding: 'utf8' },
   );
-  assert.notEqual(blockedMaintenance.status, 0, 'interactive maintenance unexpectedly ran');
-  assert.match(blockedMaintenance.stderr, /maintain is pre-game only/);
+  assert.notEqual(blockedRenewal.status, 0, 'interactive renewal unexpectedly ran');
+  assert.match(blockedRenewal.stderr, /renew-world is pre-game only/);
   const manifest = JSON.parse(fs.readFileSync(MANIFEST, 'utf8'));
   assert.equal(manifest.schemaVersion, 1, 'world manifest must be schema 1');
   assert.equal(manifest.protocolVersion, 1, 'world manifest must declare protocol v1');
   assert.equal(manifest.gameId, 'woodland.sh');
   assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');
   assert.equal(manifest.maxPlayerLevel, 99);
-  assert.equal(manifest.baseLogDropBasisPoints, 2_500);
-  assert.equal(manifest.levelLogDropBonusBasisPoints, 100);
-  assert.deepEqual(manifest.levelLogDropXpThresholds, [1_154, 4_470, 13_363, 37_224, 101_333]);
+  assert.equal(manifest.baseLogDropBasisPoints, 2_000);
+  assert.equal(manifest.levelLogDropBonusBasisPoints, 200);
+  assert.deepEqual(
+    manifest.levelLogDropXpThresholds,
+    [1_154, 4_470, 13_363, 37_224, 101_333],
+  );
   assert.equal(manifest.maxLevelLogDropBasisPoints, 3_000);
+  assert.equal(manifest.luckWindowBasisPoints, 10_000);
+  assert.equal(manifest.initialLuckCredit, 8_000);
   assert.equal(manifest.activeLogsPerTree, 5);
-  assert.equal(manifest.logReservePerTree, 10);
-  assert.equal(manifest.xpPerTree, 10);
-  assert.equal(manifest.respawnMinSeconds, 20);
-  assert.equal(manifest.respawnMaxSeconds, 40);
-  assert.ok(manifest.maintenanceSigner, 'world manifest must pin a maintenance signer');
+  assert.equal(manifest.logReservePerTree, 1_000);
+  assert.equal(manifest.xpPerTree, 1_000);
   assert.ok(manifest.rolloverSigner, 'world manifest must pin a rollover signer');
+  assert.ok(manifest.treeRetireArkadeScript, 'world manifest must pin the tree retire leaf');
+  assert.ok(manifest.vaultScript, 'world manifest must pin the supply vault');
+  assert.ok(manifest.vaultRestockArkadeScript, 'world manifest must pin the vault restock leaf');
+  assert.ok(manifest.vaultRenewalArkadeScript, 'world manifest must pin the vault renewal leaf');
   const unauthorizedRollover = spawnSync(
     'cargo',
     renewArgs(['tree', String(TREE_ID)]),
@@ -206,15 +217,23 @@ async function main() {
       throw new Error(`${label} asset query failed: ${await response.text()}`);
     }
     const info = await response.json();
-    const metadata = Buffer.from(info.metadata, 'hex');
-    for (const token of ['game', 'woodland.sh', 'protocol', '1', 'asset', label]) {
-      assert.ok(metadata.includes(Buffer.from(token)), `${label} metadata omits ${token}`);
-    }
-    return { info, metadata };
+    assert.deepEqual(
+      [...decodeAssetMetadata(info.metadata)],
+      [
+        ['game', 'woodland.sh'],
+        ['protocol', String(manifest.protocolVersion)],
+        ['asset', label],
+      ],
+      `${label} metadata changed`,
+    );
+    return info;
   };
-  await assetInfo(treeAsset, 'TREE');
-  const { info: logAssetInfo } = await assetInfo(logAsset, 'LOG');
-  const { info: xpAssetInfo } = await assetInfo(xpAsset, 'XP');
+  const treeAssetInfo = await assetInfo(treeAsset, 'TREE');
+  const logAssetInfo = await assetInfo(logAsset, 'LOG');
+  const xpAssetInfo = await assetInfo(xpAsset, 'XP');
+  assert.equal(treeAssetInfo.supply, '2100', 'indexed TREE supply changed');
+  assert.equal(logAssetInfo.supply, '21000000', 'indexed LOG supply changed');
+  assert.equal(xpAssetInfo.supply, '21000000', 'indexed XP supply changed');
   assert.equal(logAssetInfo.controlAsset || '', '');
   assert.equal(xpAssetInfo.controlAsset || '', '');
   const worldBefore = await indexerVtxos({ scripts: treeScript, spendableOnly: 'true' });
@@ -222,6 +241,32 @@ async function main() {
     worldBefore.length,
     manifest.trees.length,
     'all declared trees must be live before renewal',
+  );
+  for (const record of worldBefore) {
+    assert.equal(Number(record.amount), 330, 'every tree holds exactly the dust value');
+    const markers = (record.assets || []).filter((asset) => asset.assetId === treeAsset);
+    assert.equal(markers.length, 1, 'every tree carries exactly one TREE marker');
+    assert.equal(Number(markers[0].amount), 1, 'every tree carries exactly one TREE marker');
+  }
+  const vaultBefore = await indexerVtxos({
+    scripts: manifest.vaultScript,
+    spendableOnly: 'true',
+  });
+  assert.equal(vaultBefore.length, 1, 'supply vault must be one live VTXO');
+  assert.equal(Number(vaultBefore[0].amount), 330, 'supply vault holds the dust value');
+  const vaultHoldingsBefore = new Map(
+    vaultBefore[0].assets.map((asset) => [asset.assetId, Number(asset.amount)]),
+  );
+  assert.equal(vaultHoldingsBefore.size, 2, 'supply vault must carry only LOG and XP');
+  assert.equal(
+    vaultHoldingsBefore.get(logAsset),
+    18_900_000,
+    'supply vault starts with the undistributed LOG supply',
+  );
+  assert.equal(
+    vaultHoldingsBefore.get(xpAsset),
+    18_900_000,
+    'supply vault starts with the undistributed XP supply',
   );
   const totalsBefore = worldAssetTotals(worldBefore, treeAsset, logAsset, xpAsset);
   assert.equal(totalsBefore.trees, manifest.trees.length);
@@ -263,11 +308,6 @@ async function main() {
   assert.ok(
     leafBytes.includes(treeStatePacketBytes(treeState)),
     'renewed batch leaf must preserve the exact tree state packet',
-  );
-  assert.match(first.treeRoll, /^[0-9a-f]{64}$/);
-  assert.ok(
-    leafBytes.includes(Buffer.from(first.treeRoll, 'hex')),
-    'renewed batch leaf must preserve the exact tree roll packet',
   );
 
   // The old VTXO is spent; the renewed one is the sole live tree 417.
@@ -312,9 +352,20 @@ async function main() {
     totalsBefore,
     'world asset conservation holds',
   );
+  const vaultAfter = await indexerVtxos({
+    scripts: manifest.vaultScript,
+    spendableOnly: 'true',
+  });
+  assert.equal(vaultAfter.length, 1, 'supply vault must remain one live VTXO');
+  assert.equal(Number(vaultAfter[0].amount), Number(vaultBefore[0].amount));
+  assert.deepEqual(
+    new Map(vaultAfter[0].assets.map((asset) => [asset.assetId, Number(asset.amount)])),
+    vaultHoldingsBefore,
+    'tree renewals must not draw from the supply vault',
+  );
 
   console.log(
-    `renewal E2E (${E2E_PROFILE}) passed: concurrent renewal preserved tree and roll state`
+    `renewal E2E (${E2E_PROFILE}) passed: concurrent renewal preserved tree state`
       + (FULL_E2E ? ' and remained renewable' : ''),
   );
 }

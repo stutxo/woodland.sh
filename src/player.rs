@@ -6,18 +6,21 @@
 
 use crate::protocol::{
     CHOP_ANCHOR_OUTPUT_INDEX, CHOP_EXTENSION_OUTPUT_INDEX, CHOP_INPUT_COUNT, CHOP_OUTPUT_COUNT,
-    PLAYER_IDENTITY_PACKET_TYPE, PLAYER_POSITION_PACKET_TYPE, PLAYER_STATE_INPUT_INDEX,
-    PLAYER_STATE_OUTPUT_INDEX, PLAYER_XP_PACKET_TYPE, RENEWAL_STATE_INPUT_INDEX,
-    RENEWAL_STATE_OUTPUT_INDEX, TREE_INPUT_INDEX, TREE_OUTPUT_INDEX,
+    PLAYER_IDENTITY_PACKET_TYPE, PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_POSITION_PACKET_TYPE,
+    PLAYER_ROLL_PACKET_TYPE, PLAYER_STATE_INPUT_INDEX, PLAYER_STATE_OUTPUT_INDEX,
+    PLAYER_XP_PACKET_TYPE, RENEWAL_STATE_INPUT_INDEX, RENEWAL_STATE_OUTPUT_INDEX, TREE_INPUT_INDEX,
+    TREE_OUTPUT_INDEX,
 };
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
 use ark_core::send::VtxoInput;
 use ark_core::Asset;
 use ark_script::{op, ArkadeLeaf, ArkadeTapscript, ArkadeVtxoInput, ArkadeVtxoScript};
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::opcodes::all::{
-    OP_DROP, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_GREATERTHAN, OP_ROT, OP_SIZE, OP_VERIFY,
+    OP_2DROP, OP_ADD, OP_CAT, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUAL, OP_EQUALVERIFY,
+    OP_FROMALTSTACK, OP_GREATERTHAN, OP_IF, OP_LESSTHAN, OP_MOD, OP_ROT, OP_SHA256, OP_SIZE,
+    OP_SUB, OP_TOALTSTACK, OP_VERIFY,
 };
 use bitcoin::script::{Builder, PushBytesBuf};
 use bitcoin::secp256k1::{Message, Secp256k1, Verification};
@@ -33,6 +36,8 @@ const PLAYER_POSITION_MAGIC: &[u8; 2] = b"PP";
 const PLAYER_POSITION_VERSION: u8 = 1;
 const PLAYER_POSITION_LEN: usize = 7;
 const PLAYER_XP_LEN: usize = 9;
+const PLAYER_ROLL_LEN: usize = 32;
+const PLAYER_LUCK_CREDIT_LEN: usize = 9;
 const P2A_PROGRAM: [u8; 2] = [0x4e, 0x73];
 
 /// Immutable identity preserved by every transition of one player covenant.
@@ -237,6 +242,161 @@ impl<'de> serde::Deserialize<'de> for PlayerXp {
     }
 }
 
+pub const CHOP_ROLL_BASIS_POINTS: u64 = 10_000;
+pub const BASE_LOG_DROP_BASIS_POINTS: u64 = 2_000;
+pub const LEVEL_LOG_DROP_BONUS_BASIS_POINTS: u64 = 200;
+pub const LEVEL_LOG_DROP_XP_THRESHOLDS: [u64; 5] = [1_154, 4_470, 13_363, 37_224, 101_333];
+pub const MAX_LEVEL_LOG_DROP_BASIS_POINTS: u64 = 3_000;
+pub const LUCK_WINDOW_BASIS_POINTS: u64 = 10_000;
+pub const MAX_LUCK_CREDIT: u64 = LUCK_WINDOW_BASIS_POINTS * 2;
+pub const INITIAL_LUCK_CREDIT: u64 = LUCK_WINDOW_BASIS_POINTS - BASE_LOG_DROP_BASIS_POINTS;
+const PLAYER_ROLL_DOMAIN: &[u8] = b"woodland.sh/player-roll/v1";
+
+pub const fn log_drop_basis_points(player_xp: u64) -> u64 {
+    let mut basis_points = BASE_LOG_DROP_BASIS_POINTS;
+    let mut index = 0;
+    while index < LEVEL_LOG_DROP_XP_THRESHOLDS.len() {
+        if player_xp >= LEVEL_LOG_DROP_XP_THRESHOLDS[index] {
+            basis_points += LEVEL_LOG_DROP_BONUS_BASIS_POINTS;
+        }
+        index += 1;
+    }
+    if basis_points > MAX_LEVEL_LOG_DROP_BASIS_POINTS {
+        MAX_LEVEL_LOG_DROP_BASIS_POINTS
+    } else {
+        basis_points
+    }
+}
+
+/// Public deterministic entropy bound to one recursive player lineage.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PlayerRoll([u8; PLAYER_ROLL_LEN]);
+
+impl PlayerRoll {
+    pub fn initial(identity: PlayerIdentity) -> Self {
+        let mut engine = sha256::Hash::engine();
+        engine.input(PLAYER_ROLL_DOMAIN);
+        engine.input(&identity.encode());
+        Self(sha256::Hash::from_engine(engine).to_byte_array())
+    }
+
+    pub const fn encode(self) -> [u8; PLAYER_ROLL_LEN] {
+        self.0
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self> {
+        Ok(Self(
+            encoded
+                .try_into()
+                .map_err(|_| anyhow!("invalid player roll packet"))?,
+        ))
+    }
+
+    pub fn next(self) -> Self {
+        Self(sha256::Hash::hash(&self.0).to_byte_array())
+    }
+
+    pub fn bucket(self) -> u64 {
+        self.0.iter().rev().fold(0_u64, |value, byte| {
+            (value * 256 + u64::from(*byte)) % CHOP_ROLL_BASIS_POINTS
+        })
+    }
+}
+
+/// Reward credit centered on a one-drop luck corridor.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlayerLuckCredit(u64);
+
+impl PlayerLuckCredit {
+    pub fn new(value: u64) -> Result<Self> {
+        if value > MAX_LUCK_CREDIT {
+            return Err(anyhow!("player luck credit exceeds {MAX_LUCK_CREDIT}"));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn initial() -> Self {
+        Self(INITIAL_LUCK_CREDIT)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    pub fn encode(self) -> [u8; PLAYER_LUCK_CREDIT_LEN] {
+        let mut encoded = [0_u8; PLAYER_LUCK_CREDIT_LEN];
+        encoded[..8].copy_from_slice(&self.0.to_le_bytes());
+        encoded
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self> {
+        if encoded.len() != PLAYER_LUCK_CREDIT_LEN || encoded[8] != 0 {
+            return Err(anyhow!("invalid player luck credit packet"));
+        }
+        Self::new(u64::from_le_bytes(
+            encoded[..8].try_into().expect("fixed player luck credit"),
+        ))
+    }
+}
+
+impl serde::Serialize for PlayerLuckCredit {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PlayerLuckCredit {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerLuck {
+    pub roll: PlayerRoll,
+    pub credit: PlayerLuckCredit,
+}
+
+impl PlayerLuck {
+    pub fn initial(identity: PlayerIdentity) -> Self {
+        Self {
+            roll: PlayerRoll::initial(identity),
+            credit: PlayerLuckCredit::initial(),
+        }
+    }
+
+    pub fn advance(self, player_xp: u64) -> (Self, bool) {
+        let next_roll = self.roll.next();
+        let drop_basis_points = log_drop_basis_points(player_xp);
+        let raw_credit = self.credit.value() + drop_basis_points;
+        let candidate = next_roll.bucket() < drop_basis_points;
+        let success = if raw_credit > MAX_LUCK_CREDIT {
+            true
+        } else if raw_credit < CHOP_ROLL_BASIS_POINTS {
+            false
+        } else {
+            candidate
+        };
+        let next_credit = raw_credit - u64::from(success) * CHOP_ROLL_BASIS_POINTS;
+        debug_assert!(next_credit <= MAX_LUCK_CREDIT);
+        (
+            Self {
+                roll: next_roll,
+                credit: PlayerLuckCredit(next_credit),
+            },
+            success,
+        )
+    }
+}
+
 /// Level is derived, never committed as a second mutable state value. XP can
 /// continue increasing at level 99 without changing the displayed level.
 pub fn level_from_xp(xp: u64) -> u64 {
@@ -253,6 +413,7 @@ pub fn xp_for_level(level: u64) -> Option<u64> {
 pub struct PlayerState {
     pub identity: PlayerIdentity,
     pub position: PlayerPosition,
+    pub luck: PlayerLuck,
     pub xp: PlayerXp,
 }
 
@@ -263,8 +424,6 @@ pub struct PlayerChopTransition {
     pub next_state: PlayerState,
     pub previous_tree_state: crate::tree::TreeState,
     pub next_tree_state: crate::tree::TreeState,
-    pub previous_tree_roll: crate::tree::TreeRoll,
-    pub next_tree_roll: crate::tree::TreeRoll,
     pub previous_tree_health: crate::tree::TreeHealth,
     pub next_tree_health: crate::tree::TreeHealth,
     pub success: bool,
@@ -293,11 +452,12 @@ impl PlayerChopTransition {
         if self.next_state.position != self.previous_state.position {
             return Err(anyhow!("player position changed during chop"));
         }
-        let (expected_roll, expected_success) = self
-            .previous_tree_roll
+        let (expected_luck, expected_success) = self
+            .previous_state
+            .luck
             .advance(self.previous_state.xp.value());
-        if self.next_tree_roll != expected_roll || self.success != expected_success {
-            return Err(anyhow!("player chop roll is invalid"));
+        if self.next_state.luck != expected_luck || self.success != expected_success {
+            return Err(anyhow!("player chop luck transition is invalid"));
         }
         let reward = u64::from(self.success);
         if self.previous_state.xp.value() != self.state_xp_balance_before
@@ -354,7 +514,7 @@ impl PlayerChopTransition {
         if self.state_value_before != self.dust_sats || self.state_value_after != self.dust_sats {
             return Err(anyhow!("player state must preserve one dust value"));
         }
-        let expected_tree_value = crate::tree::full_tree_value_sats(self.dust_sats)?;
+        let expected_tree_value = crate::tree::tree_value_sats(self.dust_sats);
         if self.tree_value_before != expected_tree_value
             || self.tree_value_after != expected_tree_value
         {
@@ -375,6 +535,9 @@ pub struct PlayerContract {
     /// Optional unattended renewal path for the low-authority watchtower.
     pub watchtower_renewal_spend_script: ScriptBuf,
     pub renewal_arkade_script: ScriptBuf,
+    /// Owner-authorized LOG withdrawal; XP is soulbound and cannot move.
+    pub withdraw_spend_script: ScriptBuf,
+    pub withdraw_arkade_script: ScriptBuf,
     pub owner: XOnlyPublicKey,
     pub operator: XOnlyPublicKey,
     pub emulator: XOnlyPublicKey,
@@ -393,7 +556,8 @@ pub struct PlayerContract {
 ///
 /// - chop: owner + operator + covenant-tweaked emulator;
 /// - owner renewal: owner + operator + covenant-tweaked emulator;
-/// - watchtower renewal: rollover + operator + covenant-tweaked emulator.
+/// - watchtower renewal: rollover + operator + covenant-tweaked emulator;
+/// - LOG withdrawal: owner + operator + covenant-tweaked emulator.
 ///
 /// The required Arkade CSV exit is keyed to the NUMS point, so it satisfies
 /// expiry accounting without creating a unilateral path around recursion.
@@ -431,11 +595,35 @@ pub fn build_player_contract<C: Verification>(
     let chop_arkade_script =
         player_chop_covenant_script(log_asset, xp_asset, dust_sats, tree_script)?;
     let renewal_arkade_script = player_renewal_covenant_script(log_asset, xp_asset, dust_sats)?;
+    let withdraw_arkade_script = player_withdraw_covenant_script(log_asset, xp_asset, dust_sats)?;
     let chop_tweaked_emulator =
         ark_script::compute_arkade_script_public_key(&emulator_pk, &chop_arkade_script)
             .context("derive player emulator signer")?;
-    if chop_tweaked_emulator == owner_pk || chop_tweaked_emulator == operator_pk {
-        return Err(anyhow!("tweaked emulator collides with a player signer"));
+    let renewal_tweaked_emulator =
+        ark_script::compute_arkade_script_public_key(&emulator_pk, &renewal_arkade_script)
+            .context("derive player emulator signer")?;
+    let withdraw_tweaked_emulator =
+        ark_script::compute_arkade_script_public_key(&emulator_pk, &withdraw_arkade_script)
+            .context("derive player emulator signer")?;
+    let nums: bitcoin::PublicKey = ark_core::UNSPENDABLE_KEY
+        .parse()
+        .context("parse Arkade NUMS key")?;
+    let exit_owner = nums.inner.x_only_public_key().0;
+    // Each covenant leaf's emulator position is the script-tweaked key
+    // emulator + H("ArkScriptHash", script)·G. A tweaked key equal to a plain
+    // signer of the same leaf lets that signer take the emulator path without
+    // covenant execution; equal to the NUMS exit owner the leaf is dead.
+    for tweaked_emulator in [
+        chop_tweaked_emulator,
+        renewal_tweaked_emulator,
+        withdraw_tweaked_emulator,
+    ] {
+        if [owner_pk, operator_pk, rollover_pk].contains(&tweaked_emulator) {
+            return Err(anyhow!("tweaked emulator collides with a player signer"));
+        }
+        if tweaked_emulator == exit_owner {
+            return Err(anyhow!("tweaked emulator collides with the exit key"));
+        }
     }
     let processed = ArkadeVtxoScript::new(vec![
         ArkadeVtxoInput::Arkade(ArkadeLeaf {
@@ -459,20 +647,26 @@ pub fn build_player_contract<C: Verification>(
             },
             introspectors: vec![emulator_pk],
         }),
+        ArkadeVtxoInput::Arkade(ArkadeLeaf {
+            arkade_script: withdraw_arkade_script.clone(),
+            tapscript: ArkadeTapscript::Multisig {
+                pubkeys: vec![owner_pk, operator_pk],
+            },
+            introspectors: vec![emulator_pk],
+        }),
     ])
     .context("build player Arkade tapleaves")?;
-    let [chop_spend_script, renewal_spend_script, watchtower_renewal_spend_script] =
+    let [chop_spend_script, renewal_spend_script, watchtower_renewal_spend_script, withdraw_spend_script] =
         processed.scripts.as_slice()
     else {
-        return Err(anyhow!("player contract must have chop and renewal leaves"));
+        return Err(anyhow!(
+            "player contract must have chop, renewal, and withdraw leaves"
+        ));
     };
     let chop_spend_script = chop_spend_script.clone();
     let renewal_spend_script = renewal_spend_script.clone();
     let watchtower_renewal_spend_script = watchtower_renewal_spend_script.clone();
-    let nums: bitcoin::PublicKey = ark_core::UNSPENDABLE_KEY
-        .parse()
-        .context("parse Arkade NUMS key")?;
-    let exit_owner = nums.inner.x_only_public_key().0;
+    let withdraw_spend_script = withdraw_spend_script.clone();
     let scripts = processed
         .scripts
         .into_iter()
@@ -495,6 +689,8 @@ pub fn build_player_contract<C: Verification>(
         renewal_spend_script,
         watchtower_renewal_spend_script,
         renewal_arkade_script,
+        withdraw_spend_script,
+        withdraw_arkade_script,
         owner: owner_pk,
         operator: operator_pk,
         emulator: emulator_pk,
@@ -529,8 +725,11 @@ pub fn player_renewal_covenant_script(
     .push_opcode(op::INSPECTINPUTVALUE)
     .push_int(dust)
     .push_opcode(OP_EQUALVERIFY);
+    let builder = push_canonical_initial_player_luck(builder, RENEWAL_STATE_INPUT_INDEX);
     let builder = crate::tree::push_equal_state_packet(builder, PLAYER_IDENTITY_PACKET_TYPE);
     let builder = crate::tree::push_equal_state_packet(builder, PLAYER_POSITION_PACKET_TYPE);
+    let builder = crate::tree::push_equal_state_packet(builder, PLAYER_ROLL_PACKET_TYPE);
+    let builder = crate::tree::push_equal_state_packet(builder, PLAYER_LUCK_CREDIT_PACKET_TYPE);
     let builder = crate::tree::push_equal_state_packet(builder, PLAYER_XP_PACKET_TYPE);
     let builder = crate::tree::push_renewal_asset_shell(builder)?;
     let builder = crate::tree::push_player_marker_group(
@@ -565,6 +764,151 @@ pub fn player_renewal_covenant_script(
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(OP_EQUAL)
         .into_script())
+}
+
+/// Covenant for the owner-authorized LOG withdrawal leaf. Only LOG may leave:
+/// the player state must exit with its exact P2TR, dust, PLAYER_ID, identity,
+/// position, luck, XP packet, and XP balance intact, so XP is soulbound and
+/// can never move. The destination is the owner's choice, funded entirely by
+/// the wallet input.
+///
+/// Canonical shape:
+///
+/// ```text
+/// vin 0 player state | vin 1 wallet funding
+/// vout 0 player state | vout 1 LOG destination | vout 2 extension | vout 3 anchor
+/// groups 0..2 PLAYER_ID | LOG | XP
+/// ```
+pub fn player_withdraw_covenant_script(
+    log_asset: AssetId,
+    xp_asset: AssetId,
+    dust_sats: u64,
+) -> Result<ScriptBuf> {
+    if log_asset == xp_asset {
+        return Err(anyhow!("LOG and XP assets must differ"));
+    }
+    let dust = i64::try_from(dust_sats)
+        .map_err(|_| anyhow!("player dust exceeds script integer range"))?;
+    let anchor_program =
+        crate::tree::witness_v1_program(&ark_core::anchor_output().script_pubkey, "Arkade anchor")?;
+    let builder = Builder::new()
+        .push_opcode(op::PUSHCURRENTINPUTINDEX)
+        .push_int(crate::protocol::WITHDRAW_STATE_INPUT_INDEX as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(op::INSPECTNUMINPUTS)
+        .push_int(crate::protocol::WITHDRAW_INPUT_COUNT as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(op::INSPECTNUMOUTPUTS)
+        .push_int(crate::protocol::WITHDRAW_OUTPUT_COUNT as i64)
+        .push_opcode(OP_EQUALVERIFY);
+    // The state keeps its exact P2TR and dust; the destination is funded
+    // entirely by the wallet input with zero fee skimmed from state.
+    let builder = crate::tree::push_equal_input_output_scripts(
+        builder,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+        crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX,
+    )
+    .push_int(i64::from(crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX))
+    .push_opcode(op::INSPECTOUTPUTVALUE)
+    .push_int(dust)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_int(crate::protocol::WITHDRAW_STATE_INPUT_INDEX as i64)
+    .push_opcode(op::INSPECTINPUTVALUE)
+    .push_int(dust)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_int(i64::from(
+        crate::protocol::WITHDRAW_DESTINATION_OUTPUT_INDEX,
+    ))
+    .push_opcode(op::INSPECTOUTPUTVALUE)
+    .push_int(crate::protocol::WITHDRAW_FUNDING_INPUT_INDEX as i64)
+    .push_opcode(op::INSPECTINPUTVALUE)
+    .push_opcode(OP_EQUALVERIFY);
+    let builder =
+        push_canonical_initial_player_luck(builder, crate::protocol::WITHDRAW_STATE_INPUT_INDEX);
+    // Identity, position, luck, and the XP counter are preserved byte-for-byte.
+    let builder = crate::tree::push_equal_state_packet_at(
+        builder,
+        PLAYER_IDENTITY_PACKET_TYPE,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+    );
+    let builder = crate::tree::push_equal_state_packet_at(
+        builder,
+        PLAYER_POSITION_PACKET_TYPE,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+    );
+    let builder = crate::tree::push_equal_state_packet_at(
+        builder,
+        PLAYER_ROLL_PACKET_TYPE,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+    );
+    let builder = crate::tree::push_equal_state_packet_at(
+        builder,
+        PLAYER_LUCK_CREDIT_PACKET_TYPE,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+    );
+    let builder = crate::tree::push_equal_state_packet_at(
+        builder,
+        PLAYER_XP_PACKET_TYPE,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+    );
+    let builder = crate::tree::push_extension_and_anchor_shape(
+        builder,
+        crate::protocol::WITHDRAW_EXTENSION_OUTPUT_INDEX,
+        crate::protocol::WITHDRAW_ANCHOR_OUTPUT_INDEX,
+        &anchor_program,
+    )
+    .push_int(i64::from(crate::protocol::WITHDRAW_EXTENSION_OUTPUT_INDEX))
+    .push_opcode(op::INSPECTOUTASSETCOUNT)
+    .push_int(0)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_int(i64::from(crate::protocol::WITHDRAW_ANCHOR_OUTPUT_INDEX))
+    .push_opcode(op::INSPECTOUTASSETCOUNT)
+    .push_int(0)
+    .push_opcode(OP_EQUALVERIFY);
+    let builder = crate::tree::push_player_marker_group(
+        builder,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+        crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX,
+    );
+    let builder = crate::tree::push_player_renewal_group_set(builder, log_asset, xp_asset);
+
+    // LOG conservation: state-in minus state-out is exactly the destination.
+    let builder = crate::tree::push_input_asset_lookup(
+        builder,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+        log_asset,
+    )
+    .push_int(1)
+    .push_opcode(OP_EQUALVERIFY);
+    let builder = crate::tree::push_optional_output_asset_lookup(
+        builder,
+        crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX,
+        log_asset,
+    )
+    .push_opcode(OP_DROP)
+    .push_opcode(OP_SUB);
+    let builder = crate::tree::push_optional_output_asset_lookup(
+        builder,
+        crate::protocol::WITHDRAW_DESTINATION_OUTPUT_INDEX,
+        log_asset,
+    )
+    .push_opcode(OP_DROP)
+    .push_opcode(OP_EQUALVERIFY);
+    // XP is soulbound: presence and amount are preserved exactly.
+    let builder = crate::tree::push_optional_input_asset_lookup(
+        builder,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+        xp_asset,
+    );
+    Ok(crate::tree::push_optional_output_asset_lookup(
+        builder,
+        crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX,
+        xp_asset,
+    )
+    .push_opcode(OP_ROT)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_opcode(OP_EQUAL)
+    .into_script())
 }
 
 /// Convert a canonical indexed player-state VTXO into its chop spend path.
@@ -644,12 +988,12 @@ fn canonical_player_state_assets<'a>(
 /// Build the personalized half of the atomic PLAYER/TREE chop.
 ///
 /// The player state owns its LOG and XP inventory directly. The shared tree
-/// covenant enforces the reciprocal transfers and deterministic roll.
+/// covenant enforces the reciprocal transfers and player-luck transition.
 ///
 /// This half proves owner continuity: the player P2TR/value, identity,
 /// position, PLAYER_ID, and XP backing survive, and both tree endpoints are the
-/// manifest-pinned shared contract. The tree half computes the public roll and
-/// enforces the reciprocal TREE/LOG/XP and health deltas.
+/// manifest-pinned shared contract. The tree half computes the public
+/// player-bound reward and enforces the reciprocal TREE/LOG/XP and health deltas.
 pub fn player_chop_covenant_script(
     log_asset: AssetId,
     xp_asset: AssetId,
@@ -669,7 +1013,7 @@ pub fn player_chop_covenant_script(
         .map_err(|_| anyhow!("player dust exceeds script integer range"))?;
     let tree_program = PushBytesBuf::try_from(tree_script.as_bytes()[2..].to_vec())
         .expect("validated witness program is a bounded push");
-    let tree_value = i64::try_from(crate::tree::full_tree_value_sats(dust_sats)?)
+    let tree_value = i64::try_from(crate::tree::tree_value_sats(dust_sats))
         .map_err(|_| anyhow!("tree value exceeds script integer range"))?;
     let anchor_program =
         PushBytesBuf::try_from(P2A_PROGRAM.to_vec()).expect("P2A is a bounded push");
@@ -748,6 +1092,7 @@ pub fn player_chop_covenant_script(
         .push_opcode(op::INSPECTOUTPUTVALUE)
         .push_int(0)
         .push_opcode(OP_EQUALVERIFY);
+    let builder = push_canonical_initial_player_luck(builder, PLAYER_STATE_INPUT_INDEX);
 
     let builder = push_preserved_player_packet(
         builder,
@@ -759,6 +1104,7 @@ pub fn player_chop_covenant_script(
         PLAYER_POSITION_PACKET_TYPE,
         PLAYER_STATE_INPUT_INDEX,
     );
+    let builder = push_advanced_player_luck(builder, PLAYER_STATE_INPUT_INDEX).push_opcode(OP_DROP);
     let builder = crate::tree::push_player_marker_group(
         builder,
         PLAYER_STATE_INPUT_INDEX,
@@ -804,6 +1150,18 @@ pub fn attach_player_state_packets(psbt: &mut Psbt, state: PlayerState) -> Resul
     .context("attach player position packet")?;
     ark_core::extension::add_packet_to_psbt(
         &mut updated,
+        PLAYER_ROLL_PACKET_TYPE,
+        &state.luck.roll.encode(),
+    )
+    .context("attach player roll packet")?;
+    ark_core::extension::add_packet_to_psbt(
+        &mut updated,
+        PLAYER_LUCK_CREDIT_PACKET_TYPE,
+        &state.luck.credit.encode(),
+    )
+    .context("attach player luck credit packet")?;
+    ark_core::extension::add_packet_to_psbt(
+        &mut updated,
         PLAYER_XP_PACKET_TYPE,
         &state.xp.encode(),
     )
@@ -815,15 +1173,21 @@ pub fn attach_player_state_packets(psbt: &mut Psbt, state: PlayerState) -> Resul
 /// Decode complete player state from a transaction. No player packets means
 /// `None`; a partial set is rejected rather than silently defaulted.
 pub fn player_state_from_tx(tx: &Transaction) -> Result<Option<PlayerState>> {
-    let [identity, position, xp] = player_packet_payloads(tx)?;
+    let [identity, position, roll, credit, xp] = player_packet_payloads(tx)?;
 
-    match (identity, position, xp) {
-        (None, None, None) => Ok(None),
-        (Some(identity), Some(position), Some(xp)) => Ok(Some(PlayerState {
-            identity: PlayerIdentity::decode(identity)?,
-            position: PlayerPosition::decode(position)?,
-            xp: PlayerXp::decode(xp)?,
-        })),
+    match (identity, position, roll, credit, xp) {
+        (None, None, None, None, None) => Ok(None),
+        (Some(identity), Some(position), Some(roll), Some(credit), Some(xp)) => {
+            Ok(Some(PlayerState {
+                identity: PlayerIdentity::decode(identity)?,
+                position: PlayerPosition::decode(position)?,
+                luck: PlayerLuck {
+                    roll: PlayerRoll::decode(roll)?,
+                    credit: PlayerLuckCredit::decode(credit)?,
+                },
+                xp: PlayerXp::decode(xp)?,
+            }))
+        }
         _ => Err(anyhow!("transaction contains incomplete player state")),
     }
 }
@@ -837,7 +1201,6 @@ pub fn attach_player_chop_context(
     tree_contract: &crate::tree::TreeContract,
     previous_input_txs: [&Transaction; 2],
     next_state: PlayerState,
-    next_tree_roll: crate::tree::TreeRoll,
 ) -> Result<()> {
     if psbt.unsigned_tx.input.len() != 2 {
         return Err(anyhow!("player chop requires exactly two inputs"));
@@ -863,7 +1226,7 @@ pub fn attach_player_chop_context(
         .witness_utxo
         .as_ref()
         .expect("previous transaction helper validated the tree source");
-    if tree_source_output.value.to_sat() != crate::tree::full_tree_value_sats(contract.dust_sats)?
+    if tree_source_output.value.to_sat() != crate::tree::tree_value_sats(contract.dust_sats)
         || tree_source_output.script_pubkey != tree_contract.vtxo.script_pubkey()
         || contract.tree_script_pubkey != tree_contract.vtxo.script_pubkey()
     {
@@ -876,15 +1239,10 @@ pub fn attach_player_chop_context(
         .ok_or_else(|| anyhow!("previous player transaction has no complete state"))?;
     let tree_state = crate::tree::tree_state_from_tx(previous_input_txs[TREE_INPUT_INDEX])?
         .ok_or_else(|| anyhow!("previous tree transaction has no tree state"))?;
-    let previous_tree_roll = crate::tree::tree_roll_from_tx(previous_input_txs[TREE_INPUT_INDEX])?
-        .ok_or_else(|| anyhow!("previous tree transaction has no tree roll"))?;
     let previous_tree_health =
         crate::tree::tree_health_from_tx(previous_input_txs[TREE_INPUT_INDEX])?
             .ok_or_else(|| anyhow!("previous tree transaction has no tree health"))?;
-    let (expected_tree_roll, success) = previous_tree_roll.advance(previous_state.xp.value());
-    if next_tree_roll != expected_tree_roll {
-        return Err(anyhow!("next tree roll is not the SHA-256 successor"));
-    }
+    let (expected_luck, success) = previous_state.luck.advance(previous_state.xp.value());
     let expected_xp = if success {
         previous_state.xp.increment()?
     } else {
@@ -892,6 +1250,7 @@ pub fn attach_player_chop_context(
     };
     if next_state.identity != previous_state.identity
         || next_state.position != previous_state.position
+        || next_state.luck != expected_luck
         || next_state.xp != expected_xp
     {
         return Err(anyhow!(
@@ -906,7 +1265,6 @@ pub fn attach_player_chop_context(
     )?;
     attach_player_state_packets(&mut updated, next_state)?;
     crate::tree::attach_tree_state_packet(&mut updated, tree_state)?;
-    crate::tree::attach_tree_roll_packet(&mut updated, next_tree_roll)?;
     crate::tree::attach_tree_health_packet(&mut updated, next_health)?;
     let packet = ark_core::introspector::packet::Packet::new(vec![
         ark_core::introspector::packet::IntrospectorEntry {
@@ -1094,8 +1452,8 @@ fn verify_exact_signatures(
     Ok(())
 }
 
-fn player_packet_payloads(tx: &Transaction) -> Result<[Option<&[u8]>; 3]> {
-    let mut packets = [None, None, None];
+fn player_packet_payloads(tx: &Transaction) -> Result<[Option<&[u8]>; 5]> {
+    let mut packets = [None, None, None, None, None];
     for output in &tx.output {
         let Some(extension) = ark_core::extension::extension_payload(&output.script_pubkey) else {
             continue;
@@ -1106,7 +1464,9 @@ fn player_packet_payloads(tx: &Transaction) -> Result<[Option<&[u8]>; 3]> {
             let slot = match packet_type {
                 PLAYER_IDENTITY_PACKET_TYPE => &mut packets[0],
                 PLAYER_POSITION_PACKET_TYPE => &mut packets[1],
-                PLAYER_XP_PACKET_TYPE => &mut packets[2],
+                PLAYER_ROLL_PACKET_TYPE => &mut packets[2],
+                PLAYER_LUCK_CREDIT_PACKET_TYPE => &mut packets[3],
+                PLAYER_XP_PACKET_TYPE => &mut packets[4],
                 _ => continue,
             };
             if slot.replace(payload).is_some() {
@@ -1133,6 +1493,166 @@ pub(crate) fn push_preserved_player_packet(
         .push_int(1)
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(OP_EQUALVERIFY)
+}
+
+fn push_player_roll_bucket(builder: Builder, player_input_index: usize) -> Builder {
+    let positive_sign = PushBytesBuf::try_from(vec![0]).expect("one-byte sign extension");
+    builder
+        .push_int(PLAYER_ROLL_PACKET_TYPE.into())
+        .push_int(player_input_index as i64)
+        .push_opcode(op::INSPECTINPUTPACKET)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_SIZE)
+        .push_int(PLAYER_ROLL_LEN as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_SHA256)
+        .push_opcode(OP_DUP)
+        .push_int(PLAYER_ROLL_PACKET_TYPE.into())
+        .push_opcode(op::INSPECTPACKET)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_slice(positive_sign)
+        .push_opcode(OP_CAT)
+        .push_opcode(op::BIN2NUM)
+        .push_int(CHOP_ROLL_BASIS_POINTS as i64)
+        .push_opcode(OP_MOD)
+}
+
+fn push_log_drop_basis_points(builder: Builder, player_input_index: usize) -> Builder {
+    let builder = push_player_input_xp(builder, player_input_index)
+        .push_int(1)
+        .push_opcode(OP_ADD)
+        .push_int(BASE_LOG_DROP_BASIS_POINTS as i64);
+    let mut builder = builder;
+    for threshold in LEVEL_LOG_DROP_XP_THRESHOLDS {
+        builder = builder
+            .push_opcode(bitcoin::opcodes::all::OP_OVER)
+            .push_int(threshold as i64)
+            .push_opcode(OP_GREATERTHAN)
+            .push_opcode(OP_IF)
+            .push_int(LEVEL_LOG_DROP_BONUS_BASIS_POINTS as i64)
+            .push_opcode(OP_ADD)
+            .push_opcode(OP_ENDIF);
+    }
+    builder
+        .push_opcode(OP_TOALTSTACK)
+        .push_opcode(OP_DROP)
+        .push_opcode(OP_FROMALTSTACK)
+}
+
+fn push_luck_credit_value(builder: Builder, input_index: Option<usize>) -> Builder {
+    let builder = builder.push_int(PLAYER_LUCK_CREDIT_PACKET_TYPE.into());
+    let builder = match input_index {
+        Some(index) => builder
+            .push_int(index as i64)
+            .push_opcode(op::INSPECTINPUTPACKET),
+        None => builder.push_opcode(op::INSPECTPACKET),
+    };
+    builder
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_SIZE)
+        .push_int(PLAYER_LUCK_CREDIT_LEN as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_DUP)
+        .push_opcode(op::BIN2NUM)
+        .push_opcode(OP_DUP)
+        .push_int(PLAYER_LUCK_CREDIT_LEN as i64)
+        .push_opcode(op::NUM2BIN)
+        .push_opcode(OP_ROT)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_DUP)
+        .push_int(-1)
+        .push_opcode(OP_GREATERTHAN)
+        .push_opcode(OP_VERIFY)
+        .push_opcode(OP_DUP)
+        .push_int((MAX_LUCK_CREDIT + 1) as i64)
+        .push_opcode(OP_LESSTHAN)
+        .push_opcode(OP_VERIFY)
+}
+/// Require a direct issuance-to-state activation to start from the
+/// identity-derived roll and canonical credit. In that canonical shape, the
+/// PLAYER_ID AssetId txid equals the state input's outpoint txid only on the
+/// first recursive spend. Checking every player leaf prevents a malformed
+/// direct activation from being laundered through renewal or withdrawal. It
+/// cannot prove ancestry before the marker entered this covenant.
+pub(crate) fn push_canonical_initial_player_luck(
+    builder: Builder,
+    player_input_index: usize,
+) -> Builder {
+    let domain = PushBytesBuf::try_from(PLAYER_ROLL_DOMAIN.to_vec())
+        .expect("player-roll domain is a bounded push");
+    let builder = builder
+        .push_int(crate::protocol::PLAYER_ID_ASSET_GROUP_INDEX as i64)
+        .push_opcode(op::INSPECTASSETGROUPASSETID)
+        .push_int(crate::protocol::PLAYER_ID_ASSET_GROUP_INDEX as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_int(player_input_index as i64)
+        .push_opcode(op::INSPECTINPUTOUTPOINT)
+        .push_opcode(OP_DROP)
+        .push_opcode(OP_EQUAL)
+        .push_opcode(OP_IF)
+        .push_slice(domain)
+        .push_int(PLAYER_IDENTITY_PACKET_TYPE.into())
+        .push_int(player_input_index as i64)
+        .push_opcode(op::INSPECTINPUTPACKET)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_CAT)
+        .push_opcode(OP_SHA256)
+        .push_int(PLAYER_ROLL_PACKET_TYPE.into())
+        .push_int(player_input_index as i64)
+        .push_opcode(op::INSPECTINPUTPACKET)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_EQUALVERIFY);
+    push_luck_credit_value(builder, Some(player_input_index))
+        .push_int(INITIAL_LUCK_CREDIT as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_ENDIF)
+}
+
+/// Verify and advance the player-bound roll and bounded luck credit, leaving
+/// the canonical reward bit on the stack.
+pub(crate) fn push_advanced_player_luck(builder: Builder, player_input_index: usize) -> Builder {
+    let builder = push_player_roll_bucket(builder, player_input_index);
+    let builder = push_log_drop_basis_points(builder, player_input_index)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
+        .push_opcode(OP_LESSTHAN);
+    let builder = push_luck_credit_value(builder, Some(player_input_index))
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_ADD)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_int(MAX_LUCK_CREDIT as i64)
+        .push_opcode(OP_GREATERTHAN)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_2DROP)
+        .push_int(1)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_DUP)
+        .push_int(CHOP_ROLL_BASIS_POINTS as i64)
+        .push_opcode(OP_LESSTHAN)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_2DROP)
+        .push_int(0)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_DROP)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_FROMALTSTACK)
+        .push_int(CHOP_ROLL_BASIS_POINTS as i64)
+        .push_opcode(OP_SUB)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_ENDIF);
+    push_luck_credit_value(builder, None).push_opcode(OP_EQUALVERIFY)
 }
 
 fn push_xp_packet_value(builder: Builder, input_index: Option<usize>) -> Builder {
@@ -1198,9 +1718,11 @@ mod tests {
     }
 
     fn state(xp: u64) -> PlayerState {
+        let identity = PlayerIdentity { player_id: [7; 32] };
         PlayerState {
-            identity: PlayerIdentity { player_id: [7; 32] },
+            identity,
             position: PlayerPosition { x: 3, y: 17 },
+            luck: PlayerLuck::initial(identity),
             xp: PlayerXp::new(xp),
         }
     }
@@ -1211,40 +1733,44 @@ mod tests {
             x: 7,
             y: 13,
         };
-        let mut previous_tree_roll = crate::tree::TreeRoll::initial(tree_state);
-        let next_tree_roll = loop {
-            let (next, drop) = previous_tree_roll.advance(4);
+        let mut previous_state = state(4);
+        previous_state.luck.credit = PlayerLuckCredit::new(
+            CHOP_ROLL_BASIS_POINTS - log_drop_basis_points(previous_state.xp.value()),
+        )
+        .unwrap();
+        loop {
+            let (next_luck, drop) = previous_state.luck.advance(previous_state.xp.value());
             if drop == success {
-                break next;
+                let reward = u64::from(success);
+                let mut next_state = previous_state;
+                next_state.luck = next_luck;
+                next_state.xp = PlayerXp::new(previous_state.xp.value() + reward);
+                return PlayerChopTransition {
+                    previous_state,
+                    next_state,
+                    previous_tree_state: tree_state,
+                    next_tree_state: tree_state,
+                    previous_tree_health: crate::tree::TreeHealth::new(5).unwrap(),
+                    next_tree_health: crate::tree::TreeHealth::new(5 - reward).unwrap(),
+                    success,
+                    state_logs_before: 9,
+                    state_logs_after: 9 + reward,
+                    state_xp_balance_before: 4,
+                    state_xp_balance_after: 4 + reward,
+                    tree_markers_before: 1,
+                    tree_markers_after: 1,
+                    tree_logs_before: 5,
+                    tree_logs_after: 5 - reward,
+                    tree_xp_balance_before: 5,
+                    tree_xp_balance_after: 5 - reward,
+                    state_value_before: 330,
+                    state_value_after: 330,
+                    tree_value_before: 330,
+                    tree_value_after: 330,
+                    dust_sats: 330,
+                };
             }
-            previous_tree_roll = next;
-        };
-        let reward = u64::from(success);
-        PlayerChopTransition {
-            previous_state: state(4),
-            next_state: state(4 + reward),
-            previous_tree_state: tree_state,
-            next_tree_state: tree_state,
-            previous_tree_roll,
-            next_tree_roll,
-            previous_tree_health: crate::tree::TreeHealth::new(5).unwrap(),
-            next_tree_health: crate::tree::TreeHealth::new(5 - reward).unwrap(),
-            success,
-            state_logs_before: 9,
-            state_logs_after: 9 + reward,
-            state_xp_balance_before: 4,
-            state_xp_balance_after: 4 + reward,
-            tree_markers_before: 1,
-            tree_markers_after: 1,
-            tree_logs_before: 5,
-            tree_logs_after: 5 - reward,
-            tree_xp_balance_before: 5,
-            tree_xp_balance_after: 5 - reward,
-            state_value_before: 330,
-            state_value_after: 330,
-            tree_value_before: 1_980,
-            tree_value_after: 1_980,
-            dust_sats: 330,
+            previous_state.luck.roll = next_luck.roll;
         }
     }
 
@@ -1269,6 +1795,102 @@ mod tests {
         let mut negative_zero = [0_u8; PLAYER_XP_LEN];
         negative_zero[PLAYER_XP_LEN - 1] = 0x80;
         assert!(PlayerXp::decode(&negative_zero).is_err());
+    }
+    #[test]
+    fn player_luck_vectors_and_initial_rate_are_stable() {
+        let identity = PlayerIdentity { player_id: [7; 32] };
+        let initial = PlayerLuck::initial(identity);
+        assert_eq!(
+            initial.roll.encode().to_lower_hex_string(),
+            "2f84c0ca7bc7f7af921caf1a33a8751601baff69e6bb0da963af2cf97ac54a24"
+        );
+        assert_eq!(
+            initial.credit.encode().to_lower_hex_string(),
+            "401f00000000000000"
+        );
+        let (next, success) = initial.advance(0);
+        assert_eq!(
+            next.roll.encode().to_lower_hex_string(),
+            "baae20577f224870603acdea2ea14398d861dcfdac463cb0a601b028bd0b2bee"
+        );
+        assert_eq!(next.roll.bucket(), 5_066);
+        assert_eq!(success, next.roll.bucket() < BASE_LOG_DROP_BASIS_POINTS);
+        assert_eq!(
+            initial.credit.value() + BASE_LOG_DROP_BASIS_POINTS,
+            LUCK_WINDOW_BASIS_POINTS
+        );
+        assert_eq!(next.credit.value(), LUCK_WINDOW_BASIS_POINTS);
+
+        let mut negative_zero = [0_u8; PLAYER_LUCK_CREDIT_LEN];
+        negative_zero[PLAYER_LUCK_CREDIT_LEN - 1] = 0x80;
+        assert!(PlayerLuckCredit::decode(&negative_zero).is_err());
+        let mut over_max = [0_u8; PLAYER_LUCK_CREDIT_LEN];
+        over_max[..8].copy_from_slice(&(MAX_LUCK_CREDIT + 1).to_le_bytes());
+        assert!(PlayerLuckCredit::decode(&over_max).is_err());
+    }
+
+    #[test]
+    fn luck_credit_bounds_long_runs_above_and_below_expectation() {
+        for (index, xp) in [0, 1_154, 4_470, 13_363, 37_224, 101_333]
+            .into_iter()
+            .enumerate()
+        {
+            let identity = PlayerIdentity {
+                player_id: [index as u8 + 1; 32],
+            };
+            let mut luck = PlayerLuck::initial(identity);
+            let initial_credit = luck.credit.value();
+            let rate = log_drop_basis_points(xp);
+            let mut successes = 0_u64;
+            let mut miss_run = 0_u64;
+            let mut success_run = 0_u64;
+            let mut max_miss_run = 0_u64;
+            let mut max_success_run = 0_u64;
+            for _ in 0..100_000 {
+                let previous_credit = luck.credit.value();
+                let (next, success) = luck.advance(xp);
+                assert!(next.credit.value() <= MAX_LUCK_CREDIT);
+                assert_eq!(
+                    next.credit.value() + u64::from(success) * CHOP_ROLL_BASIS_POINTS,
+                    previous_credit + rate
+                );
+                if success {
+                    successes += 1;
+                    success_run += 1;
+                    miss_run = 0;
+                    max_success_run = max_success_run.max(success_run);
+                } else {
+                    miss_run += 1;
+                    success_run = 0;
+                    max_miss_run = max_miss_run.max(miss_run);
+                }
+                luck = next;
+            }
+            assert_eq!(
+                successes * CHOP_ROLL_BASIS_POINTS + luck.credit.value(),
+                initial_credit + 100_000 * rate
+            );
+            assert!(max_miss_run <= 10, "XP {xp}: miss run {max_miss_run}");
+            assert!(
+                max_success_run <= 2,
+                "XP {xp}: success run {max_success_run}"
+            );
+        }
+    }
+
+    #[test]
+    fn changing_tree_target_cannot_change_the_player_reward() {
+        for success in [false, true] {
+            let baseline = transition(success);
+            for tree_id in [417, 418, 2_516] {
+                let mut targeted = baseline;
+                targeted.previous_tree_state.tree_id = tree_id;
+                targeted.next_tree_state.tree_id = tree_id;
+                targeted.validate().unwrap();
+                assert_eq!(targeted.next_state.luck, baseline.next_state.luck);
+                assert_eq!(targeted.success, baseline.success);
+            }
+        }
     }
 
     #[test]
@@ -1321,7 +1943,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(contract.tree_script_pubkey, tree_script);
-        assert_eq!(contract.vtxo.tapscripts().len(), 4);
+        assert_eq!(contract.vtxo.tapscripts().len(), 5);
         assert!(contract.chop_arkade_script.len() <= 10_000);
 
         let renewal_emulator = ark_script::compute_arkade_script_public_key(
@@ -1407,5 +2029,108 @@ mod tests {
         assert_eq!(xp_for_level(99), Some(13_034_431));
         assert_eq!(xp_for_level(0), None);
         assert_eq!(xp_for_level(100), None);
+        for (xp, basis_points) in [
+            (0, 2_000),
+            (1_153, 2_000),
+            (1_154, 2_200),
+            (4_469, 2_200),
+            (4_470, 2_400),
+            (13_362, 2_400),
+            (13_363, 2_600),
+            (37_223, 2_600),
+            (37_224, 2_800),
+            (101_332, 2_800),
+            (101_333, 3_000),
+            (u64::MAX, 3_000),
+        ] {
+            assert_eq!(log_drop_basis_points(xp), basis_points, "XP {xp}");
+        }
+    }
+
+    #[test]
+    fn withdraw_script_moves_log_only_and_keeps_xp_soulbound() {
+        let withdraw = player_withdraw_covenant_script(asset(2, 1), asset(2, 2), 330).unwrap();
+        assert!(withdraw.len() <= 10_000);
+        let asm = ark_script::to_asm(&withdraw).unwrap();
+        // Two-input/four-output shape pinned by the covenant.
+        assert!(asm.contains("OP_INSPECTNUMINPUTS OP_PUSHNUM_2 OP_EQUALVERIFY"));
+        assert!(asm.contains("OP_INSPECTNUMOUTPUTS OP_PUSHNUM_4 OP_EQUALVERIFY"));
+        // LOG conservation relation: state-in minus state-out equals the
+        // destination amount.
+        assert!(asm.contains("OP_SUB"));
+        // XP preservation uses the optional-lookup ROT-equality pattern, so
+        // the XP balance can never leave the player state.
+        assert!(asm.contains("OP_ROT"));
+
+        let secp = Secp256k1::new();
+        let owner = xonly(&secp, 3);
+        let operator = xonly(&secp, 4);
+        let emulator = xonly(&secp, 5);
+        let rollover = xonly(&secp, 7);
+        let tree_script =
+            Address::p2tr(&secp, xonly(&secp, 6), None, Network::Regtest).script_pubkey();
+        let contract = build_player_contract(
+            &secp,
+            owner,
+            operator,
+            emulator,
+            rollover,
+            Sequence::from_height(144),
+            Network::Regtest,
+            asset(2, 0),
+            asset(2, 1),
+            asset(2, 2),
+            330,
+            &tree_script,
+        )
+        .unwrap();
+        let tweaked = ark_script::compute_arkade_script_public_key(
+            &emulator,
+            &contract.withdraw_arkade_script,
+        )
+        .unwrap();
+        let signers = ark_core::script::extract_checksig_pubkeys(&contract.withdraw_spend_script);
+        assert_eq!(signers.len(), 3);
+        assert!(signers.contains(&owner));
+        assert!(signers.contains(&operator));
+        assert!(signers.contains(&tweaked));
+    }
+
+    #[test]
+    fn player_contract_rejects_tweaked_emulator_collision() {
+        let secp = Secp256k1::new();
+        let operator = xonly(&secp, 4);
+        let emulator = xonly(&secp, 5);
+        let rollover = xonly(&secp, 7);
+        let tree_script =
+            Address::p2tr(&secp, xonly(&secp, 6), None, Network::Regtest).script_pubkey();
+        let (tree_asset, log_asset, xp_asset) = (asset(2, 0), asset(2, 1), asset(2, 2));
+        let chop = player_chop_covenant_script(log_asset, xp_asset, 330, &tree_script).unwrap();
+        let renewal = player_renewal_covenant_script(log_asset, xp_asset, 330).unwrap();
+        // An owner key equal to a script-tweaked emulator key could satisfy
+        // the emulator position without executing the covenant.
+        for script in [&chop, &renewal] {
+            let owner = ark_script::compute_arkade_script_public_key(&emulator, script).unwrap();
+            let error = build_player_contract(
+                &secp,
+                owner,
+                operator,
+                emulator,
+                rollover,
+                Sequence::from_height(144),
+                Network::Regtest,
+                tree_asset,
+                log_asset,
+                xp_asset,
+                330,
+                &tree_script,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "tweaked emulator collides with a player signer"
+            );
+        }
     }
 }

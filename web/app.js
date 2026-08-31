@@ -11,6 +11,9 @@ const PROFILE = `woodland.sh:web:v1:profile:${STORAGE_SCOPE}`;
 let profileStorageKey = PROFILE;
 let pendingStorageKey = `woodland.sh:web:v1:pending:${STORAGE_SCOPE}`;
 const POSITION = `woodland.sh:web:v1:position:${STORAGE_SCOPE}`;
+const PLAYER_BACKUP_FORMAT = 'woodland.sh/player-backup';
+const PLAYER_BACKUP_VERSION = 1;
+const MAX_PLAYER_BACKUP_BYTES = 64 * 1024;
 
 const element = (id) => document.getElementById(id);
 const address = element('address');
@@ -24,7 +27,7 @@ const playerState = element('player-state');
 const playerSession = element('player-session');
 const xpBacking = element('xp-backing');
 const logChance = element('log-chance');
-const regrowReady = element('regrow-ready');
+const treeState = element('tree-state');
 const emulator = element('emulator');
 const status = element('status');
 const log = element('log');
@@ -44,6 +47,7 @@ const hudLevel = element('hud-level');
 const hudXp = element('hud-xp');
 const hudLogs = element('hud-logs');
 const hudOnline = element('hud-online');
+const hudPosition = element('hud-position');
 const mapHint = element('map-hint');
 const refreshButton = element('refresh');
 const renewButton = element('renew-player');
@@ -60,13 +64,18 @@ const chatInput = element('chat-input');
 const sendChatButton = element('send-chat');
 const chatMessagesElement = element('chat-messages');
 const chatStatus = element('chat-status');
+const downloadBackupButton = element('download-backup');
+const restoreBackupButton = element('restore-backup');
+const restoreBackupFile = element('restore-backup-file');
+const backupStatus = element('backup-status');
 
 const DEFAULT_MAP_WIDTH = 425;
 const DEFAULT_MAP_HEIGHT = 425;
-const WALK_STEP_MS = 45;
+const WALK_STEP_MS = 90;
 const CHOP_FLASH_MS = 340;
 const CHOP_CADENCE_MS = 1_000;
 const CHOP_FEEDBACK_MS = 1_000;
+const LOCATION_POST_INTERVAL_MS = 750;
 const LOG_FLASH_MS = 800;
 const DIRECTIONS = [[0, -1], [-1, 0], [1, 0], [0, 1]];
 const TREE_GLYPH = '🌲';
@@ -107,6 +116,7 @@ let delegationAvailable = false;
 let socialPosting = false;
 let locationPosting = false;
 let lastPublishedLocation = null;
+let nextLocationPostAt = 0;
 let lastRenderedChatId = null;
 let mapFrame = null;
 let worldManifest = null;
@@ -366,10 +376,18 @@ async function postServerAction(path, body) {
 }
 
 async function publishLocation(force = false) {
-  if (!SERVER_URL || !serverRegistered || !state?.playerActive || locationPosting) return;
+  const now = Date.now();
+  if (
+    !SERVER_URL
+    || !serverRegistered
+    || !state?.playerActive
+    || locationPosting
+    || now < nextLocationPostAt
+  ) return;
   const location = `${player.x}:${player.y}`;
   if (!force && location === lastPublishedLocation) return;
   locationPosting = true;
+  nextLocationPostAt = now + LOCATION_POST_INTERVAL_MS;
   try {
     const locationRequest = await withApp(() => (
       app.serverLocation(SERVER_URL, player.x, player.y, Date.now())
@@ -717,9 +735,9 @@ function updateMapHint(adjacent) {
   else if (!state.playerActive) mapHint.textContent = 'Fund and activate the player.';
   else if (!state.fundingReady) mapHint.textContent = 'Player state is reconciling.';
   else if (adjacent?.health === 0) {
-    mapHint.textContent = adjacent.respawnInSeconds == null
-      ? `Tree #${adjacent.treeId} has exhausted its LOG and XP reserve.`
-      : `Tree #${adjacent.treeId} returns in ${adjacent.respawnInSeconds}s.`;
+    mapHint.textContent = adjacent.depleted
+      ? `Tree #${adjacent.treeId} is depleted until the vault restocks it.`
+      : `Tree #${adjacent.treeId} is a stump; it refills on its next batch renewal.`;
   }
   else if (adjacent) {
     mapHint.textContent = `In range of tree #${adjacent.treeId}. Click the tree to chop until LOG.`;
@@ -891,6 +909,7 @@ function render() {
   hudXp.textContent = String(state.playerXp);
   hudLogs.textContent = String(state.playerLogs || 0);
   hudOnline.textContent = String(nearbyPlayerCount());
+  hudPosition.textContent = `(${player.x}, ${player.y})`;
 
   onboarding.hidden = playerActive;
   dashboard.classList.toggle('player-active', playerActive);
@@ -953,13 +972,10 @@ function render() {
   logSlot.classList.toggle('empty', logCount === 0);
   logSlot.setAttribute('aria-label', `${logCount} LOG in inventory`);
 
-  const stumps = worldTrees().filter((candidate) => candidate.health === 0);
-  const timedStumps = stumps.filter((candidate) => candidate.respawnInSeconds != null);
-  const nextRespawn = timedStumps.length
-    ? Math.min(...timedStumps.map((candidate) => candidate.respawnInSeconds))
-    : null;
-  regrowReady.textContent = stumps.length
-    ? `${stumps.length}${nextRespawn == null ? ' / depleted' : ` / next in ${nextRespawn}s`}`
+  const stumps = worldTrees().filter((candidate) => candidate.health === 0 && !candidate.depleted);
+  const depleted = worldTrees().filter((candidate) => candidate.depleted);
+  treeState.textContent = stumps.length || depleted.length
+    ? `${stumps.length} stump${depleted.length ? ` / ${depleted.length} depleted` : ''}`
     : '0';
   emulator.textContent = `${state.emulatorVersion} / ${state.emulatorSigner.slice(0, 12)}...`;
 
@@ -968,6 +984,11 @@ function render() {
   resetProfileButton.hidden = playerActive || !localStorage.getItem(profileStorageKey);
   resetProfileButton.disabled = walking || busy || playerActive;
   resetButton.disabled = walking || busy;
+  downloadBackupButton.disabled = walking || busy || !app;
+  restoreBackupButton.disabled = walking || busy || !app || Boolean(state.pendingChopTxid);
+  restoreBackupButton.title = state.pendingChopTxid
+    ? 'Wait for the pending swing to reconcile before switching keys.'
+    : '';
   const rolloverDue = state.playerStateExpiresInSeconds != null
     && state.playerRolloverMarginSeconds != null
     && state.playerStateExpiresInSeconds < state.playerRolloverMarginSeconds;
@@ -1001,7 +1022,7 @@ async function run(label, action, completion = () => 'Success') {
   setBusy(true, label);
   appendLog(label);
   try {
-    adoptState(await withApp(action));
+    adoptState(await action());
     status.classList.remove('error');
     const message = completion(state);
     status.textContent = message;
@@ -1060,6 +1081,166 @@ function restorePosition() {
   }
 }
 
+function setBackupStatus(message, isError = false) {
+  backupStatus.textContent = message;
+  backupStatus.classList.toggle('error', isError);
+}
+
+function createPlayerBackup() {
+  if (!app || !state || !worldManifest) throw new Error('Player wallet is not ready');
+  return {
+    format: PLAYER_BACKUP_FORMAT,
+    version: PLAYER_BACKUP_VERSION,
+    createdAt: new Date().toISOString(),
+    gameId: worldManifest.gameId,
+    protocolVersion: worldManifest.protocolVersion,
+    network: worldManifest.network,
+    genesisTxid: state.genesisTxid,
+    walletAddress: state.address,
+    secretKey: app.exportKey(),
+    playerAsset: state.playerAsset || null,
+    position: state.playerActive ? { x: player.x, y: player.y } : null,
+  };
+}
+
+function downloadPlayerBackup() {
+  const backup = createPlayerBackup();
+  const body = `${JSON.stringify(backup, null, 2)}\n`;
+  const url = URL.createObjectURL(new Blob([body], { type: 'application/json' }));
+  const link = document.createElement('a');
+  const label = (backup.playerAsset || backup.genesisTxid).slice(0, 12);
+  link.href = url;
+  link.download = `woodland-player-backup-${label}.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  setBackupStatus('Backup downloaded. Store it offline and keep it secret.');
+  appendLog('Player key and PLAYER_ID backup downloaded.');
+}
+
+function parsePlayerBackup(text) {
+  let backup;
+  try {
+    backup = JSON.parse(text);
+  } catch {
+    throw new Error('Backup is not valid JSON');
+  }
+  if (!backup || typeof backup !== 'object' || Array.isArray(backup)) {
+    throw new Error('Backup must contain one JSON object');
+  }
+  if (backup.format !== PLAYER_BACKUP_FORMAT || backup.version !== PLAYER_BACKUP_VERSION) {
+    throw new Error('Unsupported woodland.sh backup format');
+  }
+  if (
+    backup.gameId !== worldManifest.gameId
+    || backup.protocolVersion !== worldManifest.protocolVersion
+    || backup.network !== worldManifest.network
+    || backup.genesisTxid !== worldManifest.genesisTxid
+  ) {
+    throw new Error('Backup belongs to a different woodland.sh world');
+  }
+  if (typeof backup.walletAddress !== 'string' || !backup.walletAddress || backup.walletAddress.length > 200) {
+    throw new Error('Backup wallet address is invalid');
+  }
+  if (typeof backup.secretKey !== 'string' || !/^[0-9a-f]{64}$/u.test(backup.secretKey)) {
+    throw new Error('Backup private key is invalid');
+  }
+  if (
+    backup.playerAsset !== null
+    && (typeof backup.playerAsset !== 'string' || !/^[0-9a-f]{68}$/u.test(backup.playerAsset))
+  ) {
+    throw new Error('Backup PLAYER_ID is invalid');
+  }
+  let position = null;
+  if (backup.position !== null) {
+    if (
+      !backup.position
+      || typeof backup.position !== 'object'
+      || !Number.isInteger(backup.position.x)
+      || !Number.isInteger(backup.position.y)
+      || backup.position.x < 0
+      || backup.position.y < 0
+      || backup.position.x >= worldManifest.mapWidth
+      || backup.position.y >= worldManifest.mapHeight
+    ) {
+      throw new Error('Backup map position is invalid');
+    }
+    position = { x: backup.position.x, y: backup.position.y };
+  }
+  return { ...backup, position };
+}
+
+async function restorePlayerBackup(file) {
+  if (busy || !file) return;
+  let reloading = false;
+  setBusy(true, 'Validating player backup...');
+  setBackupStatus('Checking the key, PLAYER_ID, and current world...');
+  try {
+    if (file.size > MAX_PLAYER_BACKUP_BYTES) throw new Error('Backup file is too large');
+    const backup = parsePlayerBackup(await file.text());
+    const profile = JSON.stringify({
+      genesisTxid: backup.genesisTxid,
+      playerAsset: backup.playerAsset,
+    });
+    const candidate = await WoodlandApp.init(
+      worldManifest.arkadeServiceUrl,
+      worldManifest.emulatorUrl,
+      JSON.stringify(worldManifest),
+      backup.secretKey,
+      profile,
+    );
+    if (candidate.address() !== backup.walletAddress) {
+      throw new Error('Backup private key does not match its wallet address');
+    }
+
+    let playerCheck = 'This backup contains a wallet key with no activated PLAYER_ID.';
+    if (backup.playerAsset) {
+      try {
+        const candidateState = await candidate.refreshPlayer();
+        playerCheck = candidateState.playerActive
+          ? `Live player found for ${backup.playerAsset.slice(0, 12)}...`
+          : 'The key is valid, but this PLAYER_ID is not currently live at the canonical player contract.';
+      } catch (error) {
+        playerCheck = `The key is valid, but live player lookup could not be completed: ${String(error).slice(0, 180)}`;
+      }
+    }
+    if (!window.confirm(
+      `${playerCheck}\n\nRestoring replaces this browser’s current private key and clears its pending swing journal. Back up the current player first. Continue?`,
+    )) {
+      setBackupStatus('Restore cancelled. The current key was not changed.');
+      return;
+    }
+
+    localStorage.setItem(KEY, backup.secretKey);
+    localStorage.removeItem(PROFILE);
+    localStorage.setItem(profileStorageKey, profile);
+    localStorage.removeItem(pendingStorageKey);
+    if (backup.position) {
+      localStorage.setItem(POSITION, JSON.stringify({
+        genesisTxid: backup.genesisTxid,
+        x: backup.position.x,
+        y: backup.position.y,
+      }));
+    } else {
+      localStorage.removeItem(POSITION);
+    }
+    setBackupStatus('Backup restored. Reloading the player...');
+    appendLog('Player backup restored; reloading.');
+    reloading = true;
+    location.reload();
+  } catch (error) {
+    const message = `Backup restore failed: ${error}`;
+    setBackupStatus(message, true);
+    status.classList.add('error');
+    status.textContent = message;
+    appendLog(message);
+  } finally {
+    restoreBackupFile.value = '';
+    if (!reloading) setBusy(false);
+  }
+}
+
 async function renewPlayer() {
   return app.renewPlayer();
 }
@@ -1083,13 +1264,13 @@ refreshButton.addEventListener('click', () => {
   const resume = Boolean(state?.pendingChopTxid);
   run(
     resume ? 'Resuming the exact pending swing...' : 'Refreshing indexed world and wallet state...',
-    () => (resume ? app.resumePendingChop() : app.refresh()),
+    () => withApp(() => (resume ? app.resumePendingChop() : app.refresh())),
     () => (resume ? 'Pending swing reconciled.' : 'Refresh complete.'),
   );
 });
 
 activateButton.addEventListener('click', () => (
-  run('Issuing PLAYER_ID into owner-authorized player state...', activatePlayer)
+  run('Issuing PLAYER_ID into owner-authorized player state...', () => withApp(activatePlayer))
 ));
 
 
@@ -1122,7 +1303,7 @@ async function chopUntilLog(treeId) {
       }, CHOP_FEEDBACK_MS);
       let nextState;
       try {
-        nextState = await app.chop(treeId);
+        nextState = await withApp(() => app.chop(treeId));
       } finally {
         clearInterval(feedbackTimer);
       }
@@ -1200,12 +1381,30 @@ chatForm.addEventListener('submit', (event) => {
 renewButton.addEventListener('click', () => {
   run(
     'Renewing player state through a fresh Ark batch...',
-    renewPlayer,
+    () => withApp(renewPlayer),
     () => 'Player session renewed.',
   );
 });
 map.addEventListener('click', (event) => { void handleMapClick(event); });
 
+
+downloadBackupButton.addEventListener('click', () => {
+  if (busy) return;
+  try {
+    downloadPlayerBackup();
+  } catch (error) {
+    setBackupStatus(`Backup failed: ${error}`, true);
+  }
+});
+
+restoreBackupButton.addEventListener('click', () => {
+  if (!busy) restoreBackupFile.click();
+});
+
+restoreBackupFile.addEventListener('change', () => {
+  const [file] = restoreBackupFile.files;
+  if (file) void restorePlayerBackup(file);
+});
 
 resetButton.addEventListener('click', () => {
   if (busy || !window.confirm('Forget this local test key and create a new wallet?')) return;
@@ -1250,30 +1449,18 @@ async function boot() {
       health: manifest.activeLogsPerTree,
       logReserveRemaining: manifest.logReservePerTree,
       xpRemaining: manifest.xpPerTree,
-      valueSats: manifest.dustSats * (manifest.activeLogsPerTree + 1),
+      valueSats: manifest.dustSats,
       treeOutpoint: `${deploymentTxid}:0`,
       deploymentTxid,
       lastAttemptTxid: null,
       nextRollBucket: null,
       nextDrop: false,
       expiresInSeconds: null,
-      respawnAt: null,
-      respawnInSeconds: null,
+      depleted: false,
     }));
     profileStorageKey = `${PROFILE}:${manifest.genesisTxid}`;
     pendingStorageKey = `woodland.sh:web:v1:pending:${manifest.arkadeServiceUrl.replace(/\/+$/, '')}:${manifest.genesisTxid}`;
-    let storedProfile = localStorage.getItem(profileStorageKey);
-    const legacyProfile = localStorage.getItem(PROFILE);
-    if (!storedProfile && legacyProfile) {
-      try {
-        if (JSON.parse(legacyProfile).genesisTxid === manifest.genesisTxid) {
-          storedProfile = legacyProfile;
-          localStorage.setItem(profileStorageKey, legacyProfile);
-        }
-      } catch {
-        // A malformed legacy profile remains untouched for manual recovery.
-      }
-    }
+    const storedProfile = localStorage.getItem(profileStorageKey);
     app = await WoodlandApp.init(
       manifest.arkadeServiceUrl,
       manifest.emulatorUrl,
@@ -1292,9 +1479,9 @@ async function boot() {
         adoptState(await app.resumePendingChop());
         appendLog('Pending swing reconciled.');
       } catch (error) {
-        const message = `Pending swing remains unresolved: ${error}`;
         status.classList.add('error');
-        status.textContent = message;
+        status.textContent = 'Still recovering the submitted swing; it retries automatically and your funds remain safe.';
+        const message = `Pending swing remains unresolved: ${error}`;
         appendLog(message);
         globalThis.__WOODLAND_E2E_ERROR = String(error);
       }
@@ -1324,18 +1511,24 @@ async function boot() {
       const tree = worldTrees().find((candidate) => candidate.treeId === Number(treeId));
       if (tree) void handleMapPosition(tree.x, tree.y);
     };
-    globalThis.__WOODLAND_E2E_UNAUTHORIZED_REISSUANCE = () => (
-      withApp(() => app.testUnauthorizedReissuance())
-    );
     globalThis.__WOODLAND_E2E_INVALID_XP = async (treeId) => {
       await withApp(() => app.testInvalidXpTransition(treeId));
       return withApp(refreshWorld);
     };
-    globalThis.__WOODLAND_E2E_REFRESH = async () => {
-      adoptState(await withApp(() => app.refresh()));
+    globalThis.__WOODLAND_E2E_WITHDRAW_LOG = async (amount) => {
+      adoptState(await withApp(() => app.withdrawLog(amount)));
       render();
       return state;
     };
+    globalThis.__WOODLAND_E2E_REFRESH = async () => {
+      const resumePending = Boolean(state?.pendingChopTxid);
+      adoptState(await withApp(() => (
+        resumePending ? app.resumePendingChop() : refreshWorld()
+      )));
+      render();
+      return state;
+    };
+    globalThis.__WOODLAND_E2E_REFRESH_WORLD_RAW = () => withApp(refreshWorld);
     globalThis.__WOODLAND_E2E_REFRESH_WORLD = async () => {
       adoptState(await withApp(refreshWorld));
       render();
@@ -1367,7 +1560,9 @@ async function boot() {
         render();
         return { ok: true, state };
       } catch (error) {
-        return { ok: false, message: String(error) };
+        adoptState(await withApp(() => app.refresh()));
+        render();
+        return { ok: false, message: String(error), state };
       }
     };
     globalThis.__WOODLAND_E2E_RESUME_PENDING = async () => {
@@ -1415,11 +1610,11 @@ setInterval(async () => {
     const resumePending = Boolean(state?.pendingChopTxid)
       && Date.now() >= pendingRetryAfter;
     if (resumePending) pendingRetryAfter = Date.now() + 5_000;
-    const respawnDue = state?.trees?.some((tree) => (
-      tree.health === 0 && tree.respawnInSeconds === 0
+    const stumpActive = state?.trees?.some((tree) => (
+      tree.health === 0 && !tree.depleted
     ));
     const refreshWorld = !resumePending
-      && (respawnDue || Date.now() >= nextWorldRefreshAt);
+      && (stumpActive || Date.now() >= nextWorldRefreshAt);
     adoptState(await withApp(() => {
       if (resumePending) return app.resumePendingChop();
       return refreshWorld ? app.refreshWorld() : app.refresh();

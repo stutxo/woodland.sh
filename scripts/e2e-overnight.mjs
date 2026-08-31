@@ -61,8 +61,6 @@ const PROFILE_CONFIGS = Object.freeze({
       WOODLAND_SOAK_RACE_CONCURRENCY: '24',
       WOODLAND_SOAK_ROUND_DELAY_MS: '100',
       WOODLAND_SOAK_TREES_PER_ROUND: '4',
-      WOODLAND_SOAK_RELOAD_EVERY: '20',
-      WOODLAND_SOAK_RELOAD_COUNT: '6',
     },
   },
   reload: {
@@ -78,7 +76,7 @@ const PROFILE_CONFIGS = Object.freeze({
       WOODLAND_SOAK_RELOAD_COUNT: '12',
     },
   },
-  regrowth: {
+  renewal: {
     runner: 'soak',
     environment: {
       WOODLAND_SOAK_PLAYERS: '12',
@@ -87,12 +85,47 @@ const PROFILE_CONFIGS = Object.freeze({
       WOODLAND_SOAK_RACE_CONCURRENCY: '4',
       WOODLAND_SOAK_ROUND_DELAY_MS: '1000',
       WOODLAND_SOAK_TREES_PER_ROUND: '1',
+      WOODLAND_SOAK_FORCE_TREE_RENEWAL_ROUND: '10',
+      WOODLAND_SOAK_FORCE_POST_CHOP_RENEWAL_ROUND: '20',
       WOODLAND_SOAK_RELOAD_EVERY: '20',
       WOODLAND_SOAK_RELOAD_COUNT: '4',
     },
   },
+  restock: {
+    runner: 'restock',
+    environment: {},
+  },
 });
-const PLAN = (process.env.WOODLAND_OVERNIGHT_PLAN || 'full,soak')
+
+const RELEASE_PLAN = Object.freeze([
+  'full',
+  'soak',
+  'burst',
+  'fanout',
+  'reload',
+  'renewal',
+  'restock',
+]);
+const EXPECTED_WORLD = Object.freeze({
+  schemaVersion: 1,
+  protocolVersion: 1,
+  network: 'regtest',
+  gameId: 'woodland.sh',
+  playerLevelCurve: 'woodland-xp-v1',
+  maxPlayerLevel: 99,
+  baseLogDropBasisPoints: 2_000,
+  levelLogDropBonusBasisPoints: 200,
+  levelLogDropXpThresholds: Object.freeze([1_154, 4_470, 13_363, 37_224, 101_333]),
+  maxLevelLogDropBasisPoints: 3_000,
+  luckWindowBasisPoints: 10_000,
+  initialLuckCredit: 8_000,
+  dustSats: 330,
+  activeLogsPerTree: 5,
+  logReservePerTree: 1_000,
+  xpPerTree: 1_000,
+  treeCount: 2_100,
+});
+const PLAN = (process.env.WOODLAND_OVERNIGHT_PLAN || RELEASE_PLAN.join(','))
   .split(',')
   .map((profile) => profile.trim())
   .filter(Boolean);
@@ -176,15 +209,92 @@ async function readJson(filename) {
   }
 }
 
+function manifestSummary(manifest) {
+  if (!manifest) {
+    return null;
+  }
+  return {
+    schemaVersion: manifest.schemaVersion,
+    protocolVersion: manifest.protocolVersion,
+    network: manifest.network,
+    gameId: manifest.gameId,
+    genesisTxid: manifest.genesisTxid,
+    playerLevelCurve: manifest.playerLevelCurve,
+    maxPlayerLevel: manifest.maxPlayerLevel,
+    rates: {
+      baseLogDropBasisPoints: manifest.baseLogDropBasisPoints,
+      levelLogDropBonusBasisPoints: manifest.levelLogDropBonusBasisPoints,
+      levelLogDropXpThresholds: manifest.levelLogDropXpThresholds,
+      maxLevelLogDropBasisPoints: manifest.maxLevelLogDropBasisPoints,
+      luckWindowBasisPoints: manifest.luckWindowBasisPoints,
+      initialLuckCredit: manifest.initialLuckCredit,
+    },
+    dustSats: manifest.dustSats,
+    activeLogsPerTree: manifest.activeLogsPerTree,
+    logReservePerTree: manifest.logReservePerTree,
+    xpPerTree: manifest.xpPerTree,
+    treeCount: Array.isArray(manifest.trees) ? manifest.trees.length : null,
+  };
+}
+
+function releaseManifestErrors(manifest) {
+  if (!manifest) {
+    return ['world manifest is missing after a successful cycle'];
+  }
+  const actual = manifestSummary(manifest);
+  const errors = [];
+  for (const [field, expected] of Object.entries(EXPECTED_WORLD)) {
+    const value = field === 'treeCount' ? actual.treeCount : manifest[field];
+    if (JSON.stringify(value) !== JSON.stringify(expected)) {
+      errors.push(`${field}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(value)}`);
+    }
+  }
+  if (!/^[0-9a-f]{64}$/u.test(actual.genesisTxid ?? '')) {
+    errors.push(`genesisTxid: expected 64 lowercase hex characters, got ${JSON.stringify(actual.genesisTxid)}`);
+  }
+  return errors;
+}
+
+async function cycleArtifactErrors(profileConfig, paths, reports) {
+  const errors = releaseManifestErrors(reports.manifest);
+  if (profileConfig.runner === 'full') {
+    try {
+      const junit = await readFile(paths.junit, 'utf8');
+      if (!junit.includes('<testsuite')) {
+        errors.push('full-cycle JUnit report has no testsuite');
+      }
+    } catch {
+      errors.push('full-cycle JUnit report is missing');
+    }
+  }
+  if (profileConfig.runner === 'soak' && !reports.soak) {
+    errors.push('soak report is missing');
+  }
+  if (profileConfig.runner === 'restock' && !reports.restock) {
+    errors.push('restock report is missing');
+  }
+  return errors;
+}
+
 async function runCycle(cycle, profile) {
   const cycleName = `cycle-${String(cycle).padStart(4, '0')}-${profile}`;
   const cycleDir = path.join(outputRoot, cycleName);
   const logPath = path.join(cycleDir, 'cycle.log');
   const soakReport = path.join(cycleDir, 'soak-report.json');
+  const restockReport = path.join(cycleDir, 'restock-report.json');
   const junitReport = path.join(cycleDir, 'e2e-junit.xml');
+  const paths = {
+    cycleDir,
+    log: logPath,
+    soak: soakReport,
+    restock: restockReport,
+    junit: junitReport,
+    world: path.join(cycleDir, 'world.json'),
+  };
   await mkdir(cycleDir, { recursive: true });
   const log = createWriteStream(logPath, { flags: 'wx' });
   const cycleStartedAt = Date.now();
+  const startedAt = new Date(cycleStartedAt).toISOString();
   const profileConfig = PROFILE_CONFIGS[profile];
   const baseSoakEnvironment = {
     WOODLAND_SOAK_PLAYERS: String(SOAK_PLAYERS),
@@ -205,6 +315,7 @@ async function runCycle(cycle, profile) {
       WOODLAND_E2E_ARTIFACT_DIR: cycleDir,
       WOODLAND_E2E_JUNIT: junitReport,
       WOODLAND_SOAK_REPORT: soakReport,
+      WOODLAND_RESTOCK_REPORT: restockReport,
       ...baseSoakEnvironment,
       ...profileConfig.environment,
     },
@@ -223,19 +334,37 @@ async function runCycle(cycle, profile) {
   });
   activeChild = null;
   await new Promise((resolve) => log.end(resolve));
+  const [manifest, soak, restock] = await Promise.all([
+    readJson(paths.world),
+    readJson(paths.soak),
+    readJson(paths.restock),
+  ]);
+  const reports = { manifest, soak, restock };
+  const artifactErrors = outcome.code === 0
+    ? await cycleArtifactErrors(profileConfig, paths, reports)
+    : [];
+  const error = outcome.error ?? (artifactErrors.length > 0 ? artifactErrors.join('; ') : null);
   return {
     cycle,
     profile,
-    status: outcome.code === 0 ? 'passed' : interrupted ? 'interrupted' : 'failed',
-    startedAt: new Date(cycleStartedAt).toISOString(),
-    finishedAt: new Date().toISOString(),
-    durationMs: Date.now() - cycleStartedAt,
+    runner: profileConfig.runner,
+    status: interrupted ? 'interrupted' : (outcome.code === 0 && !error ? 'passed' : 'failed'),
     exitCode: outcome.code,
     signal: outcome.signal,
-    error: outcome.error,
-    logPath,
-    soak: profileConfig.runner === 'soak' ? await readJson(soakReport) : null,
-    junitPath: profileConfig.runner === 'full' ? junitReport : null,
+    error,
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    elapsedSeconds: Number(((Date.now() - cycleStartedAt) / 1000).toFixed(1)),
+    environment: profileConfig.environment,
+    world: manifestSummary(manifest),
+    artifacts: {
+      directory: path.relative(ROOT, paths.cycleDir),
+      log: path.relative(ROOT, paths.log),
+      junit: path.relative(ROOT, paths.junit),
+      worldManifest: path.relative(ROOT, paths.world),
+      soakReport: soak ? path.relative(ROOT, paths.soak) : null,
+      restockReport: restock ? path.relative(ROOT, paths.restock) : null,
+    },
   };
 }
 
@@ -252,9 +381,18 @@ try {
     }
     cycle += 1;
     const profile = PLAN[(cycle - 1) % PLAN.length];
+    const profileConfig = PROFILE_CONFIGS[profile];
+    summary.activeCycle = {
+      cycle,
+      profile,
+      runner: profileConfig.runner,
+      startedAt: new Date().toISOString(),
+    };
+    await atomicSummary();
     const result = await runCycle(cycle, profile);
     result.freeDiskGbAfter = await availableDiskGb();
     summary.cycles.push(result);
+    summary.activeCycle = null;
     await atomicSummary();
     if (result.status !== 'passed') {
       throw new Error(`overnight ${result.status} in cycle ${cycle} (${profile})`);

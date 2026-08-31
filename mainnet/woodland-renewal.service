@@ -1,5 +1,11 @@
+# Renewal watcher unit. Separate from woodland-server because the watcher is
+# mandatory while the social server is optional: an expired tree or vault is
+# swept by the Arkade service and cannot be recovered. Tree and vault renewal
+# leaves are permissionless {operator}; the rollover child only triggers exact
+# covenant self-sends. Restocks are permissionless {operator, emulator}
+# service-signed transactions and need no project key.
 [Unit]
-Description=woodland.sh mainnet tree maintenance
+Description=woodland.sh mainnet renewal watcher
 After=network-online.target
 Wants=network-online.target
 

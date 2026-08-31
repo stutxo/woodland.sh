@@ -13,6 +13,9 @@ use wasm_bindgen_futures::JsFuture;
 
 const REQUEST_TIMEOUT_MS: i32 = 15_000;
 const MAX_INDEX_PAGES: usize = 128;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_COMMITMENT_BATCH_VOUTS: usize = 1_024;
 const MAX_INDEX_RECORDS: usize = 100_000;
 const MAX_VIRTUAL_TXS_PER_REQUEST: usize = 50;
 const VIRTUAL_TX_REQUEST_CONCURRENCY: usize = 8;
@@ -81,7 +84,10 @@ pub struct VtxoRecord {
 /// batch can no longer outlive, so clients fail closed instead.
 pub const DEFAULT_EXPIRY_MARGIN_SECS: i64 = 300;
 pub const MIN_ROLLOVER_MARGIN_SECS: i64 = DEFAULT_EXPIRY_MARGIN_SECS * 2;
-pub const MAX_ROLLOVER_MARGIN_SECS: i64 = 3_600;
+/// The window must cover shard drain time plus operator failover, so a
+/// correlated world-scale renewal wave or a multi-hour maintenance outage
+/// still fits inside the margin on long-lived mainnet batches.
+pub const MAX_ROLLOVER_MARGIN_SECS: i64 = 43_200;
 
 impl VtxoRecord {
     /// Remaining lifetime in seconds, if the indexer reported an expiry.
@@ -690,9 +696,24 @@ async fn fetch_text(
         .await
         .map_err(|error| HttpFailure::transport(method, url, error.to_string()))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
+    // Read the body as a stream so a hostile or broken server cannot make the
+    // client buffer an unbounded response; the cap stays well above any
+    // legitimate indexer page.
+    let mut body = Vec::new();
+    let mut chunks = resp.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk =
+            chunk.map_err(|error| HttpFailure::transport(method, url, error.to_string()))?;
+        if body.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err(HttpFailure::transport(
+                method,
+                url,
+                "response body exceeds the safety limit",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8(body)
         .map_err(|error| HttpFailure::transport(method, url, error.to_string()))?;
     if !status.is_success() {
         return Err(HttpFailure::status(method, url, status.as_u16(), text));
@@ -1203,6 +1224,13 @@ impl ArkadeRest {
             })
             .collect::<Result<Vec<_>>>()?;
         batch_vouts.sort_unstable();
+        // Cap the walk so a malicious indexer cannot keep the client fetching
+        // tree pages forever.
+        if batch_vouts.len() > MAX_COMMITMENT_BATCH_VOUTS {
+            return Err(anyhow!(
+                "commitment transaction {txid} reports more than {MAX_COMMITMENT_BATCH_VOUTS} batch outputs"
+            ));
+        }
         let mut leaves = Vec::new();
         for vout in batch_vouts {
             let mut index = 1;
@@ -1654,7 +1682,7 @@ mod tests {
         record.expires_at = Some(3_048);
         assert_eq!(record.rollover_margin_seconds(), 1_024);
 
-        record.expires_at = Some(20_000);
+        record.expires_at = Some(200_000);
         assert_eq!(record.rollover_margin_seconds(), MAX_ROLLOVER_MARGIN_SECS);
 
         record.created_at = None;

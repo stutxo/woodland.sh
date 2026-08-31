@@ -6,18 +6,18 @@
 //! and state packets. The emulator executes the renewal covenant and counters
 //! the proof; the batch then recreates the VTXO with a new expiry.
 //!
-//! Shared trees are gated by the world maintenance key and player state by its
-//! owner, so only a client that constructed the exact
-//! preservation proof can register it. The covenant constrains that signature
-//! to the self-send, never to a transfer.
+//! Shared tree renewal is permissionless and player state is gated by its
+//! owner, so only a client that constructed the exact preservation proof can
+//! register it. The covenant constrains that signature to the self-send, never
+//! to a transfer.
 
-use crate::arkade::{now_unix, VtxoRecord, DEFAULT_EXPIRY_MARGIN_SECS};
+use crate::arkade::{now_unix, VtxoRecord};
 use crate::keys::Keys;
 use crate::player::{PlayerContract, PlayerState};
 use crate::protocol::{
-    PLAYER_IDENTITY_PACKET_TYPE, PLAYER_POSITION_PACKET_TYPE, PLAYER_XP_PACKET_TYPE,
-    RENEWAL_INPUT_COUNT, RENEWAL_STATE_INPUT_INDEX, RENEWAL_STATE_OUTPUT_INDEX,
-    TREE_HEALTH_PACKET_TYPE, TREE_ROLL_PACKET_TYPE, TREE_STATE_PACKET_TYPE,
+    PLAYER_IDENTITY_PACKET_TYPE, PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_POSITION_PACKET_TYPE,
+    PLAYER_ROLL_PACKET_TYPE, PLAYER_XP_PACKET_TYPE, RENEWAL_INPUT_COUNT, RENEWAL_STATE_INPUT_INDEX,
+    RENEWAL_STATE_OUTPUT_INDEX, TREE_HEALTH_PACKET_TYPE, TREE_STATE_PACKET_TYPE,
 };
 use crate::tree::{TreeContract, TreeState};
 use anyhow::{anyhow, Context, Result};
@@ -32,6 +32,7 @@ use bitcoin::{Amount, Psbt, ScriptBuf, Sequence, Transaction, TxOut};
 
 /// Registered intents are short-lived; the renewal must reach a batch quickly.
 const INTENT_MESSAGE_TTL_SECS: u64 = 900;
+const INTENT_DELETE_TTL_SECS: u64 = 120;
 
 /// One validated state VTXO prepared for batch renewal.
 pub struct RenewalIntent {
@@ -107,6 +108,7 @@ pub async fn approve(
 /// Read and validate one indexed tree VTXO and build its renewal intent.
 /// `previous_tx` is the Ark transaction that created the VTXO; it carries the
 /// tree-state packet the renewal must preserve.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_tree(
     record: &VtxoRecord,
     previous_tx: &Transaction,
@@ -115,13 +117,12 @@ pub fn prepare_tree(
     log_asset: AssetId,
     xp_asset: AssetId,
     dust_sats: u64,
+    expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
     record.validate_creating_transaction(previous_tx)?;
     let state = crate::tree::tree_state_from_tx(previous_tx)?
         .ok_or_else(|| anyhow!("previous tree transaction has no state packet"))?;
-    let roll = crate::tree::tree_roll_from_tx(previous_tx)?
-        .ok_or_else(|| anyhow!("previous tree transaction has no roll packet"))?;
-    let health = crate::tree::tree_health_from_tx(previous_tx)?
+    let raw_health = crate::tree::tree_health_from_tx(previous_tx)?
         .ok_or_else(|| anyhow!("previous tree transaction has no health packet"))?;
     let assets = record_assets(record)?;
     let tree_count = asset_amount(&assets, tree_asset);
@@ -130,11 +131,16 @@ pub fn prepare_tree(
     let other_assets = assets.iter().any(|asset| {
         asset.asset_id != tree_asset && asset.asset_id != log_asset && asset.asset_id != xp_asset
     });
+    let health = if raw_health.value() == 0 && log_count > 0 {
+        crate::tree::TreeHealth::new(crate::tree::LOGS_PER_TREE)?
+    } else {
+        raw_health
+    };
     if tree_count != 1
         || other_assets
         || log_count != xp_count
-        || health.value() > log_count
-        || record.amount_sats != crate::tree::full_tree_value_sats(dust_sats)?
+        || raw_health.value() > log_count
+        || record.amount_sats != crate::tree::tree_value_sats(dust_sats)
     {
         return Err(anyhow!("indexed tree VTXO holdings are not canonical"));
     }
@@ -155,9 +161,54 @@ pub fn prepare_tree(
         groups,
         vec![
             (TREE_STATE_PACKET_TYPE, state.encode().to_vec()),
-            (TREE_ROLL_PACKET_TYPE, roll.encode().to_vec()),
             (TREE_HEALTH_PACKET_TYPE, health.encode().to_vec()),
         ],
+        expiry_margin_secs,
+    )
+}
+
+/// Read and validate the supply vault VTXO and build its renewal intent: an
+/// exact self-send of its LOG and XP balances with no state packets.
+pub fn prepare_vault(
+    record: &VtxoRecord,
+    previous_tx: &Transaction,
+    contract: &crate::vault::VaultContract,
+    log_asset: AssetId,
+    xp_asset: AssetId,
+    expiry_margin_secs: i64,
+) -> Result<RenewalIntent> {
+    record.validate_creating_transaction(previous_tx)?;
+    if record.script != contract.vtxo.script_pubkey() {
+        return Err(anyhow!(
+            "indexed vault record does not match the covenant script"
+        ));
+    }
+    let assets = record_assets(record)?;
+    let log_count = asset_amount(&assets, log_asset);
+    let xp_count = asset_amount(&assets, xp_asset);
+    if assets
+        .iter()
+        .any(|asset| asset.asset_id != log_asset && asset.asset_id != xp_asset)
+        || (log_count == 0 && xp_count == 0)
+    {
+        return Err(anyhow!("indexed vault VTXO holdings are not canonical"));
+    }
+    let mut groups = Vec::new();
+    if log_count > 0 {
+        groups.push(renewal_group(log_asset, log_count));
+    }
+    if xp_count > 0 {
+        groups.push(renewal_group(xp_asset, xp_count));
+    }
+    build(
+        record,
+        &contract.vtxo,
+        &contract.renewal_spend_script,
+        contract.renewal_arkade_script.clone(),
+        assets,
+        groups,
+        Vec::new(),
+        expiry_margin_secs,
     )
 }
 
@@ -167,8 +218,16 @@ pub fn prepare_player(
     previous_tx: &Transaction,
     contract: &PlayerContract,
     player_asset: AssetId,
+    expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
-    prepare_player_for_path(record, previous_tx, contract, player_asset, false)
+    prepare_player_for_path(
+        record,
+        previous_tx,
+        contract,
+        player_asset,
+        false,
+        expiry_margin_secs,
+    )
 }
 
 /// Prepare the same exact self-send through the optional watchtower leaf.
@@ -177,8 +236,16 @@ pub fn prepare_player_watchtower(
     previous_tx: &Transaction,
     contract: &PlayerContract,
     player_asset: AssetId,
+    expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
-    prepare_player_for_path(record, previous_tx, contract, player_asset, true)
+    prepare_player_for_path(
+        record,
+        previous_tx,
+        contract,
+        player_asset,
+        true,
+        expiry_margin_secs,
+    )
 }
 
 fn prepare_player_for_path(
@@ -187,12 +254,23 @@ fn prepare_player_for_path(
     contract: &PlayerContract,
     player_asset: AssetId,
     watchtower: bool,
+    expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
     record.validate_creating_transaction(previous_tx)?;
     let state = crate::player::player_state_from_tx(previous_tx)?
         .ok_or_else(|| anyhow!("previous player transaction has no state packets"))?;
     crate::player::validate_player_state_record(record, contract, player_asset)?;
     let assets = record_assets(record)?;
+    // Mirror the tree guard: fail loudly here rather than build an intent the
+    // emulator always rejects, which would silently strand the VTXO.
+    let other_assets = assets.iter().any(|asset| {
+        asset.asset_id != player_asset
+            && asset.asset_id != contract.log_asset
+            && asset.asset_id != contract.xp_asset
+    });
+    if other_assets {
+        return Err(anyhow!("indexed player VTXO holdings are not canonical"));
+    }
     let log_count = asset_amount(&assets, contract.log_asset);
     let xp_count = asset_amount(&assets, contract.xp_asset);
     if state.xp.value() != xp_count {
@@ -234,8 +312,14 @@ fn prepare_player_for_path(
                 PLAYER_POSITION_PACKET_TYPE,
                 state.position.encode().to_vec(),
             ),
+            (PLAYER_ROLL_PACKET_TYPE, state.luck.roll.encode().to_vec()),
+            (
+                PLAYER_LUCK_CREDIT_PACKET_TYPE,
+                state.luck.credit.encode().to_vec(),
+            ),
             (PLAYER_XP_PACKET_TYPE, state.xp.encode().to_vec()),
         ],
+        expiry_margin_secs,
     )
 }
 
@@ -259,8 +343,9 @@ fn build(
     assets: Vec<Asset>,
     groups: Vec<AssetGroup>,
     state_packets: Vec<(u8, Vec<u8>)>,
+    expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
-    record.ensure_live(now_unix(), DEFAULT_EXPIRY_MARGIN_SECS)?;
+    record.ensure_live(now_unix(), expiry_margin_secs)?;
     let input_expires_at = record
         .expires_at
         .ok_or_else(|| anyhow!("renewal input has no indexed expiry"))?;
@@ -305,6 +390,76 @@ fn build(
 /// Bind the exact self-send to a short-lived registration message, sign it
 /// with whichever key appears in the selected renewal leaf, and attach the
 /// creating transaction required for input introspection.
+/// A short-lived ownership proof that authorizes arkd to remove every queued
+/// intent overlapping this renewal input. Deletion changes only arkd's pending
+/// intent set; it never spends the covenant VTXO.
+pub(crate) struct IntentDeletion {
+    pub message: IntentMessage,
+    pub proof: Psbt,
+}
+
+fn sign_intent_input(
+    authorizer_keys: &Keys,
+    psbt_input: &mut bitcoin::psbt::Input,
+    message: bitcoin::secp256k1::Message,
+) -> std::result::Result<
+    Vec<(
+        bitcoin::secp256k1::schnorr::Signature,
+        bitcoin::XOnlyPublicKey,
+    )>,
+    ark_core::Error,
+> {
+    let script = psbt_input.witness_script.clone().ok_or_else(|| {
+        ark_core::Error::ad_hoc("missing witness script when signing renewal intent")
+    })?;
+    if ark_core::script::extract_checksig_pubkeys(&script).contains(&authorizer_keys.owner_pk()) {
+        Ok(authorizer_keys.sign_msg(&message))
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn reject_onchain_intent_input(
+    _: &mut bitcoin::psbt::Input,
+    _: bitcoin::secp256k1::Message,
+) -> std::result::Result<
+    (
+        bitcoin::secp256k1::schnorr::Signature,
+        bitcoin::XOnlyPublicKey,
+    ),
+    ark_core::Error,
+> {
+    Err(ark_core::Error::ad_hoc(
+        "renewal intent proofs have no onchain inputs",
+    ))
+}
+
+/// Build the proof accepted by arkd's overlap-based `deleteIntent` endpoint.
+/// A fresh proof is sufficient even after a process restart: arkd matches the
+/// proven outpoint, not the old intent id or registration proof.
+pub(crate) fn prepare_intent_deletion(
+    authorizer_keys: &Keys,
+    input: &intent::Input,
+) -> Result<IntentDeletion> {
+    let now = u64::try_from(now_unix()).context("system clock is before the Unix epoch")?;
+    let expire_at = now
+        .checked_add(INTENT_DELETE_TTL_SECS)
+        .ok_or_else(|| anyhow!("intent deletion expiry overflow"))?;
+    let message = IntentMessage::Delete { expire_at };
+    let intent = intent::make_intent(
+        |psbt_input, sighash| sign_intent_input(authorizer_keys, psbt_input, sighash),
+        reject_onchain_intent_input,
+        vec![input.clone()],
+        Vec::new(),
+        message.clone(),
+    )
+    .map_err(|error| anyhow!("build renewal intent deletion proof: {error}"))?;
+    Ok(IntentDeletion {
+        message,
+        proof: intent.proof,
+    })
+}
+
 pub fn bind(
     authorizer_keys: &Keys,
     prepared: RenewalIntent,
@@ -347,37 +502,10 @@ pub fn bind(
     };
 
     let sign_for_vtxo = |psbt_input: &mut bitcoin::psbt::Input,
-                         message: bitcoin::secp256k1::Message|
-     -> Result<
-        Vec<(
-            bitcoin::secp256k1::schnorr::Signature,
-            bitcoin::XOnlyPublicKey,
-        )>,
-        ark_core::Error,
-    > {
-        let script = psbt_input.witness_script.clone().ok_or_else(|| {
-            ark_core::Error::ad_hoc("missing witness script when signing rollover intent")
-        })?;
-        if ark_core::script::extract_checksig_pubkeys(&script).contains(&authorizer_keys.owner_pk())
-        {
-            Ok(authorizer_keys.sign_msg(&message))
-        } else {
-            Ok(Vec::new())
-        }
+                         message: bitcoin::secp256k1::Message| {
+        sign_intent_input(authorizer_keys, psbt_input, message)
     };
-    let sign_for_onchain = |_: &mut bitcoin::psbt::Input,
-                            _: bitcoin::secp256k1::Message|
-     -> Result<
-        (
-            bitcoin::secp256k1::schnorr::Signature,
-            bitcoin::XOnlyPublicKey,
-        ),
-        ark_core::Error,
-    > {
-        Err(ark_core::Error::ad_hoc(
-            "renewal intents have no onchain inputs",
-        ))
-    };
+    let sign_for_onchain = reject_onchain_intent_input;
 
     let message_json = message
         .encode()
@@ -429,6 +557,11 @@ fn attach_previous_transaction(intent: &mut Intent, previous_tx: &Transaction) -
         .inputs
         .get_mut(RENEWAL_STATE_INPUT_INDEX)
         .ok_or_else(|| anyhow!("renewal proof is missing its state input"))?;
+    if proof_input.unknown.contains_key(&key) {
+        return Err(anyhow!(
+            "previous Ark transaction field already exists on input {RENEWAL_STATE_INPUT_INDEX}"
+        ));
+    }
     proof_input
         .unknown
         .insert(key, bitcoin::consensus::encode::serialize(previous_tx));
@@ -459,16 +592,26 @@ pub fn combine_and_verify_emulator_approval(
         ark_script::compute_arkade_script_public_key(&emulator_pk, arkade_script)
             .context("derive renewal emulator signer")?;
     let rollover_pk = verifier.owner_pk();
+    // The authorizer signs only when its key is a renewal-leaf signer; a
+    // permissionless leaf (operator + tweaked emulator) takes the emulator
+    // signature alone and arkd completes its own when it enforces.
+    let client_sig_expected = expected.inputs[RENEWAL_STATE_INPUT_INDEX]
+        .witness_script
+        .as_ref()
+        .map(ark_core::script::extract_checksig_pubkeys)
+        .is_some_and(|signers| signers.contains(&rollover_pk));
     for input_index in 0..RENEWAL_INPUT_COUNT {
-        crate::txbuild::verified_signature_for_key_with_sighash(
-            verifier,
-            expected,
-            &combined,
-            input_index,
-            rollover_pk,
-            "rollover",
-            bitcoin::TapSighashType::Default,
-        )?;
+        if client_sig_expected {
+            crate::txbuild::verified_signature_for_key_with_sighash(
+                verifier,
+                expected,
+                &combined,
+                input_index,
+                rollover_pk,
+                "rollover",
+                bitcoin::TapSighashType::Default,
+            )?;
+        }
         crate::txbuild::verified_signature_for_key_with_sighash(
             verifier,
             expected,
@@ -478,7 +621,8 @@ pub fn combine_and_verify_emulator_approval(
             "emulator",
             bitcoin::TapSighashType::All,
         )?;
-        if combined.inputs[input_index].tap_script_sigs.len() != 2 {
+        let expected_sigs = 1 + usize::from(client_sig_expected);
+        if combined.inputs[input_index].tap_script_sigs.len() != expected_sigs {
             return Err(anyhow!("rollover proof contains an unexpected signature"));
         }
     }
@@ -725,13 +869,13 @@ mod tests {
             &secp,
             xonly(3),
             xonly(4),
-            xonly(5),
-            xonly(7),
             Sequence::from_height(144),
             Network::Regtest,
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            1_000,
+            1_000,
             330,
         )
         .unwrap();
@@ -764,7 +908,7 @@ mod tests {
             input: vec![bitcoin::TxIn::default()],
             output: vec![
                 TxOut {
-                    value: Amount::from_sat(1_980),
+                    value: Amount::from_sat(330),
                     script_pubkey: contract.vtxo.script_pubkey(),
                 },
                 ark_core::anchor_output(),
@@ -783,7 +927,6 @@ mod tests {
         )
         .unwrap();
         crate::tree::attach_tree_state_packet(&mut psbt, state).unwrap();
-        crate::tree::attach_tree_roll_packet(&mut psbt, advanced_tree_roll(state)).unwrap();
         crate::tree::attach_tree_health_packet(&mut psbt, crate::tree::TreeHealth::new(5).unwrap())
             .unwrap();
         psbt.unsigned_tx
@@ -818,14 +961,6 @@ mod tests {
         psbt.unsigned_tx
     }
 
-    fn advanced_tree_roll(state: TreeState) -> crate::tree::TreeRoll {
-        let mut roll = crate::tree::TreeRoll::initial(state);
-        for _ in 0..7 {
-            roll = roll.next();
-        }
-        roll
-    }
-
     #[test]
     fn prepare_tree_rejects_non_canonical_records_without_touching_the_intent() {
         let (_secp, contract) = tree_contract();
@@ -838,7 +973,7 @@ mod tests {
         let good = record(
             9,
             &contract.vtxo.script_pubkey(),
-            1_980,
+            330,
             vec![
                 indexed(asset(2, 0), 1),
                 indexed(asset(2, 1), 5),
@@ -857,6 +992,7 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .expect("canonical tree record");
         assert_eq!(prepared.input.assets().len(), 3);
@@ -870,7 +1006,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
-            330
+            330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
         .is_err());
 
@@ -883,7 +1020,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
-            330
+            330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
         .is_err());
 
@@ -896,7 +1034,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
-            330
+            330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
         .is_err());
 
@@ -910,6 +1049,7 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .is_err());
 
@@ -922,7 +1062,34 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
-            330
+            330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
+        )
+        .is_err());
+        // The forced rescue path may still renew a live input inside the
+        // usual margin, but never an expired one.
+        prepare_tree(
+            &expiring,
+            &previous,
+            &contract,
+            asset(2, 0),
+            asset(2, 1),
+            asset(2, 2),
+            330,
+            0,
+        )
+        .expect("forced renewal inside the margin");
+        let mut expired = good.clone();
+        expired.expires_at = Some(now_unix() - 1);
+        assert!(prepare_tree(
+            &expired,
+            &previous,
+            &contract,
+            asset(2, 0),
+            asset(2, 1),
+            asset(2, 2),
+            330,
+            0,
         )
         .is_err());
     }
@@ -939,7 +1106,7 @@ mod tests {
         let mut good = record(
             9,
             &contract.vtxo.script_pubkey(),
-            1_980,
+            330,
             vec![
                 indexed(asset(2, 0), 1),
                 indexed(asset(2, 1), 5),
@@ -955,16 +1122,13 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .unwrap();
         assert_eq!(
             prepared.state_packets,
             [
                 (TREE_STATE_PACKET_TYPE, state.encode().to_vec()),
-                (
-                    TREE_ROLL_PACKET_TYPE,
-                    advanced_tree_roll(state).encode().to_vec(),
-                ),
                 (
                     TREE_HEALTH_PACKET_TYPE,
                     crate::tree::TreeHealth::new(5).unwrap().encode().to_vec(),
@@ -983,24 +1147,76 @@ mod tests {
             .collect();
         assert_eq!(
             packet_types,
-            [
-                0,
-                TREE_STATE_PACKET_TYPE,
-                TREE_ROLL_PACKET_TYPE,
-                TREE_HEALTH_PACKET_TYPE,
-                1,
-            ]
+            [0, TREE_STATE_PACKET_TYPE, TREE_HEALTH_PACKET_TYPE, 1]
         );
         assert_eq!(extension.value, Amount::ZERO);
+    }
+
+    #[test]
+    fn intent_deletion_proves_the_same_input_without_creating_outputs() {
+        let (_secp, contract) = tree_contract();
+        let state = TreeState {
+            tree_id: 7,
+            x: 1,
+            y: 2,
+        };
+        let previous = previous_tree_tx(&contract, state);
+        let mut indexed_tree = record(
+            9,
+            &contract.vtxo.script_pubkey(),
+            330,
+            vec![
+                indexed(asset(2, 0), 1),
+                indexed(asset(2, 1), 5),
+                indexed(asset(2, 2), 5),
+            ],
+        );
+        indexed_tree.outpoint.txid = previous.compute_txid();
+        let prepared = prepare_tree(
+            &indexed_tree,
+            &previous,
+            &contract,
+            asset(2, 0),
+            asset(2, 1),
+            asset(2, 2),
+            330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+        )
+        .unwrap();
+        let authorizer = Keys::from_hex(&"03".repeat(32)).unwrap();
+        let before = now_unix() as u64;
+        let deletion = prepare_intent_deletion(&authorizer, &prepared.input).unwrap();
+        let after = now_unix() as u64;
+
+        let IntentMessage::Delete { expire_at } = deletion.message else {
+            panic!("cleanup proof must carry a delete message");
+        };
+        assert!(expire_at >= before + INTENT_DELETE_TTL_SECS);
+        assert!(expire_at <= after + INTENT_DELETE_TTL_SECS);
+        assert_eq!(
+            deletion.proof.unsigned_tx.input[1].previous_output,
+            prepared.input.outpoint()
+        );
+        assert_eq!(deletion.proof.unsigned_tx.output.len(), 1);
+        assert_eq!(deletion.proof.unsigned_tx.output[0].value, Amount::ZERO);
+        assert!(deletion.proof.unsigned_tx.output[0]
+            .script_pubkey
+            .is_op_return());
+        // The message and real input both prove the rollover key. Arkd skips
+        // its own covenant signer during ownership verification.
+        assert_eq!(deletion.proof.inputs[0].tap_script_sigs.len(), 1);
+        assert_eq!(deletion.proof.inputs[1].tap_script_sigs.len(), 1);
     }
 
     #[test]
     fn player_renewal_preserves_player_id_identity_position_and_xp_counter() {
         let contract = player_contract();
         let player_asset = asset(9, 0);
+        let identity = crate::player::PlayerIdentity { player_id: [7; 32] };
         let state = PlayerState {
-            identity: crate::player::PlayerIdentity { player_id: [7; 32] },
+            identity,
             position: crate::player::PlayerPosition { x: 3, y: 17 },
+            luck: crate::player::PlayerLuck::initial(identity),
             xp: crate::player::PlayerXp::new(83),
         };
         let previous = previous_player_tx(&contract, player_asset, state);
@@ -1015,7 +1231,14 @@ mod tests {
             ],
         );
         good.outpoint.txid = previous.compute_txid();
-        let prepared = prepare_player(&good, &previous, &contract, player_asset).unwrap();
+        let prepared = prepare_player(
+            &good,
+            &previous,
+            &contract,
+            player_asset,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+        )
+        .unwrap();
         assert_eq!(prepared.groups.len(), 3);
         assert_eq!(prepared.input.spend_info().0, contract.renewal_spend_script);
         assert_eq!(
@@ -1029,13 +1252,25 @@ mod tests {
                     PLAYER_POSITION_PACKET_TYPE,
                     state.position.encode().to_vec()
                 ),
+                (PLAYER_ROLL_PACKET_TYPE, state.luck.roll.encode().to_vec()),
+                (
+                    PLAYER_LUCK_CREDIT_PACKET_TYPE,
+                    state.luck.credit.encode().to_vec()
+                ),
                 (PLAYER_XP_PACKET_TYPE, state.xp.encode().to_vec()),
             ]
         );
 
         let mut leaked = good.clone();
         leaked.assets.push(indexed(asset(2, 0), 1));
-        assert!(prepare_player(&leaked, &previous, &contract, player_asset).is_err());
+        assert!(prepare_player(
+            &leaked,
+            &previous,
+            &contract,
+            player_asset,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
+        )
+        .is_err());
 
         let zero_state = PlayerState {
             xp: crate::player::PlayerXp::new(0),
@@ -1049,16 +1284,67 @@ mod tests {
             vec![indexed(player_asset, 1)],
         );
         zero_record.outpoint.txid = zero_previous.compute_txid();
-        let prepared =
-            prepare_player(&zero_record, &zero_previous, &contract, player_asset).unwrap();
+        let prepared = prepare_player(
+            &zero_record,
+            &zero_previous,
+            &contract,
+            player_asset,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+        )
+        .unwrap();
         assert_eq!(prepared.groups.len(), 1);
         assert_eq!(prepared.input.spend_info().0, contract.renewal_spend_script);
-        let watchtower =
-            prepare_player_watchtower(&zero_record, &zero_previous, &contract, player_asset)
-                .unwrap();
+        let watchtower = prepare_player_watchtower(
+            &zero_record,
+            &zero_previous,
+            &contract,
+            player_asset,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+        )
+        .unwrap();
         assert_eq!(
             watchtower.input.spend_info().0,
             contract.watchtower_renewal_spend_script
         );
+    }
+    #[test]
+    fn prepare_player_rejects_foreign_assets_even_without_xp() {
+        let contract = player_contract();
+        let player_asset = asset(9, 0);
+        let identity = crate::player::PlayerIdentity { player_id: [7; 32] };
+        let state = PlayerState {
+            identity,
+            position: crate::player::PlayerPosition { x: 3, y: 17 },
+            luck: crate::player::PlayerLuck::initial(identity),
+            xp: crate::player::PlayerXp::new(0),
+        };
+        let previous = previous_player_tx(&contract, player_asset, state);
+        let mut foreign = record(
+            9,
+            &contract.vtxo.script_pubkey(),
+            330,
+            vec![
+                indexed(player_asset, 1),
+                indexed(contract.log_asset, 2),
+                indexed(asset(2, 0), 1),
+            ],
+        );
+        foreign.outpoint.txid = previous.compute_txid();
+        assert!(prepare_player(
+            &foreign,
+            &previous,
+            &contract,
+            player_asset,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
+        )
+        .is_err());
+        assert!(prepare_player_watchtower(
+            &foreign,
+            &previous,
+            &contract,
+            player_asset,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
+        )
+        .is_err());
     }
 }

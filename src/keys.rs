@@ -49,8 +49,14 @@ impl Keys {
 
     /// Sign a taproot script-path sighash. Mirrors the SDK client's sign fn:
     /// one schnorr signature over the message, tagged with our x-only pubkey.
+    /// Auxiliary randomness hedges the deterministic nonce against fault and
+    /// side-channel nonce-recovery on long-lived online signers.
     pub fn sign_msg(&self, msg: &Message) -> Vec<(schnorr::Signature, XOnlyPublicKey)> {
-        let sig = self.secp.sign_schnorr_no_aux_rand(msg, &self.keypair);
+        let mut aux_rand = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut aux_rand);
+        let sig = self
+            .secp
+            .sign_schnorr_with_aux_rand(msg, &self.keypair, &aux_rand);
         vec![(sig, self.owner_pk())]
     }
 }

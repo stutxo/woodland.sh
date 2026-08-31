@@ -6,6 +6,8 @@ use crate::txbuild;
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
 use bitcoin::secp256k1::{Secp256k1, Verification};
+#[cfg(not(target_arch = "wasm32"))]
+use bitcoin::OutPoint;
 use bitcoin::Txid;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -13,12 +15,18 @@ use std::str::FromStr;
 
 pub(crate) const GAME_ID: &str = "woodland.sh";
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
+/// Initial manifest schema for player luck, reachable XP, permissionless tree
+/// lifecycle, and the fixed-supply restock vault.
 pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub(crate) const PROTOCOL_DUST_SATS: u64 = 330;
 pub(crate) const ACTIVE_LOGS_PER_TREE: u64 = 5;
-pub(crate) const LOG_RESERVE_PER_TREE: u64 = 10;
-pub(crate) const XP_PER_TREE: u64 = 10;
+pub(crate) const LOG_RESERVE_PER_TREE: u64 = 1_000;
+pub(crate) const XP_PER_TREE: u64 = 1_000;
 pub(crate) const TREE_COUNT: usize = 2_100;
+/// Fixed total LOG and XP supply: 2.1M on initial trees, the rest in the
+/// supply vault until restocks draw it down.
+pub(crate) const LOG_SUPPLY: u64 = 21_000_000;
+pub(crate) const XP_SUPPLY: u64 = 21_000_000;
 pub(crate) const MAP_WIDTH: u16 = 425;
 pub(crate) const MAP_HEIGHT: u16 = 425;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -116,14 +124,14 @@ pub(crate) fn tree_states() -> Vec<TreeState> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ManifestTree {
+pub struct ManifestTree {
     pub state: TreeState,
     pub deployment_txid: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct WorldManifest {
+pub struct WorldManifest {
     pub schema_version: u32,
     pub protocol_version: u32,
     pub game_id: String,
@@ -131,8 +139,9 @@ pub(crate) struct WorldManifest {
     pub arkade_service_url: String,
     pub emulator_url: String,
     pub operator_signer: String,
+    pub forfeit_pubkey: String,
+    pub forfeit_address: String,
     pub emulator_signer: String,
-    pub maintenance_signer: String,
     pub rollover_signer: String,
     pub unilateral_exit_sequence: u32,
     pub dust_sats: u64,
@@ -150,33 +159,49 @@ pub(crate) struct WorldManifest {
     pub level_log_drop_bonus_basis_points: u64,
     pub level_log_drop_xp_thresholds: [u64; 5],
     pub max_level_log_drop_basis_points: u64,
-    pub respawn_min_seconds: i64,
-    pub respawn_max_seconds: i64,
+    pub luck_window_basis_points: u64,
+    pub initial_luck_credit: u64,
     pub tree_script: String,
     pub tree_chop_arkade_script: String,
-    pub tree_regrow_arkade_script: String,
     pub tree_renewal_arkade_script: String,
+    pub tree_retire_arkade_script: String,
+    pub vault_script: String,
+    pub vault_restock_arkade_script: String,
+    pub vault_renewal_arkade_script: String,
     pub genesis_txid: String,
     pub trees: Vec<ManifestTree>,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ValidatedTree {
+pub struct ValidatedTree {
     pub state: TreeState,
     pub deployment_txid: Txid,
 }
 
-pub(crate) struct ValidatedWorld {
+/// Manifest-pinned Arkade service identity. Batch validation and forfeit
+/// signing use these values instead of endpoint-supplied parameters, so a
+/// spoofed or redirected Arkade endpoint cannot substitute its own operator
+/// key or forfeit payout.
+#[derive(Clone, Debug)]
+pub struct WorldPins {
+    pub operator_signer: bitcoin::XOnlyPublicKey,
+    pub forfeit_pk: bitcoin::PublicKey,
+    pub forfeit_address: bitcoin::Address,
+}
+
+pub struct ValidatedWorld {
     pub tree_asset: AssetId,
     pub log_asset: AssetId,
     pub xp_asset: AssetId,
     pub genesis_txid: Txid,
     pub trees: Vec<ValidatedTree>,
-    /// Used only by the native maintenance flow.
+    /// Used by the native and browser batch flows; the browser reads the
+    /// pins through the manifest instead.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub maintenance_signer: bitcoin::XOnlyPublicKey,
+    pub pins: WorldPins,
     pub rollover_signer: bitcoin::XOnlyPublicKey,
     pub contract: TreeContract,
+    pub vault: crate::vault::VaultContract,
 }
 
 impl WorldManifest {
@@ -187,12 +212,12 @@ impl WorldManifest {
         emulator: &EmulatorParams,
         arkade_service_url: &str,
         emulator_url: &str,
-        maintenance_signer: bitcoin::XOnlyPublicKey,
         rollover_signer: bitcoin::XOnlyPublicKey,
         tree_asset: AssetId,
         log_asset: AssetId,
         xp_asset: AssetId,
         contract: &TreeContract,
+        vault: &crate::vault::VaultContract,
         genesis_txid: Txid,
         deployments: &[(TreeState, Txid)],
     ) -> Self {
@@ -204,9 +229,10 @@ impl WorldManifest {
             arkade_service_url: arkade_service_url.trim_end_matches('/').to_owned(),
             emulator_url: emulator_url.trim_end_matches('/').to_owned(),
             operator_signer: params.signer_pk.to_string(),
+            forfeit_pubkey: params.forfeit_pk.to_string(),
+            forfeit_address: params.forfeit_address.to_string(),
             emulator_signer: emulator.signer_pk.to_string(),
             rollover_signer: rollover_signer.to_string(),
-            maintenance_signer: maintenance_signer.to_string(),
             unilateral_exit_sequence: params.unilateral_exit_delay.to_consensus_u32(),
             dust_sats: params.dust_sats,
             map_width: MAP_WIDTH,
@@ -219,16 +245,19 @@ impl WorldManifest {
             xp_per_tree: XP_PER_TREE,
             player_level_curve: crate::player::PLAYER_LEVEL_CURVE.to_string(),
             max_player_level: crate::player::MAX_PLAYER_LEVEL,
-            base_log_drop_basis_points: tree::BASE_LOG_DROP_BASIS_POINTS,
-            level_log_drop_bonus_basis_points: tree::LEVEL_LOG_DROP_BONUS_BASIS_POINTS,
-            level_log_drop_xp_thresholds: tree::LEVEL_LOG_DROP_XP_THRESHOLDS,
-            max_level_log_drop_basis_points: tree::MAX_LEVEL_LOG_DROP_BASIS_POINTS,
-            respawn_min_seconds: tree::RESPAWN_MIN_SECS,
-            respawn_max_seconds: tree::RESPAWN_MAX_SECS,
+            base_log_drop_basis_points: crate::player::BASE_LOG_DROP_BASIS_POINTS,
+            level_log_drop_bonus_basis_points: crate::player::LEVEL_LOG_DROP_BONUS_BASIS_POINTS,
+            level_log_drop_xp_thresholds: crate::player::LEVEL_LOG_DROP_XP_THRESHOLDS,
+            max_level_log_drop_basis_points: crate::player::MAX_LEVEL_LOG_DROP_BASIS_POINTS,
+            luck_window_basis_points: crate::player::LUCK_WINDOW_BASIS_POINTS,
+            initial_luck_credit: crate::player::INITIAL_LUCK_CREDIT,
             tree_script: contract.vtxo.script_pubkey().to_hex_string(),
             tree_chop_arkade_script: contract.chop_arkade_script.to_hex_string(),
-            tree_regrow_arkade_script: contract.regrow_arkade_script.to_hex_string(),
             tree_renewal_arkade_script: contract.renewal_arkade_script.to_hex_string(),
+            tree_retire_arkade_script: contract.retire_arkade_script.to_hex_string(),
+            vault_script: vault.vtxo.script_pubkey().to_hex_string(),
+            vault_restock_arkade_script: vault.restock_arkade_script.to_hex_string(),
+            vault_renewal_arkade_script: vault.renewal_arkade_script.to_hex_string(),
             genesis_txid: genesis_txid.to_string(),
             trees: deployments
                 .iter()
@@ -242,6 +271,31 @@ impl WorldManifest {
 
     pub fn from_json(json: &str) -> Result<Self> {
         serde_json::from_str(json).context("parse woodland.sh world manifest")
+    }
+
+    /// Parse the pinned service identity, checking the forfeit address
+    /// against the expected network. Meaningful only after [`Self::validate`]
+    /// has bound the manifest to the live services.
+    pub fn pins(&self, network: bitcoin::Network) -> Result<WorldPins> {
+        let operator_signer = self
+            .operator_signer
+            .parse()
+            .context("parse world operator signer")?;
+        let forfeit_pk = self
+            .forfeit_pubkey
+            .parse()
+            .context("parse world forfeit pubkey")?;
+        let forfeit_address = self
+            .forfeit_address
+            .parse::<bitcoin::Address<_>>()
+            .context("parse world forfeit address")?
+            .require_network(network)
+            .context("world forfeit address network mismatch")?;
+        Ok(WorldPins {
+            operator_signer,
+            forfeit_pk,
+            forfeit_address,
+        })
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -261,10 +315,6 @@ impl WorldManifest {
                 self.schema_version
             ));
         }
-        let maintenance_signer: bitcoin::XOnlyPublicKey = self
-            .maintenance_signer
-            .parse()
-            .context("parse world maintenance signer")?;
         let rollover_signer: bitcoin::XOnlyPublicKey = self
             .rollover_signer
             .parse()
@@ -273,6 +323,8 @@ impl WorldManifest {
             || self.game_id != GAME_ID
             || self.network != params.network.to_string()
             || self.operator_signer != params.signer_pk.to_string()
+            || self.forfeit_pubkey != params.forfeit_pk.to_string()
+            || self.forfeit_address != params.forfeit_address.to_string()
             || self.emulator_signer != emulator.signer_pk.to_string()
             || self.unilateral_exit_sequence != params.unilateral_exit_delay.to_consensus_u32()
             || self.dust_sats != params.dust_sats
@@ -286,16 +338,11 @@ impl WorldManifest {
                 "woodland.sh world manifest does not match the running services"
             ));
         }
-        if [
-            params.signer_pk,
-            emulator.signer_pk,
-            maintenance_signer,
-            rollover_signer,
-        ]
-        .into_iter()
-        .collect::<HashSet<_>>()
-        .len()
-            != 4
+        if [params.signer_pk, emulator.signer_pk, rollover_signer]
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != 3
         {
             return Err(anyhow!("world service signers must be distinct"));
         }
@@ -308,12 +355,14 @@ impl WorldManifest {
             || self.xp_per_tree != XP_PER_TREE
             || self.player_level_curve != crate::player::PLAYER_LEVEL_CURVE
             || self.max_player_level != crate::player::MAX_PLAYER_LEVEL
-            || self.base_log_drop_basis_points != tree::BASE_LOG_DROP_BASIS_POINTS
-            || self.level_log_drop_bonus_basis_points != tree::LEVEL_LOG_DROP_BONUS_BASIS_POINTS
-            || self.level_log_drop_xp_thresholds != tree::LEVEL_LOG_DROP_XP_THRESHOLDS
-            || self.max_level_log_drop_basis_points != tree::MAX_LEVEL_LOG_DROP_BASIS_POINTS
-            || self.respawn_min_seconds != tree::RESPAWN_MIN_SECS
-            || self.respawn_max_seconds != tree::RESPAWN_MAX_SECS
+            || self.base_log_drop_basis_points != crate::player::BASE_LOG_DROP_BASIS_POINTS
+            || self.level_log_drop_bonus_basis_points
+                != crate::player::LEVEL_LOG_DROP_BONUS_BASIS_POINTS
+            || self.level_log_drop_xp_thresholds != crate::player::LEVEL_LOG_DROP_XP_THRESHOLDS
+            || self.max_level_log_drop_basis_points
+                != crate::player::MAX_LEVEL_LOG_DROP_BASIS_POINTS
+            || self.luck_window_basis_points != crate::player::LUCK_WINDOW_BASIS_POINTS
+            || self.initial_luck_credit != crate::player::INITIAL_LUCK_CREDIT
             || self.trees.len() != TREE_COUNT
         {
             return Err(anyhow!("woodland.sh world manifest shape is invalid"));
@@ -371,19 +420,36 @@ impl WorldManifest {
             secp,
             params.signer_pk,
             emulator.signer_pk,
-            maintenance_signer,
-            rollover_signer,
             params.unilateral_exit_delay,
             params.network,
             tree_asset,
             log_asset,
             xp_asset,
+            LOG_RESERVE_PER_TREE,
+            XP_PER_TREE,
+            params.dust_sats,
+        )?;
+        let vault = crate::vault::build_vault_contract(
+            secp,
+            params.signer_pk,
+            emulator.signer_pk,
+            params.unilateral_exit_delay,
+            params.network,
+            tree_asset,
+            log_asset,
+            xp_asset,
+            &contract.vtxo.script_pubkey(),
+            LOG_RESERVE_PER_TREE,
+            XP_PER_TREE,
             params.dust_sats,
         )?;
         if self.tree_script != contract.vtxo.script_pubkey().to_hex_string()
             || self.tree_chop_arkade_script != contract.chop_arkade_script.to_hex_string()
-            || self.tree_regrow_arkade_script != contract.regrow_arkade_script.to_hex_string()
             || self.tree_renewal_arkade_script != contract.renewal_arkade_script.to_hex_string()
+            || self.tree_retire_arkade_script != contract.retire_arkade_script.to_hex_string()
+            || self.vault_script != vault.vtxo.script_pubkey().to_hex_string()
+            || self.vault_restock_arkade_script != vault.restock_arkade_script.to_hex_string()
+            || self.vault_renewal_arkade_script != vault.renewal_arkade_script.to_hex_string()
         {
             return Err(anyhow!("world manifest covenant script mismatch"));
         }
@@ -394,9 +460,10 @@ impl WorldManifest {
             xp_asset,
             genesis_txid,
             trees,
-            maintenance_signer,
+            pins: self.pins(params.network)?,
             rollover_signer,
             contract,
+            vault,
         })
     }
 }
@@ -418,29 +485,113 @@ fn expected_asset_metadata(label: &str) -> Vec<u8> {
 }
 
 impl ValidatedWorld {
+    /// Follow every declared tree's indexed lineage from its deployment
+    /// outpoint to the current live record. Each hop requires exactly one
+    /// successor that preserves the tree identity packet and matches the
+    /// indexer's spent-by pointer; forks, cycles, and indexing gaps fail
+    /// closed. This is the single implementation every host (operator,
+    /// server, headless client) uses to reconcile tree state.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn load_tree_lineage_records(
+        &self,
+        rest: &crate::arkade::ArkadeRest,
+        declared: &[ValidatedTree],
+    ) -> Result<Vec<crate::arkade::VtxoRecord>> {
+        let outpoints = declared
+            .iter()
+            .map(|tree| OutPoint {
+                txid: tree.deployment_txid,
+                vout: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut current = rest.get_vtxos_by_outpoints(&outpoints).await?;
+        if current.len() != declared.len() {
+            return Err(anyhow!(
+                "index returned {} of {} exact tree lineages",
+                current.len(),
+                declared.len()
+            ));
+        }
+        let mut lineage_states = declared
+            .iter()
+            .map(|tree| {
+                (
+                    OutPoint {
+                        txid: tree.deployment_txid,
+                        vout: 0,
+                    },
+                    tree.state,
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut visited = current
+            .iter()
+            .map(|record| record.outpoint)
+            .collect::<std::collections::HashSet<_>>();
+        let tree_script = self.contract.vtxo.script_pubkey();
+        loop {
+            let spent = current
+                .iter()
+                .filter(|record| record.is_spent)
+                .cloned()
+                .collect::<Vec<_>>();
+            if spent.is_empty() {
+                return Ok(current);
+            }
+            let candidates = rest
+                .get_vtxo_successor_candidates(&spent, &tree_script, self.tree_asset)
+                .await?;
+            let mut successors = Vec::with_capacity(candidates.len());
+            for (record, transaction) in candidates {
+                let state = tree::tree_state_from_tx(&transaction)?
+                    .ok_or_else(|| anyhow!("tree successor has no identity packet"))?;
+                successors.push((state, record));
+            }
+            for record in &mut current {
+                if !record.is_spent {
+                    continue;
+                }
+                let state = lineage_states
+                    .remove(&record.outpoint)
+                    .ok_or_else(|| anyhow!("tree lineage lost its identity"))?;
+                let direct_txid = record.spent_by;
+                let mut matching = successors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (candidate_state, candidate))| {
+                        *candidate_state == state
+                            && direct_txid.is_none_or(|txid| candidate.outpoint.txid == txid)
+                    })
+                    .map(|(index, _)| index);
+                let index = matching
+                    .next()
+                    .ok_or_else(|| anyhow!("tree successor is not indexed yet"))?;
+                if matching.next().is_some() {
+                    return Err(anyhow!("tree has multiple indexed successors"));
+                }
+                drop(matching);
+                let (_, successor) = successors.swap_remove(index);
+                if !visited.insert(successor.outpoint) {
+                    return Err(anyhow!("tree lineage contains a cycle"));
+                }
+                lineage_states.insert(successor.outpoint, state);
+                *record = successor;
+            }
+        }
+    }
+
     pub async fn verify_indexed_assets(&self, rest: &crate::arkade::ArkadeRest) -> Result<()> {
-        for (asset_id, label, maximum_supply, allow_zero) in [
-            (self.tree_asset, "TREE", self.trees.len() as u64, false),
-            (
-                self.log_asset,
-                "LOG",
-                LOG_RESERVE_PER_TREE * self.trees.len() as u64,
-                true,
-            ),
-            (
-                self.xp_asset,
-                "XP",
-                XP_PER_TREE * self.trees.len() as u64,
-                true,
-            ),
+        for (asset_id, label, expected_supply) in [
+            (self.tree_asset, "TREE", self.trees.len() as u64),
+            (self.log_asset, "LOG", LOG_SUPPLY),
+            (self.xp_asset, "XP", XP_SUPPLY),
         ] {
             let details = rest
                 .get_asset_details(asset_id)
                 .await
                 .with_context(|| format!("verify indexed {label} asset"))?;
             if details.control_asset.is_some()
-                || (!allow_zero && details.supply == 0)
-                || details.supply > maximum_supply
+                || details.supply != expected_supply
                 || details.metadata != expected_asset_metadata(label)
             {
                 return Err(anyhow!(
@@ -468,14 +619,10 @@ mod tests {
         let secp = Secp256k1::new();
         let operator_secret = SecretKey::from_slice(&[3; 32]).unwrap();
         let emulator_secret = SecretKey::from_slice(&[4; 32]).unwrap();
-        let renewal_secret = SecretKey::from_slice(&[5; 32]).unwrap();
         let rollover_secret = SecretKey::from_slice(&[7; 32]).unwrap();
         let operator_keypair = Keypair::from_secret_key(&secp, &operator_secret);
         let operator = operator_keypair.x_only_public_key().0;
         let emulator = Keypair::from_secret_key(&secp, &emulator_secret)
-            .x_only_public_key()
-            .0;
-        let renewal = Keypair::from_secret_key(&secp, &renewal_secret)
             .x_only_public_key()
             .0;
         let rollover = Keypair::from_secret_key(&secp, &rollover_secret)
@@ -516,13 +663,28 @@ mod tests {
             &secp,
             operator,
             emulator,
-            renewal,
-            rollover,
             params.unilateral_exit_delay,
             params.network,
             tree_asset,
             log_asset,
             xp_asset,
+            LOG_RESERVE_PER_TREE,
+            XP_PER_TREE,
+            params.dust_sats,
+        )
+        .unwrap();
+        let vault = crate::vault::build_vault_contract(
+            &secp,
+            operator,
+            emulator,
+            params.unilateral_exit_delay,
+            params.network,
+            tree_asset,
+            log_asset,
+            xp_asset,
+            &contract.vtxo.script_pubkey(),
+            LOG_RESERVE_PER_TREE,
+            XP_PER_TREE,
             params.dust_sats,
         )
         .unwrap();
@@ -540,12 +702,12 @@ mod tests {
             &emulator_params,
             "http://127.0.0.1:7070",
             "http://127.0.0.1:7073",
-            renewal,
             rollover,
             tree_asset,
             log_asset,
             xp_asset,
             &contract,
+            &vault,
             genesis_txid,
             &deployments,
         );
@@ -571,17 +733,27 @@ mod tests {
         assert_eq!(parsed.max_player_level, crate::player::MAX_PLAYER_LEVEL);
         assert_eq!(
             parsed.level_log_drop_xp_thresholds,
-            tree::LEVEL_LOG_DROP_XP_THRESHOLDS
+            crate::player::LEVEL_LOG_DROP_XP_THRESHOLDS
         );
         assert_eq!(
             parsed.max_level_log_drop_basis_points,
-            tree::MAX_LEVEL_LOG_DROP_BASIS_POINTS
+            crate::player::MAX_LEVEL_LOG_DROP_BASIS_POINTS
         );
-        assert_eq!(parsed.respawn_min_seconds, tree::RESPAWN_MIN_SECS);
-        assert_eq!(parsed.respawn_max_seconds, tree::RESPAWN_MAX_SECS);
         assert_eq!(
-            world.contract.regrow_arkade_script.to_hex_string(),
-            parsed.tree_regrow_arkade_script
+            parsed.luck_window_basis_points,
+            crate::player::LUCK_WINDOW_BASIS_POINTS
+        );
+        assert_eq!(
+            parsed.initial_luck_credit,
+            crate::player::INITIAL_LUCK_CREDIT
+        );
+        assert_eq!(
+            world.contract.retire_arkade_script.to_hex_string(),
+            parsed.tree_retire_arkade_script
+        );
+        assert_eq!(
+            world.vault.restock_arkade_script.to_hex_string(),
+            parsed.vault_restock_arkade_script
         );
     }
 
@@ -606,13 +778,44 @@ mod tests {
     fn manifest_rejects_changed_tree_leaf_commitments() {
         let (secp, params, emulator, manifest) = fixture();
 
-        let mut regrow = manifest.clone();
-        regrow.tree_regrow_arkade_script.push_str("00");
-        assert!(regrow.validate(&secp, &params, &emulator).is_err());
+        let mut retire = manifest.clone();
+        retire.tree_retire_arkade_script.push_str("00");
+        assert!(retire.validate(&secp, &params, &emulator).is_err());
+
+        let mut vault = manifest.clone();
+        vault.vault_restock_arkade_script.push_str("00");
+        assert!(vault.validate(&secp, &params, &emulator).is_err());
 
         let mut chop = manifest;
         chop.tree_chop_arkade_script.push_str("00");
         assert!(chop.validate(&secp, &params, &emulator).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_changed_service_identity() {
+        let (secp, params, emulator, manifest) = fixture();
+        for mutate in [
+            |manifest: &mut WorldManifest| manifest.operator_signer.push('0'),
+            |manifest: &mut WorldManifest| manifest.emulator_signer.push('0'),
+            |manifest: &mut WorldManifest| manifest.forfeit_pubkey.push('0'),
+            |manifest: &mut WorldManifest| {
+                manifest.forfeit_address = Address::p2tr(
+                    &Secp256k1::new(),
+                    SecretKey::from_slice(&[9; 32])
+                        .unwrap()
+                        .public_key(&Secp256k1::new())
+                        .x_only_public_key()
+                        .0,
+                    None,
+                    Network::Regtest,
+                )
+                .to_string();
+            },
+        ] {
+            let mut changed = manifest.clone();
+            mutate(&mut changed);
+            assert!(changed.validate(&secp, &params, &emulator).is_err());
+        }
     }
 
     #[test]
@@ -624,11 +827,12 @@ mod tests {
             |manifest: &mut WorldManifest| manifest.level_log_drop_bonus_basis_points += 1,
             |manifest: &mut WorldManifest| manifest.level_log_drop_xp_thresholds[0] -= 1,
             |manifest: &mut WorldManifest| manifest.max_level_log_drop_basis_points += 1,
+            |manifest: &mut WorldManifest| manifest.luck_window_basis_points += 1,
+            |manifest: &mut WorldManifest| manifest.initial_luck_credit += 1,
             |manifest: &mut WorldManifest| manifest.max_player_level += 1,
             |manifest: &mut WorldManifest| manifest.log_reserve_per_tree += 1,
             |manifest: &mut WorldManifest| manifest.xp_per_tree += 1,
-            |manifest: &mut WorldManifest| manifest.respawn_min_seconds -= 1,
-            |manifest: &mut WorldManifest| manifest.respawn_max_seconds += 1,
+            |manifest: &mut WorldManifest| manifest.vault_script.push('0'),
         ] {
             let mut changed = manifest.clone();
             mutate(&mut changed);

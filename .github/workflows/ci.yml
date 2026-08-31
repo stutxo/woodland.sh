@@ -15,6 +15,7 @@ on:
           - smoke
           - full
           - soak
+          - restock
         default: smoke
 
 concurrency:
@@ -194,13 +195,13 @@ jobs:
           retention-days: 7
 
   pages-build:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.WOODLAND_PAGES_MANIFEST != ''
     needs: regtest
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
-      WOODLAND_WORLD_MANIFEST: ${{ vars.WOODLAND_PAGES_MANIFEST || 'mutinynet/woodland-world.json' }}
+      WOODLAND_WORLD_MANIFEST: ${{ vars.WOODLAND_PAGES_MANIFEST }}
       WOODLAND_SERVER_URL: ${{ vars.WOODLAND_SERVER_URL || '' }}
       WOODLAND_WASM_FEATURES: woodland-app
     steps:

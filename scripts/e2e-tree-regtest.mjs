@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
   assertPortAvailable,
+  decodeAssetMetadata,
   E2E_PROFILE,
   FULL_E2E,
   saveScreenshot,
@@ -24,14 +25,48 @@ const EXTERNAL_WEB_URL = process.env.WOODLAND_E2E_WEB_URL?.replace(/\/$/, '');
 const WEB_URL = EXTERNAL_WEB_URL || `http://127.0.0.1:${WEB_PORT}`;
 const DRIVER_URL = `http://127.0.0.1:${DRIVER_PORT}`;
 const TARGET_HITS = FULL_E2E ? 5 : 1;
+const ARKD = 'http://127.0.0.1:7070';
 
 async function request(method, pathName, body) {
   return webdriverRequest(DRIVER_URL, method, pathName, body);
 }
 
+async function indexerVtxos(params) {
+  const records = [];
+  const visited = new Set();
+  let pageIndex = 1;
+  while (!visited.has(pageIndex)) {
+    visited.add(pageIndex);
+    const query = new URLSearchParams({
+      ...params,
+      'page.size': '500',
+      'page.index': String(pageIndex),
+    });
+    const response = await fetch(`${ARKD}/v1/indexer/vtxos?${query}`);
+    if (!response.ok) throw new Error(`indexer query failed: ${await response.text()}`);
+    const payload = await response.json();
+    records.push(...(payload.vtxos || []));
+    const next = Number(payload.page?.next || 0);
+    if (next <= pageIndex) break;
+    pageIndex = next;
+  }
+  return records;
+}
+
+// Withdrawn LOG sits in plain wallet VTXOs, outside the player state.
+function walletAssetTotal(state, assetId) {
+  return (state.walletVtxos || []).reduce(
+    (sum, vtxo) => sum + (vtxo.assets || []).reduce(
+      (inner, asset) => inner + (asset.id === assetId ? asset.amount : 0),
+      0,
+    ),
+    0,
+  );
+}
+
 function assertLogSupply(state, expected, label) {
   const treeLogs = state.trees.reduce((sum, tree) => sum + tree.logReserveRemaining, 0);
-  const total = treeLogs + state.playerLogs;
+  const total = treeLogs + state.playerLogs + walletAssetTotal(state, state.logAsset);
   assert.equal(total, expected, `${label}: fixed LOG supply is ${total}`);
 }
 
@@ -58,7 +93,7 @@ function assertFixedSats(state, expected, label) {
 
 async function main() {
   await Promise.all([
-    waitForHttp('http://127.0.0.1:7070/v1/info', 5_000),
+    waitForHttp(`${ARKD}/v1/info`, 5_000),
     waitForHttp('http://127.0.0.1:7073/v1/info', 5_000),
     ...(EXTERNAL_WEB_URL ? [] : [assertPortAvailable(WEB_PORT, 'web server')]),
     assertPortAvailable(DRIVER_PORT, 'WebDriver'),
@@ -252,6 +287,33 @@ async function main() {
       overrides.playerStateOutpoint ?? snapshot.playerStateOutpoint,
       overrides.drop ?? tree.nextDrop,
     ]);
+    const expectedChopAfterRenewal = async (snapshot, tree, label) => {
+      const result = await expectedChop(snapshot, tree);
+      if (result.ok) return { result, refreshed: null };
+
+      assert.match(result.message, /chop precondition changed/i, label);
+      const refreshed = await inspect();
+      const currentTree = refreshed.state.trees.find(
+        (candidate) => candidate.treeId === tree.treeId,
+      );
+      assert.ok(currentTree, `${label}: refreshed tree disappeared`);
+      assert.ok(
+        refreshed.state.playerStateOutpoint !== snapshot.playerStateOutpoint
+          || currentTree.treeOutpoint !== tree.treeOutpoint,
+        `${label}: precondition rejection did not expose a renewed state`,
+      );
+      assert.equal(refreshed.state.playerAsset, snapshot.playerAsset, label);
+      assert.equal(refreshed.state.playerXp, snapshot.playerXp, label);
+      assert.equal(refreshed.state.playerLogs, snapshot.playerLogs, label);
+      assert.equal(refreshed.state.playerLuckCredit, snapshot.playerLuckCredit, label);
+      assert.equal(refreshed.state.playerLevel, snapshot.playerLevel, label);
+      assert.equal(currentTree.health, tree.health, label);
+      assert.equal(currentTree.logReserveRemaining, tree.logReserveRemaining, label);
+      assert.equal(currentTree.xpRemaining, tree.xpRemaining, label);
+      assert.equal(currentTree.nextRollBucket, tree.nextRollBucket, label);
+      assert.equal(currentTree.nextDrop, tree.nextDrop, label);
+      return { result: null, refreshed };
+    };
     const assertExpectedChopPreconditions = async (snapshot, tree) => {
       const mutations = [
         { treeOutpoint: `${tree.treeOutpoint}-stale` },
@@ -298,10 +360,9 @@ async function main() {
     const assertAutoChopUntilLog = async (before, label) => {
       const tree = before.state.trees.find((candidate) => (
         candidate.health > 0
-        && candidate.nextDrop === false
         && Math.abs(before.player.x - candidate.x) + Math.abs(before.player.y - candidate.y) > 1
       ));
-      assert.ok(tree, `${label}: no distant standing miss-first tree is available`);
+      assert.ok(tree, `${label}: no distant standing tree is available`);
       await clickTree(tree.treeId);
       const after = await waitFor(
         label,
@@ -309,7 +370,7 @@ async function main() {
         (value) => !value.busy
           && value.autoChop?.treeId === tree.treeId
           && value.autoChop.success
-          && value.autoChop.swings > 1
+          && value.autoChop.swings >= 1
           && value.state?.playerLogs === before.state.playerLogs + 1
           && value.state.playerXp === before.state.playerXp + 1,
         180_000,
@@ -318,6 +379,10 @@ async function main() {
       assert.equal(
         after.status,
         `You get a LOG and 1 XP after ${after.autoChop.swings} ${suffix}.`,
+      );
+      assert.ok(
+        after.autoChop.swings <= 11,
+        `${label}: auto-chop exceeded the player luck bound`,
       );
       assert.ok(
         after.autoChop.durationMs >= (after.autoChop.swings - 1) * 900,
@@ -347,6 +412,125 @@ async function main() {
       );
       return after;
     };
+    // A stump (health 0 with reserve left) refills when the renewal watcher
+    // renews it on its ~60s tick: health returns to 5 while LOG, XP, and player
+    // state remain unchanged. Poll with forced world refreshes, bounded to five
+    // minutes.
+    const waitForTreeRenewal = async (treeId, label) => {
+      const deadline = Date.now() + 300_000;
+      for (;;) {
+        await sleep(5_000);
+        await executeAsync(`
+          const done = arguments[arguments.length - 1];
+          globalThis.__WOODLAND_E2E_REFRESH_WORLD().then(done);
+        `);
+        const view = await inspect();
+        if (view.error) throw new Error(`${label} failed: ${view.error}\n${view.log || ''}`);
+        const tree = view.state?.trees?.find((candidate) => candidate.treeId === treeId);
+        if (view.ready && !view.busy && tree?.health === 5) return view;
+        assert.ok(
+          Date.now() < deadline,
+          `${label}: tree ${treeId} was not renewed within five minutes`,
+        );
+      }
+    };
+    // The first-party game deliberately has no withdrawal control. Keep
+    // protocol/API coverage for a future marketplace or third-party client.
+    const runWithdrawStage = async (before, label) => {
+      assert.ok(before.state.playerLogs >= 1, `${label}: withdraw needs at least 1 LOG`);
+      assert.equal(
+        before.state.walletVtxos.length,
+        0,
+        `${label}: withdraw funding needs an empty wallet`,
+      );
+      execFileSync(
+        path.join(ROOT, 'scripts/regtest.sh'),
+        ['fund', before.state.address, '330'],
+        { cwd: ROOT, stdio: 'pipe', encoding: 'utf8' },
+      );
+      await click('refresh');
+      let view = await waitFor(
+        `${label} withdraw funding`,
+        inspect,
+        (value) => !value.busy
+          && value.state?.walletVtxos?.length === 1
+          && value.state.walletVtxos[0].amountSats === 330
+          && (value.state.walletVtxos[0].assets || []).length === 0
+          && value.state.walletSats === before.state.walletSats + 330,
+        180_000,
+      );
+      const logsBefore = view.state.playerLogs;
+      const xpBefore = view.state.playerXp;
+      // Soulbound proxy: XP has no withdrawal path at all — the withdraw
+      // covenant pins the XP balance inside the player state (covered by the
+      // native withdraw-leaf unit tests) and the WASM exposes no XP-moving
+      // mutation hook. The client-side check is that withdrawing more LOG
+      // than the player holds is rejected before any transaction exists.
+      const rejected = await executeAsync(`
+        const done = arguments[arguments.length - 1];
+        globalThis.__WOODLAND_E2E_WITHDRAW_LOG(arguments[0])
+          .then(() => done({ ok: true }))
+          .catch((error) => done({ rejection: String(error) }));
+      `, [logsBefore + 1]);
+      assert.ok(rejected.rejection, `${label}: over-balance withdraw was accepted`);
+      assert.match(rejected.rejection, /exceeds the player LOG balance/);
+      await executeAsync(`
+        const done = arguments[arguments.length - 1];
+        globalThis.__WOODLAND_E2E_REFRESH().then(done);
+      `);
+      const unchanged = await inspect();
+      assert.equal(unchanged.state.playerLogs, logsBefore, label);
+      assert.equal(unchanged.state.playerXp, xpBefore, label);
+      assert.equal(
+        unchanged.state.playerStateOutpoint,
+        view.state.playerStateOutpoint,
+        label,
+      );
+      const withdrawn = await executeAsync(`
+        const done = arguments[arguments.length - 1];
+        globalThis.__WOODLAND_E2E_WITHDRAW_LOG(arguments[0])
+          .then(() => done({ ok: true }))
+          .catch((error) => done({ error: String(error) }));
+      `, [1]);
+      assert.equal(withdrawn.error, undefined, `${label}: ${withdrawn.error}`);
+      view = await waitFor(
+        `${label} LOG withdraw settlement`,
+        inspect,
+        (value) => !value.busy
+          && value.state?.playerLogs === logsBefore - 1
+          && value.state?.playerXp === xpBefore
+          && value.state?.walletVtxos?.some((vtxo) => (vtxo.assets || []).some(
+            (asset) => asset.id === value.state.logAsset && asset.amount === 1,
+          )),
+        180_000,
+      );
+      assert.notEqual(
+        view.state.playerStateOutpoint,
+        unchanged.state.playerStateOutpoint,
+        label,
+      );
+      assert.equal(view.state.playerAsset, before.state.playerAsset, label);
+      const destination = view.state.walletVtxos.find((vtxo) => (vtxo.assets || []).some(
+        (asset) => asset.id === view.state.logAsset,
+      ));
+      assert.equal(destination.amountSats, 330, `${label}: withdraw destination value`);
+      assert.equal(
+        destination.assets
+          .filter((asset) => asset.id === view.state.logAsset)
+          .reduce((sum, asset) => sum + asset.amount, 0),
+        1,
+        `${label}: withdrawn LOG amount`,
+      );
+      assert.equal(view.state.playerXp, xpBefore, `${label}: XP must be soulbound`);
+      assert.equal(
+        view.state.walletSats,
+        before.state.walletSats + 330,
+        `${label}: withdraw must not create or destroy sats`,
+      );
+      assertLogSupply(view.state, totalLogs, label);
+      assertXpAccounting(view.state, totalXp, label);
+      return view;
+    };
 
     await wd('POST', '/url', { url: `${WEB_URL}/` });
     const initial = await waitFor(
@@ -366,12 +550,13 @@ async function main() {
     assert.equal(initial.stumpGlyphs, 0);
     assert.equal(initial.state.dustSats, 330);
     assert.equal(initial.state.fundingRequiredSats, 330);
-    assert.equal(initial.state.fullTreeValueSats, 1_980);
+    assert.equal(initial.state.fullTreeValueSats, 330);
     assert.equal(new Set(initial.state.trees.map((tree) => tree.treeId)).size, treeCount);
     assert.equal(new Set(initial.state.trees.map((tree) => `${tree.x}:${tree.y}`)).size, treeCount);
     assert.equal(new Set(initial.state.trees.map((tree) => tree.treeOutpoint)).size, treeCount);
-    assert.ok(initial.state.trees.every((tree) => tree.logReserveRemaining === 10));
-    assert.ok(initial.state.trees.every((tree) => tree.xpRemaining === 10));
+    assert.ok(initial.state.trees.every((tree) => tree.logReserveRemaining === 1_000));
+    assert.ok(initial.state.trees.every((tree) => tree.xpRemaining === 1_000));
+    assert.ok(initial.state.trees.every((tree) => tree.depleted === false));
     assert.equal(initial.state.playerLogs, 0);
     assert.equal(initial.state.fundingRequiredSats, initial.state.dustSats);
     assert.equal(initial.state.playerXp, 0);
@@ -395,10 +580,35 @@ async function main() {
     assertLogSupply(initial.state, totalLogs, 'initial world');
     assertXpAccounting(initial.state, totalXp, 'initial world');
     assertTreeValue(initial.state, 'initial world');
+    assert.equal(manifest.schemaVersion, 1, 'world manifest must be schema 1');
+    assert.equal(manifest.protocolVersion, 1, 'world manifest must declare protocol v1');
+    assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');
+    assert.equal(manifest.baseLogDropBasisPoints, 2_000);
+    assert.equal(manifest.levelLogDropBonusBasisPoints, 200);
+    assert.deepEqual(
+      manifest.levelLogDropXpThresholds,
+      [1_154, 4_470, 13_363, 37_224, 101_333],
+    );
+    assert.equal(manifest.maxLevelLogDropBasisPoints, 3_000);
+    assert.equal(manifest.luckWindowBasisPoints, 10_000);
+    assert.equal(manifest.initialLuckCredit, 8_000);
+    assert.ok(manifest.vaultScript, 'world manifest must pin the supply vault');
+    const vaultRecords = await indexerVtxos({
+      scripts: manifest.vaultScript,
+      spendableOnly: 'true',
+    });
+    assert.equal(vaultRecords.length, 1, 'genesis supply vault must be one live VTXO');
+    assert.equal(Number(vaultRecords[0].amount), 330, 'supply vault holds the dust value');
+    const vaultAssets = new Map(
+      vaultRecords[0].assets.map((asset) => [asset.assetId, Number(asset.amount)]),
+    );
+    assert.equal(vaultAssets.size, 2, 'supply vault must carry only LOG and XP');
+    assert.equal(vaultAssets.get(manifest.logAsset), 18_900_000, 'supply vault LOG balance');
+    assert.equal(vaultAssets.get(manifest.xpAsset), 18_900_000, 'supply vault XP balance');
     assert.equal(await execute(`return document.getElementById('create-tree');`), null);
     assert.equal(await execute(`return document.getElementById('sell');`), null);
-    assert.equal(await execute(`return document.title;`), 'woodland.sh');
-    assert.equal(await execute(`return document.querySelector('h1')?.textContent;`), 'woodland.sh');
+    assert.equal(await execute(`return document.title;`), 'woodland.sh (alpha)');
+    assert.equal(await execute(`return document.querySelector('h1')?.textContent;`), 'woodland.sh (alpha)');
     const positionAfterKeyboard = await execute(`
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'd', bubbles: true }));
       return globalThis.__WOODLAND_E2E_PLAYER;
@@ -469,13 +679,15 @@ async function main() {
     assert.equal(playerAssetInfo.assetId, playerAsset);
     assert.equal(playerAssetInfo.supply, '1');
     assert.equal(playerAssetInfo.controlAsset || '', '');
-    const playerAssetMetadata = Buffer.from(playerAssetInfo.metadata, 'hex');
-    for (const token of ['game', 'woodland.sh', 'protocol', '1', 'asset', 'PLAYER_ID', 'owner']) {
-      assert.ok(
-        playerAssetMetadata.includes(Buffer.from(token)),
-        `PLAYER_ID metadata omits ${token}`,
-      );
-    }
+    const playerAssetMetadata = decodeAssetMetadata(playerAssetInfo.metadata);
+    assert.deepEqual(
+      [...playerAssetMetadata.keys()],
+      ['game', 'protocol', 'asset', 'owner'],
+    );
+    assert.equal(playerAssetMetadata.get('game'), 'woodland.sh');
+    assert.equal(playerAssetMetadata.get('protocol'), String(manifest.protocolVersion));
+    assert.equal(playerAssetMetadata.get('asset'), 'PLAYER_ID');
+    assert.match(playerAssetMetadata.get('owner'), /^[0-9a-f]{64}$/);
     assert.ok(deployed.state.playerStateExpiresInSeconds > 300);
     {
       const indexedTrees = deployed.state.trees.filter(
@@ -506,6 +718,27 @@ async function main() {
     assertLogSupply(deployed.state, totalLogs, 'activated player');
     assertXpAccounting(deployed.state, totalXp, 'activated player');
     assertTreeValue(deployed.state, 'activated player');
+    const playerRewardView = await executeAsync(`
+      const done = arguments[arguments.length - 1];
+      globalThis.__WOODLAND_E2E_REFRESH_WORLD_RAW()
+        .then((state) => done({ state }))
+        .catch((error) => done({ error: String(error) }));
+    `);
+    assert.equal(playerRewardView.error, undefined, playerRewardView.error);
+    const liveOutcomes = playerRewardView.state.trees.filter(
+      (tree) => tree.health > 0 && tree.logReserveRemaining > 0 && tree.xpRemaining > 0,
+    );
+    assert.ok(liveOutcomes.length > 1);
+    assert.equal(
+      new Set(liveOutcomes.map((tree) => tree.nextRollBucket)).size,
+      1,
+      'changing tree target must not change player-bound entropy',
+    );
+    assert.equal(
+      new Set(liveOutcomes.map((tree) => tree.nextDrop)).size,
+      1,
+      'changing tree target must not change the next reward',
+    );
     const denseLocations = Array.from({ length: 500 }, (_, index) => ({
       playerAsset: `synthetic-${index}`,
       x: 4,
@@ -537,7 +770,8 @@ async function main() {
     );
     const responsiveWalk = await inspect();
     assert.equal(responsiveWalk.walk.steps, 1);
-    assert.ok(responsiveWalk.walk.durationMs < 250, JSON.stringify(responsiveWalk.walk));
+    assert.ok(responsiveWalk.walk.durationMs >= 80, JSON.stringify(responsiveWalk.walk));
+    assert.ok(responsiveWalk.walk.durationMs < 300, JSON.stringify(responsiveWalk.walk));
     deployed = await assertPlayerRenewed(deployed, 'zero-XP player renewal');
     const playerStateBeforeBrowserReload = deployed.state.playerStateOutpoint;
     const fixedSats = deployed.state.trees.reduce(
@@ -638,8 +872,10 @@ async function main() {
     );
     for (const [mutation, label] of [
       ['wrong-roll', 'wrong roll successor must be rejected'],
-      ['wrong-log-delta', 'LOG delta inconsistent with the roll must be rejected'],
-      ['wrong-xp-delta', 'XP transfer inconsistent with the roll must be rejected'],
+      ['noncanonical-health-zero', 'negative-zero health encoding must be rejected'],
+      ['wrong-luck-credit', 'wrong luck credit successor must be rejected'],
+      ['wrong-log-delta', 'LOG delta inconsistent with the reward bit must be rejected'],
+      ['wrong-xp-delta', 'XP transfer inconsistent with the reward bit must be rejected'],
       ['asset-metadata', 'transfer metadata mutation must be rejected'],
       ['player-marker-metadata', 'PLAYER_ID transfer metadata must be rejected'],
       ['asset-control', 'transfer control-asset mutation must be rejected'],
@@ -659,11 +895,12 @@ async function main() {
     let hits = 0;
     let attempts = 0;
     let sawMiss = false;
+    let checkedNonzeroXpMutation = false;
+    let renewalRefreshes = 0;
     while (hits < TARGET_HITS) {
-      attempts += 1;
       assert.ok(
-        attempts <= (FULL_E2E ? 40 : 6),
-        `${TARGET_HITS} LOG drop(s) exceeded the deterministic swing bound`,
+        attempts < TARGET_HITS * 11,
+        `${TARGET_HITS} LOG drop(s) exceeded the luck-protection bound`,
       );
       const before = chopped.state;
       const beforeTree = before.trees.find(
@@ -672,38 +909,33 @@ async function main() {
       const previousTreeOutpoint = beforeTree.treeOutpoint;
       assert.ok(Number.isInteger(beforeTree.nextRollBucket));
       assert.ok(beforeTree.nextRollBucket >= 0 && beforeTree.nextRollBucket < 10_000);
-      assert.equal(beforeTree.nextDrop, beforeTree.nextRollBucket < before.logDropBasisPoints);
-      if (attempts === 6) {
+      const rawLuckCredit = before.playerLuckCredit + before.logDropBasisPoints;
+      const expectedDrop = rawLuckCredit > manifest.luckWindowBasisPoints * 2
+        ? true
+        : rawLuckCredit < manifest.luckWindowBasisPoints
+          ? false
+          : beforeTree.nextRollBucket < before.logDropBasisPoints;
+      assert.equal(beforeTree.nextDrop, expectedDrop);
+      if (FULL_E2E && hits > 0 && !checkedNonzeroXpMutation) {
         chopped = await assertInvalidXpRejected(
           firstTree.treeId,
-          'missing XP counter increment on a LOG drop must be rejected',
+          'a nonzero-XP transition mismatch must be rejected',
         );
-        chopped = await assertChopMutationRejected(
-          'wrong-xp-delta',
-          firstTree.treeId,
-          'a successful chop without exactly one XP transfer must be rejected',
-        );
+        checkedNonzeroXpMutation = true;
       }
-      if (FULL_E2E && attempts === 7) {
-        chopped = await assertInvalidXpRejected(
-          firstTree.treeId,
-          'XP counter increment on a nonzero-XP miss must be rejected',
-        );
+      const attempt = await expectedChopAfterRenewal(
+        before,
+        beforeTree,
+        'recursive swing renewal',
+      );
+      if (attempt.refreshed) {
+        renewalRefreshes += 1;
+        assert.ok(renewalRefreshes <= 20, 'recursive swings encountered excessive renewals');
+        chopped = attempt.refreshed;
+        continue;
       }
-      if (FULL_E2E && attempts === 21) {
-        chopped = await assertInvalidXpRejected(
-          firstTree.treeId,
-          'missing XP counter increment on a nonzero-XP LOG drop must be rejected',
-        );
-      }
-      if (FULL_E2E && attempts === 37) {
-        chopped = await assertChopMutationRejected(
-          'noncanonical-health-zero',
-          firstTree.treeId,
-          'negative-zero stump health must be rejected',
-        );
-      }
-      const result = await expectedChop(before, beforeTree);
+      attempts += 1;
+      const { result } = attempt;
       assert.equal(result.ok, true, result.message);
       chopped = await waitFor(
         `recursive swing ${attempts}`,
@@ -735,6 +967,11 @@ async function main() {
       assert.equal(chopped.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
       assert.equal(chopped.state.lastAttempt.treeId, firstTree.treeId);
       assert.equal(chopped.state.playerStateOutpoint === before.playerStateOutpoint, false);
+      assert.equal(
+        chopped.state.playerLuckCredit + Number(success) * manifest.luckWindowBasisPoints,
+        before.playerLuckCredit + before.logDropBasisPoints,
+        'luck credit must conserve expected reward value',
+      );
       for (const tree of chopped.state.trees.filter((tree) => tree.treeId !== firstTree.treeId)) {
         assert.equal(tree.treeOutpoint, initialOutpoints.get(tree.treeId));
       }
@@ -748,8 +985,14 @@ async function main() {
         `tree ${firstTree.treeId} swing ${attempts}: ${success ? 'LOG' : 'miss'} ${current.lastAttemptTxid}`,
       );
     }
-    assert.ok(attempts >= TARGET_HITS && attempts < 100, 'drop sequence did not converge');
-    assert.ok(sawMiss, 'deterministic sequence exercises at least one miss');
+    assert.ok(
+      attempts >= TARGET_HITS && attempts <= TARGET_HITS * 11,
+      'drop sequence exceeded the luck-protection bound',
+    );
+    assert.ok(sawMiss, 'the bounded luck sequence must exercise at least one miss');
+    if (FULL_E2E) {
+      assert.equal(checkedNonzeroXpMutation, true, 'nonzero-XP mutation probe did not run');
+    }
     chopped = await assertPlayerRenewed(chopped, 'nonzero-XP player renewal');
     if (!FULL_E2E) {
       assert.equal(chopped.state.playerXp, 1);
@@ -764,6 +1007,7 @@ async function main() {
         chopped.logSlotLabel,
         `${chopped.state.playerLogs} LOG in inventory`,
       );
+      chopped = await runWithdrawStage(chopped, 'smoke LOG withdraw');
       console.log(JSON.stringify({
         profile: E2E_PROFILE,
         address: chopped.state.address,
@@ -785,44 +1029,39 @@ async function main() {
     const stump = chopped.state.trees.find(
       (tree) => tree.treeId === firstTree.treeId,
     );
-    assert.ok(stump.respawnInSeconds > 0 && stump.respawnInSeconds <= 40);
-    assert.equal(stump.logReserveRemaining, 5);
-    assert.equal(stump.xpRemaining, 5);
+    assert.equal(stump.health, 0);
+    assert.equal(stump.logReserveRemaining, 995);
+    assert.equal(stump.xpRemaining, 995);
+    assert.equal(stump.depleted, false, 'a stump still holds its LOG reserve');
+    assert.equal(stump.nextDrop, false);
+    const stumpLuckBucket = stump.nextRollBucket;
     const stumpOutpoint = stump.treeOutpoint;
-    await sleep(1_500);
-    const waiting = await inspect();
-    assert.equal(
-      waiting.state.trees.find((tree) => tree.treeId === firstTree.treeId).health,
-      0,
-      'maintenance must not regrow before the deadline',
-    );
-    const playerStateBeforeRegrow = chopped.state.playerStateOutpoint;
-    chopped = await waitFor(
-      'staggered automatic stump respawn',
-      inspect,
-      (value) => !value.busy
-        && value.state?.trees?.find((tree) => tree.treeId === firstTree.treeId)?.health === 5
-        && value.state.playerLogs === 5
-        && value.state.playerXp === stumpXp,
-      90_000,
-    );
+    const playerStateBeforeRenewal = chopped.state.playerStateOutpoint;
+    chopped = await waitForTreeRenewal(firstTree.treeId, 'watcher stump renewal');
     assert.equal(chopped.state.walletSats, 330);
     assert.equal(chopped.state.walletVtxos.length, 0);
-    assert.equal(chopped.state.playerStateOutpoint, playerStateBeforeRegrow);
-    assert.notEqual(
-      chopped.state.trees.find((tree) => tree.treeId === firstTree.treeId).treeOutpoint,
-      stumpOutpoint,
+    assert.equal(chopped.state.playerStateOutpoint, playerStateBeforeRenewal);
+    assert.equal(chopped.state.playerLogs, 5);
+    assert.equal(chopped.state.playerXp, stumpXp);
+    const renewedTree = chopped.state.trees.find(
+      (tree) => tree.treeId === firstTree.treeId,
     );
-    const regrownTree = chopped.state.trees.find((tree) => tree.treeId === firstTree.treeId);
-    assert.equal(regrownTree.logReserveRemaining, 5);
-    assert.equal(regrownTree.xpRemaining, 5);
-    assertLogSupply(chopped.state, totalLogs, 'regrown tree');
-    assertXpAccounting(chopped.state, totalXp, 'regrown tree');
-    assertTreeValue(chopped.state, 'regrown tree');
-    assertFixedSats(chopped.state, fixedSats, 'regrown tree');
+    assert.notEqual(renewedTree.treeOutpoint, stumpOutpoint);
+    assert.equal(renewedTree.logReserveRemaining, 995);
+    assert.equal(renewedTree.xpRemaining, 995);
+    assert.equal(
+      renewedTree.nextRollBucket,
+      stumpLuckBucket,
+      'stump renewal must preserve player-bound reward entropy',
+    );
+    assert.equal(renewedTree.depleted, false);
+    assertLogSupply(chopped.state, totalLogs, 'renewed tree');
+    assertXpAccounting(chopped.state, totalXp, 'renewed tree');
+    assertTreeValue(chopped.state, 'renewed tree');
+    assertFixedSats(chopped.state, fixedSats, 'renewed tree');
     await wd('POST', '/refresh', {});
     chopped = await waitFor(
-      'player XP and regrown tree reconstruction after reload',
+      'player XP and renewed tree reconstruction after reload',
       inspect,
       (value) => value.ready
         && value.state?.playerActive
@@ -833,24 +1072,39 @@ async function main() {
         && value.state.playerLogs === 5
         && value.state?.trees?.find((tree) => tree.treeId === firstTree.treeId)?.health === 5,
     );
-    assertLogSupply(chopped.state, totalLogs, 'post-regrowth reload');
-    assertXpAccounting(chopped.state, totalXp, 'post-regrowth reload');
-    assertTreeValue(chopped.state, 'post-regrowth reload');
-    assertFixedSats(chopped.state, fixedSats, 'post-regrowth reload');
+    assertLogSupply(chopped.state, totalLogs, 'post-renewal reload');
+    assertXpAccounting(chopped.state, totalXp, 'post-renewal reload');
+    assertTreeValue(chopped.state, 'post-renewal reload');
+    assertFixedSats(chopped.state, fixedSats, 'post-renewal reload');
     let depletionAttempts = 0;
     let depletionHits = 0;
+    let depletionRenewalRefreshes = 0;
     while (
       chopped.state.trees.find((tree) => tree.treeId === firstTree.treeId).health > 0
     ) {
-      depletionAttempts += 1;
-      assert.ok(depletionAttempts <= 40, 'second tree-417 harvest exceeded its swing bound');
+      assert.ok(depletionAttempts < 55, 'second tree-417 harvest exceeded its luck bound');
       const before = chopped.state;
       const beforeTree = before.trees.find((tree) => tree.treeId === firstTree.treeId);
       const previousTreeOutpoint = beforeTree.treeOutpoint;
-      const result = await expectedChop(before, beforeTree);
+      const attempt = await expectedChopAfterRenewal(
+        before,
+        beforeTree,
+        'second tree-417 harvest renewal',
+      );
+      if (attempt.refreshed) {
+        depletionRenewalRefreshes += 1;
+        assert.ok(
+          depletionRenewalRefreshes <= 20,
+          'second tree-417 harvest encountered excessive renewals',
+        );
+        chopped = attempt.refreshed;
+        continue;
+      }
+      depletionAttempts += 1;
+      const { result } = attempt;
       assert.equal(result.ok, true, result.message);
       chopped = await waitFor(
-        `reserve depletion swing ${depletionAttempts}`,
+        `second harvest swing ${depletionAttempts}`,
         inspect,
         (value) => !value.busy
           && value.state?.trees?.find((tree) => tree.treeId === firstTree.treeId)?.treeOutpoint
@@ -858,78 +1112,96 @@ async function main() {
         180_000,
       );
       const success = chopped.state.lastAttempt?.success === true;
-      assert.equal(success, beforeTree.nextDrop, 'depletion roll prediction must be exact');
+      assert.equal(success, beforeTree.nextDrop, 'second-harvest roll prediction must be exact');
       if (success) depletionHits += 1;
       const current = chopped.state.trees.find((tree) => tree.treeId === firstTree.treeId);
       assert.equal(current.health, 5 - depletionHits);
-      assert.equal(current.logReserveRemaining, 5 - depletionHits);
-      assert.equal(current.xpRemaining, 5 - depletionHits);
+      assert.equal(current.logReserveRemaining, 995 - depletionHits);
+      assert.equal(current.xpRemaining, 995 - depletionHits);
       assert.equal(chopped.state.playerLogs, stumpXp + depletionHits);
       assert.equal(chopped.state.playerXp, stumpXp + depletionHits);
       assert.equal(chopped.state.playerLevel, 1);
       assert.equal(chopped.state.playerNextLevelXp, 83);
-      assertLogSupply(chopped.state, totalLogs, `reserve depletion swing ${depletionAttempts}`);
-      assertXpAccounting(chopped.state, totalXp, `reserve depletion swing ${depletionAttempts}`);
-      assertTreeValue(chopped.state, `reserve depletion swing ${depletionAttempts}`);
-      assertFixedSats(chopped.state, fixedSats, `reserve depletion swing ${depletionAttempts}`);
+      assertLogSupply(chopped.state, totalLogs, `second harvest swing ${depletionAttempts}`);
+      assertXpAccounting(chopped.state, totalXp, `second harvest swing ${depletionAttempts}`);
+      assertTreeValue(chopped.state, `second harvest swing ${depletionAttempts}`);
+      assertFixedSats(chopped.state, fixedSats, `second harvest swing ${depletionAttempts}`);
     }
-    assert.equal(depletionAttempts, 25, 'tree 417 second deterministic harvest changed');
+    assert.ok(
+      depletionAttempts >= depletionHits && depletionAttempts <= depletionHits * 11,
+      'tree 417 second harvest exceeded the player luck corridor',
+    );
     assert.equal(depletionHits, 5);
     const exhaustedXp = stumpXp + depletionHits;
     const exhaustedLogs = chopped.state.playerLogs;
     assert.equal(exhaustedXp, 10);
     assert.equal(exhaustedLogs, 10);
-    const exhaustedTree = chopped.state.trees.find(
+    const secondStump = chopped.state.trees.find(
       (tree) => tree.treeId === firstTree.treeId,
     );
-    assert.equal(exhaustedTree.health, 0);
-    assert.equal(exhaustedTree.logReserveRemaining, 0);
-    assert.equal(exhaustedTree.xpRemaining, 0);
-    assert.equal(exhaustedTree.nextDrop, false);
-    assert.equal(exhaustedTree.respawnAt, null);
-    assert.equal(exhaustedTree.respawnInSeconds, null);
-    const exhaustedOutpoint = exhaustedTree.treeOutpoint;
-    await sleep(45_000);
-    chopped = await inspect();
-    const permanentlyDepletedTree = chopped.state.trees.find(
+    assert.equal(secondStump.health, 0);
+    assert.equal(secondStump.logReserveRemaining, 990);
+    assert.equal(secondStump.xpRemaining, 990);
+    assert.equal(secondStump.nextDrop, false);
+    assert.equal(secondStump.depleted, false, 'a harvested stump still holds its LOG reserve');
+    const secondStumpLuckBucket = secondStump.nextRollBucket;
+    const secondStumpOutpoint = secondStump.treeOutpoint;
+    chopped = await waitForTreeRenewal(firstTree.treeId, 'second watcher stump renewal');
+    const twiceRenewedTree = chopped.state.trees.find(
       (tree) => tree.treeId === firstTree.treeId,
     );
-    assert.equal(permanentlyDepletedTree.treeOutpoint, exhaustedOutpoint);
-    assert.equal(permanentlyDepletedTree.health, 0);
-    assert.equal(permanentlyDepletedTree.logReserveRemaining, 0);
-    assert.equal(permanentlyDepletedTree.xpRemaining, 0);
-    assert.equal(permanentlyDepletedTree.respawnAt, null);
-    assert.equal(permanentlyDepletedTree.respawnInSeconds, null);
+    assert.notEqual(twiceRenewedTree.treeOutpoint, secondStumpOutpoint);
+    assert.equal(twiceRenewedTree.logReserveRemaining, 990);
+    assert.equal(twiceRenewedTree.xpRemaining, 990);
+    assert.equal(
+      twiceRenewedTree.nextRollBucket,
+      secondStumpLuckBucket,
+      'second stump renewal must preserve player-bound reward entropy',
+    );
+    assert.equal(twiceRenewedTree.depleted, false);
     assert.equal(chopped.state.playerXp, exhaustedXp);
-    assert.match(chopped.mapHint, /exhausted its LOG and XP reserve/);
     assert.equal(chopped.state.playerLogs, exhaustedLogs);
-    assertLogSupply(chopped.state, totalLogs, 'permanently depleted tree');
-    assertXpAccounting(chopped.state, totalXp, 'permanently depleted tree');
-    assertTreeValue(chopped.state, 'permanently depleted tree');
-    assertFixedSats(chopped.state, fixedSats, 'permanently depleted tree');
-
+    assertLogSupply(chopped.state, totalLogs, 'twice-renewed tree');
+    assertXpAccounting(chopped.state, totalXp, 'twice-renewed tree');
+    assertTreeValue(chopped.state, 'twice-renewed tree');
+    assertFixedSats(chopped.state, fixedSats, 'twice-renewed tree');
 
     const secondTree = chopped.state.trees.find((tree) => tree.treeId === 426);
-    assert.ok(secondTree, 'deterministic tree 426 is unavailable');
+    assert.ok(secondTree, 'tree 426 is unavailable');
     const beforeSecondOutpoints = new Map(
       chopped.state.trees.map((tree) => [tree.treeId, tree.treeOutpoint]),
     );
     await clickMapCell(secondTree.x, secondTree.y + 1);
-    await waitFor(
+    chopped = await waitFor(
       `player movement next to tree ${secondTree.treeId}`,
       inspect,
       (value) => value.adjacentTree?.treeId === secondTree.treeId,
     );
     let secondAttempts = 0;
+    let secondTreeRenewalRefreshes = 0;
     while (chopped.state.playerLogs === exhaustedLogs) {
-      secondAttempts += 1;
-      assert.ok(secondAttempts <= 15, 'second tree succeeds within 15 swings');
+      assert.ok(secondAttempts < 11, 'second tree exceeded the player luck bound');
       const beforeTree = chopped.state.trees.find(
         (tree) => tree.treeId === secondTree.treeId,
       );
       const previous = beforeTree.treeOutpoint;
       const previousStateOutpoint = chopped.state.playerStateOutpoint;
-      const result = await expectedChop(chopped.state, beforeTree);
+      const attempt = await expectedChopAfterRenewal(
+        chopped.state,
+        beforeTree,
+        'second-tree swing renewal',
+      );
+      if (attempt.refreshed) {
+        secondTreeRenewalRefreshes += 1;
+        assert.ok(
+          secondTreeRenewalRefreshes <= 20,
+          'second-tree swings encountered excessive renewals',
+        );
+        chopped = attempt.refreshed;
+        continue;
+      }
+      secondAttempts += 1;
+      const { result } = attempt;
       assert.equal(result.ok, true, result.message);
       chopped = await waitFor(
         `second tree swing ${secondAttempts}`,
@@ -941,9 +1213,9 @@ async function main() {
       );
       assert.notEqual(chopped.state.playerStateOutpoint, previousStateOutpoint);
     }
-    assert.equal(secondAttempts, 2, 'clean tree 426 roll must first drop LOG on swing 2');
+    assert.ok(secondAttempts >= 1 && secondAttempts <= 11);
     assert.equal(chopped.state.trees.find((tree) => tree.treeId === secondTree.treeId).health, 4);
-    assert.equal(chopped.state.trees.find((tree) => tree.treeId === firstTree.treeId).health, 0);
+    assert.equal(chopped.state.trees.find((tree) => tree.treeId === firstTree.treeId).health, 5);
     assert.equal(chopped.state.playerLogs, exhaustedLogs + 1);
     assert.equal(chopped.state.playerXp, exhaustedXp + 1);
     assert.equal(chopped.state.playerLevel, 1);
@@ -959,7 +1231,7 @@ async function main() {
     assertFixedSats(chopped.state, fixedSats, 'second tree chop');
     await wd('POST', '/refresh', {});
     chopped = await waitFor(
-      'ten-tree reconstruction after final reload',
+      'world reconstruction after final reload',
       inspect,
       (value) => value.ready
         && value.state?.trees?.length === treeCount
@@ -969,7 +1241,7 @@ async function main() {
         && value.state.playerNextLevelXp === 83
         && value.state.logDropBasisPoints === manifest.baseLogDropBasisPoints
         && value.state.playerLogs === exhaustedLogs + 1
-        && value.state.trees.find((tree) => tree.treeId === firstTree.treeId)?.health === 0
+        && value.state.trees.find((tree) => tree.treeId === firstTree.treeId)?.health === 5
         && value.state.trees.find((tree) => tree.treeId === secondTree.treeId)?.health === 4,
     );
     assertLogSupply(chopped.state, totalLogs, 'final reload');
@@ -978,6 +1250,7 @@ async function main() {
     assertTreeValue(chopped.state, 'final reload');
     assertFixedSats(chopped.state, fixedSats, 'final reload');
     chopped = await assertAutoChopUntilLog(chopped, 'continuous chopping UX after full profile');
+    chopped = await runWithdrawStage(chopped, 'full LOG withdraw');
     console.log(JSON.stringify({
       profile: E2E_PROFILE,
       address: chopped.state.address,
