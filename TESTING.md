@@ -261,6 +261,32 @@ WOODLAND_SOAK_ROUND_DELAY_MS=1000 \
 ./scripts/test-regtest.sh soak
 ```
 
+### Emulator Outage Chaos
+
+The chaos profile runs the same one-tree contention contract through a
+loopback-only emulator proxy:
+
+```bash
+./scripts/test-regtest.sh chaos
+```
+
+One round holds every `POST /v1/tx` at HTTP 500 through both the initial submit
+and the browser's immediate exact-transaction resume. The harness requires zero
+state transitions during the outage and one retained pending journal per
+player. It then restores the emulator, resumes those exact transactions under
+contention, and requires one winner, cleared journals, converged browsers, and
+conserved supplies. A later round forwards one successful submission but masks
+its response as HTTP 500, proving reconciliation of a committed transaction
+whose response was lost. Proxy counters in `chaosEvents` prove that both fault
+classes occurred; the proxy log is
+`regtest/_build/ci-artifacts/emulator-chaos-proxy.log`.
+
+Defaults are 12 players, 12 rounds, persistent outage at round 3, and masked
+success at round 7. Override
+`WOODLAND_SOAK_CHAOS_FAIL_BEFORE_ROUND` and
+`WOODLAND_SOAK_CHAOS_FAIL_AFTER_SUCCESS_ROUND` for shorter checks. Chaos rounds
+must be distinct and use one target tree.
+
 To target an already prepared remote-compatible world, run the Node scenario
 directly. The funding executable receives `<address> <sats>`:
 
@@ -280,8 +306,9 @@ permission. Concurrency and round delay exist to bound remote load.
 ## Overnight v1 Release Soak
 
 The overnight runner repeatedly creates a fresh world and rotates the full,
-same-tree soak, 24-player burst, multi-tree fanout, browser-reload,
-stump-renewal, and vault-restock profiles. Every cycle exercises the renamed
+same-tree soak, 24-player burst, persistent emulator-outage chaos, multi-tree
+fanout, browser-reload, stump-renewal, and vault-restock profiles. Every cycle
+exercises the renamed
 `renew-world` startup gate before launching the watcher. It stops on the first
 failure and preserves that cycle's manifest, cycle/server/watcher logs, the last
 2,000 arkd and emulator log lines, screenshots, JUnit, and structured scenario
@@ -292,7 +319,7 @@ report.
 ```
 
 Defaults are eight hours, plan
-`full,soak,burst,fanout,reload,renewal,restock`, 12 baseline soak players, and
+`full,soak,burst,chaos,fanout,reload,renewal,restock`, 12 baseline soak players, and
 50 contention rounds per baseline soak cycle. A successful cycle additionally
 requires an exact schema-v1/protocol-v1 regtest manifest, the 2,100-tree world,
 canonical rates and reserves, and its profile's structured report. Before every
@@ -332,12 +359,12 @@ journalctl --user -fu woodland-overnight
 Stop it cleanly with `systemctl --user stop woodland-overnight`; the active
 regtest wrapper receives a termination signal and tears down its containers.
 Use `WOODLAND_OVERNIGHT_CYCLES=1` for orchestration checks. The plan accepts
-`full`, `soak`, `burst`, `fanout`, `reload`, `renewal`, and `restock`.
+`full`, `soak`, `burst`, `chaos`, `fanout`, `reload`, `renewal`, and `restock`.
 
 ## Four-Hour Aggressive Matrix
 
-The aggressive launcher uses fresh worlds and rotates six materially different
-profiles instead of repeating one load shape:
+The aggressive launcher uses fresh worlds and rotates seven materially
+different profiles instead of repeating one load shape:
 
 ```bash
 ./scripts/test-aggressive.sh
@@ -347,6 +374,7 @@ profiles instead of repeating one load shape:
 | --- | --- |
 | `full` | Existing browser, adversarial covenant, renewal, recovery, and multiplayer suite |
 | `burst` | 24 players, 100 zero-delay rounds, all 24 race one tree, six rotating browser reloads every 25 rounds |
+| `chaos` | 24 players contend on one tree while a persistent emulator outage rejects both submission attempts, then one committed response is masked |
 | `fanout` | 24 players, four tree groups per round, 320 accepted and 1,600 conflicting submissions per cycle |
 | `reload` | 12 players, two tree groups, all 12 browsers reload together every 20 rounds |
 | `renewal` | Sustained same-tree pressure with forced pre-chop and post-chop exact-self-send rollovers, natural watcher rollovers, and rotating browser reloads |
@@ -364,7 +392,7 @@ pending-tree reconciliation observes the same target set. Every profile still
 verifies global TREE/LOG/XP supplies.
 
 The default duration is four hours and the default plan is
-`full,burst,fanout,reload,renewal,restock`. Duration and plan remain
+`full,burst,chaos,fanout,reload,renewal,restock`. Duration and plan remain
 configurable:
 
 ```bash

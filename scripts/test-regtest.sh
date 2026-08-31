@@ -28,9 +28,9 @@ export WOODLAND_E2E_WEB_URL="$WOODLAND_SERVER_URL"
 PROFILE=${1:-full}
 
 case "$PROFILE" in
-  smoke|full|soak|restock) ;;
+  smoke|full|soak|chaos|restock) ;;
   *)
-    printf 'usage: %s [smoke|full|soak|restock]\n' "$0" >&2
+    printf 'usage: %s [smoke|full|soak|chaos|restock]\n' "$0" >&2
     exit 2
     ;;
 esac
@@ -39,14 +39,28 @@ export WOODLAND_E2E_PROFILE=$PROFILE
 if [[ "$PROFILE" == restock ]]; then
   export WOODLAND_E2E_INITIAL_TREE_RESERVE=${WOODLAND_E2E_INITIAL_TREE_RESERVE:-5}
 fi
+if [[ "$PROFILE" == chaos ]]; then
+  export WOODLAND_CHAOS_UPSTREAM_URL="${WOODLAND_CHAOS_UPSTREAM_URL:-http://127.0.0.1:7073}"
+  export WOODLAND_CHAOS_PROXY_PORT="${WOODLAND_CHAOS_PROXY_PORT:-7074}"
+  export WOODLAND_EMULATOR_URL="http://127.0.0.1:$WOODLAND_CHAOS_PROXY_PORT"
+  export WOODLAND_SOAK_CHAOS_CONTROL_URL="${WOODLAND_SOAK_CHAOS_CONTROL_URL:-$WOODLAND_EMULATOR_URL/__chaos}"
+  export WOODLAND_SOAK_PLAYERS="${WOODLAND_SOAK_PLAYERS:-12}"
+  export WOODLAND_SOAK_ROUNDS="${WOODLAND_SOAK_ROUNDS:-12}"
+  export WOODLAND_SOAK_ACTIVATION_CONCURRENCY="${WOODLAND_SOAK_ACTIVATION_CONCURRENCY:-8}"
+  export WOODLAND_SOAK_RACE_CONCURRENCY="${WOODLAND_SOAK_RACE_CONCURRENCY:-12}"
+  export WOODLAND_SOAK_CHAOS_FAIL_BEFORE_ROUND="${WOODLAND_SOAK_CHAOS_FAIL_BEFORE_ROUND:-3}"
+  export WOODLAND_SOAK_CHAOS_FAIL_AFTER_SUCCESS_ROUND="${WOODLAND_SOAK_CHAOS_FAIL_AFTER_SUCCESS_ROUND:-7}"
+fi
 SERVER_PID=
 WATCHER_PID=
 E2E_PID=
+CHAOS_PROXY_PID=
 ARTIFACT_DIR="${WOODLAND_E2E_ARTIFACT_DIR:-$ROOT/regtest/_build/ci-artifacts}"
 SERVER_LOG="$ARTIFACT_DIR/server.log"
 WATCHER_LOG="$ARTIFACT_DIR/watcher.log"
 ARKD_LOG="$ARTIFACT_DIR/arkd.log"
 EMULATOR_LOG="$ARTIFACT_DIR/emulator.log"
+CHAOS_PROXY_LOG="$ARTIFACT_DIR/emulator-chaos-proxy.log"
 
 cleanup() {
   local status=$?
@@ -55,7 +69,7 @@ cleanup() {
     kill -- "-$E2E_PID" 2>/dev/null || true
     wait "$E2E_PID" 2>/dev/null || true
   fi
-  for pid in "$SERVER_PID" "$WATCHER_PID"; do
+  for pid in "$SERVER_PID" "$WATCHER_PID" "$CHAOS_PROXY_PID"; do
     [[ -n "$pid" ]] || continue
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -76,12 +90,32 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 printf 'Running woodland.sh %s regtest profile\n' "$PROFILE"
+mkdir -p "$ARTIFACT_DIR"
 "$ROOT/scripts/regtest.sh" clean --force
+if [[ "$PROFILE" == chaos ]]; then
+  node "$ROOT/scripts/e2e-emulator-chaos-proxy.mjs" >"$CHAOS_PROXY_LOG" 2>&1 &
+  CHAOS_PROXY_PID=$!
+  for attempt in {1..30}; do
+    if ! kill -0 "$CHAOS_PROXY_PID" 2>/dev/null; then
+      cat "$CHAOS_PROXY_LOG" >&2
+      printf 'error: emulator chaos proxy exited before readiness\n' >&2
+      exit 1
+    fi
+    if curl --fail --silent "$WOODLAND_SOAK_CHAOS_CONTROL_URL/status" >/dev/null; then
+      break
+    fi
+    if [[ $attempt == 30 ]]; then
+      cat "$CHAOS_PROXY_LOG" >&2
+      printf 'error: emulator chaos proxy did not become ready\n' >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+fi
 "$ROOT/scripts/regtest.sh" start-tree
 WOODLAND_RENEWAL_STARTUP=1 "$ROOT/scripts/regtest.sh" renew-world
 cargo build --locked --features server --bin woodland-server
 rm -f "$WOODLAND_SERVER_DB"
-mkdir -p "$ARTIFACT_DIR"
 cp "$WOODLAND_WORLD_MANIFEST" "$ARTIFACT_DIR/world.json"
 WOODLAND_SERVER_URL=self WOODLAND_WASM_FEATURES=regtest-e2e "$ROOT/scripts/build-web.sh"
 "$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" >"$WATCHER_LOG" 2>&1 &
@@ -108,7 +142,7 @@ for attempt in {1..60}; do
   fi
   sleep 1
 done
-if [[ "$PROFILE" == soak ]]; then
+if [[ "$PROFILE" == soak || "$PROFILE" == chaos ]]; then
   setsid node "$ROOT/scripts/e2e-soak-regtest.mjs" &
 elif [[ "$PROFILE" == restock ]]; then
   setsid node "$ROOT/scripts/e2e-restock-regtest.mjs" &

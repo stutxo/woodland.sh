@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
   assertPortAvailable,
+  E2E_PROFILE,
   saveScreenshot,
   sleep,
   startGeckodriver,
@@ -39,6 +40,24 @@ const RELOAD_COUNT = setting(
   1,
   PLAYER_COUNT,
 );
+const CHAOS_CONTROL_URL = (process.env.WOODLAND_SOAK_CHAOS_CONTROL_URL || '').replace(/\/$/, '');
+const CHAOS_FAIL_BEFORE_ROUND = setting('WOODLAND_SOAK_CHAOS_FAIL_BEFORE_ROUND', 0, 0, ROUNDS);
+const CHAOS_FAIL_AFTER_SUCCESS_ROUND = setting(
+  'WOODLAND_SOAK_CHAOS_FAIL_AFTER_SUCCESS_ROUND',
+  0,
+  0,
+  ROUNDS,
+);
+const CHAOS_ENABLED = CHAOS_FAIL_BEFORE_ROUND > 0 || CHAOS_FAIL_AFTER_SUCCESS_ROUND > 0;
+if (CHAOS_FAIL_BEFORE_ROUND > 0 && CHAOS_FAIL_BEFORE_ROUND === CHAOS_FAIL_AFTER_SUCCESS_ROUND) {
+  throw new Error('chaos failure rounds must be distinct');
+}
+if (CHAOS_ENABLED && !CHAOS_CONTROL_URL) {
+  throw new Error('WOODLAND_SOAK_CHAOS_CONTROL_URL is required when chaos rounds are enabled');
+}
+if (CHAOS_ENABLED && TREES_PER_ROUND !== 1) {
+  throw new Error('chaos rounds require WOODLAND_SOAK_TREES_PER_ROUND=1');
+}
 const FORCE_TREE_RENEWAL_ROUND = setting(
   'WOODLAND_SOAK_FORCE_TREE_RENEWAL_ROUND',
   0,
@@ -93,6 +112,33 @@ async function mapLimit(items, concurrency, operation) {
   }));
   return results;
 }
+async function chaosRequest(route, init = {}) {
+  const response = await fetch(`${CHAOS_CONTROL_URL}/${route}`, {
+    ...init,
+    headers: {
+      'content-type': 'application/json',
+      ...(init.headers || {}),
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`chaos control ${route} failed (${response.status}): ${text}`);
+  }
+  return JSON.parse(text);
+}
+
+function configureChaos(mode, remaining = 0) {
+  return chaosRequest('config', {
+    method: 'POST',
+    body: JSON.stringify({ mode, remaining }),
+  });
+}
+
+function inspectChaos() {
+  return chaosRequest('status');
+}
+
 
 async function createPlayer(driverUrl, label) {
   const session = await webdriverRequest(driverUrl, 'POST', '/session', {
@@ -127,6 +173,12 @@ async function createPlayer(driverUrl, label) {
       .then((state) => done({ state }))
       .catch((error) => done({ error: String(error) }));
   `);
+  const resume = () => executeAsync(`
+    const done = arguments[arguments.length - 1];
+    globalThis.__WOODLAND_E2E_RESUME_PENDING()
+      .then((state) => done({ state }))
+      .catch((error) => done({ error: String(error) }));
+  `);
   const race = (snapshot, tree) => executeAsync(`
     const done = arguments[arguments.length - 1];
     globalThis.__WOODLAND_E2E_CHOP_EXPECTED(...Array.from(arguments).slice(0, -1)).then(done);
@@ -144,6 +196,7 @@ async function createPlayer(driverUrl, label) {
     inspect,
     refresh,
     race,
+    resume,
     reload,
   };
 }
@@ -242,6 +295,54 @@ async function refreshUntilConverged(players, label) {
   );
   return { views: result.views, retries: attempts - 1 };
 }
+async function recoverPendingChops(players, label) {
+  const initialViews = await Promise.all(players.map((player) => player.inspect()));
+  const initialPending = initialViews.filter((view) => view.state.pendingChopTxid).length;
+  if (initialPending === 0) {
+    return {
+      initialPending,
+      resumeCalls: 0,
+      resumeErrors: 0,
+      retries: 0,
+    };
+  }
+
+  let attempts = 0;
+  let resumeCalls = 0;
+  let resumeErrors = 0;
+  const recovered = await waitFor(
+    `${label} pending recovery`,
+    async () => {
+      attempts += 1;
+      const views = await Promise.all(players.map((player) => player.inspect()));
+      const pending = players.filter((_, index) => views[index].state.pendingChopTxid);
+      if (pending.length === 0) return { resolved: true };
+      const outcomes = await mapLimit(pending, RACE_CONCURRENCY, async (player) => {
+        try {
+          return await player.resume();
+        } catch (error) {
+          return { error: error instanceof Error ? error.message : String(error) };
+        }
+      });
+      resumeCalls += outcomes.length;
+      resumeErrors += outcomes.filter((outcome) => outcome.error).length;
+      const after = await Promise.all(players.map((player) => player.inspect()));
+      return {
+        resolved: after.every((view) => !view.state.pendingChopTxid),
+      };
+    },
+    (value) => value.resolved,
+    OPERATION_TIMEOUT_MS,
+  );
+  assert.equal(recovered.resolved, true, `${label}: pending chops did not recover`);
+  return {
+    initialPending,
+    resumeCalls,
+    resumeErrors,
+    retries: attempts - 1,
+  };
+}
+
 
 function percentile(values, ratio) {
   if (!values.length) return 0;
@@ -543,6 +644,7 @@ const roundReports = [];
 let recoveredUnknownOutcomes = 0;
 let convergenceRetries = 0;
 let browserReloads = 0;
+const chaosEvents = [];
 const startedAt = Date.now();
 
 try {
@@ -693,12 +795,71 @@ try {
       forcedPreChopTreeRenewals += 1;
       console.log(`soak round ${round}: forced pre-chop tree ${renewal.treeId} renewal`);
     }
+    let chaosKind = null;
+    if (CHAOS_FAIL_BEFORE_ROUND === round) {
+      chaosKind = 'fail-before';
+      await configureChaos(chaosKind, null);
+      console.log(`soak round ${round}: emulator outage enabled`);
+    } else if (CHAOS_FAIL_AFTER_SUCCESS_ROUND === round) {
+      chaosKind = 'fail-after-success';
+      await configureChaos(chaosKind, 1);
+      console.log(`soak round ${round}: successful emulator response will be masked`);
+    }
     const results = await mapLimit(players, RACE_CONCURRENCY, (player, index) => {
       const playerTree = views[index].state.trees.find(
         (tree) => tree.treeId === assignedTreeIds[index],
       );
       return player.race(views[index].state, playerTree);
     });
+    if (chaosKind) {
+      const duringFault = await inspectChaos();
+      assert.equal(duringFault.event.mode, chaosKind, `round ${round}: wrong chaos mode`);
+      if (chaosKind === 'fail-before') {
+        assert.equal(
+          duringFault.event.failedBefore,
+          PLAYER_COUNT * 2,
+          `round ${round}: persistent outage did not reject both submissions per player`,
+        );
+        assert.equal(
+          results.filter((result) => result.ok).length,
+          0,
+          `round ${round}: outage unexpectedly reported a winner`,
+        );
+        const pendingViews = await Promise.all(players.map((player) => player.inspect()));
+        for (const [index, view] of pendingViews.entries()) {
+          assert.ok(view.state.pendingChopTxid, `round ${round}: player ${index + 1} lost pending chop`);
+          assert.equal(
+            view.state.playerStateOutpoint,
+            beforePlayers[index].outpoint,
+            `round ${round}: player ${index + 1} changed during the outage`,
+          );
+          const pendingTree = view.state.trees.find((tree) => tree.treeId === targetTrees[0].treeId);
+          assert.equal(
+            pendingTree.treeOutpoint,
+            targetTrees[0].treeOutpoint,
+            `round ${round}: tree changed during the outage`,
+          );
+        }
+      } else {
+        assert.equal(
+          duringFault.event.maskedSuccesses,
+          1,
+          `round ${round}: no successful emulator response was masked`,
+        );
+      }
+      await configureChaos('pass');
+      const recovery = await recoverPendingChops(players, `round ${round} chaos`);
+      chaosEvents.push({
+        round,
+        kind: chaosKind,
+        fault: duringFault.event,
+        recovery,
+      });
+      console.log(
+        `soak round ${round}: chaos recovered ${recovery.initialPending} pending chop(s) `
+          + `with ${recovery.resumeCalls} resume call(s)`,
+      );
+    }
     if (
       FORCE_POST_CHOP_RENEWAL_ROUND === round
       && forcedPostChopTreeRenewals === 0
@@ -773,6 +934,8 @@ try {
 
   const durations = roundReports.map((round) => round.durationMs);
   const health = await fetch(`${WEB_URL}/health.json`).then((response) => response.json());
+  assert.equal(health.ready, true, `server unhealthy after soak: ${JSON.stringify(health)}`);
+  assert.equal(health.lastError ?? null, null, `server retained an error: ${JSON.stringify(health)}`);
   const [treeMarkers, logs, xp] = await Promise.all([
     fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.treeAsset),
     fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.logAsset),
@@ -783,7 +946,7 @@ try {
   assert.equal(logs, INDEXED_LOG_SUPPLY, 'indexed LOG supply changed');
   assert.equal(xp, INDEXED_XP_SUPPLY, 'indexed XP supply changed');
   const report = {
-    profile: 'soak',
+    profile: E2E_PROFILE,
     webUrl: WEB_URL,
     arkadeServiceUrl: manifest.arkadeServiceUrl,
     emulatorUrl: manifest.emulatorUrl,
@@ -795,6 +958,9 @@ try {
     reloadEvery: RELOAD_EVERY,
     reloadCount: RELOAD_COUNT,
     roundDelayMs: ROUND_DELAY_MS,
+    chaosFailBeforeRound: CHAOS_FAIL_BEFORE_ROUND,
+    chaosFailAfterSuccessRound: CHAOS_FAIL_AFTER_SUCCESS_ROUND,
+    chaosEvents,
     forceTreeRenewalRound: FORCE_TREE_RENEWAL_ROUND,
     forcePostChopRenewalRound: FORCE_POST_CHOP_RENEWAL_ROUND,
     durationMs: Date.now() - startedAt,

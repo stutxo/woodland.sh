@@ -52,6 +52,21 @@ const PROFILE_CONFIGS = Object.freeze({
       WOODLAND_SOAK_RELOAD_COUNT: '6',
     },
   },
+  chaos: {
+    runner: 'chaos',
+    environment: {
+      WOODLAND_SOAK_PLAYERS: '24',
+      WOODLAND_SOAK_ROUNDS: '60',
+      WOODLAND_SOAK_ACTIVATION_CONCURRENCY: '8',
+      WOODLAND_SOAK_RACE_CONCURRENCY: '24',
+      WOODLAND_SOAK_ROUND_DELAY_MS: '0',
+      WOODLAND_SOAK_TREES_PER_ROUND: '1',
+      WOODLAND_SOAK_RELOAD_EVERY: '20',
+      WOODLAND_SOAK_RELOAD_COUNT: '6',
+      WOODLAND_SOAK_CHAOS_FAIL_BEFORE_ROUND: '10',
+      WOODLAND_SOAK_CHAOS_FAIL_AFTER_SUCCESS_ROUND: '30',
+    },
+  },
   fanout: {
     runner: 'soak',
     environment: {
@@ -101,6 +116,7 @@ const RELEASE_PLAN = Object.freeze([
   'full',
   'soak',
   'burst',
+  'chaos',
   'fanout',
   'reload',
   'renewal',
@@ -267,8 +283,14 @@ async function cycleArtifactErrors(profileConfig, paths, reports) {
       errors.push('full-cycle JUnit report is missing');
     }
   }
-  if (profileConfig.runner === 'soak' && !reports.soak) {
-    errors.push('soak report is missing');
+  if (['soak', 'chaos'].includes(profileConfig.runner)) {
+    if (!reports.soak) {
+      errors.push('soak report is missing');
+    } else if (reports.soak.profile !== profileConfig.runner) {
+      errors.push(
+        `soak report profile: expected ${profileConfig.runner}, got ${reports.soak.profile}`,
+      );
+    }
   }
   if (profileConfig.runner === 'restock' && !reports.restock) {
     errors.push('restock report is missing');
