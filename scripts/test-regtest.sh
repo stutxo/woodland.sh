@@ -12,7 +12,7 @@ if [[ ${WOODLAND_RELEASE_SOAK_LOCKED:-0} != 1 ]]; then
 fi
 export WOODLAND_NETWORK=regtest
 export WOODLAND_ARKADE_SERVICE_URL=http://127.0.0.1:7070
-export WOODLAND_EMULATOR_URL=http://127.0.0.1:7073
+export WOODLAND_EMULATOR_URL=http://127.0.0.1:7074
 export WOODLAND_DEPLOYER_SECRET=1111111111111111111111111111111111111111111111111111111111111111
 export WOODLAND_ROLLOVER_SECRET=4444444444444444444444444444444444444444444444444444444444444444
 export WOODLAND_WORLD_MANIFEST="$ROOT/regtest/_build/woodland-world.json"
@@ -28,20 +28,20 @@ export WOODLAND_E2E_WEB_URL="$WOODLAND_SERVER_URL"
 PROFILE=${1:-full}
 
 case "$PROFILE" in
-  smoke|full|soak|chaos|restock) ;;
+  smoke|full|soak|chaos|regrowth) ;;
   *)
-    printf 'usage: %s [smoke|full|soak|chaos|restock]\n' "$0" >&2
+    printf 'usage: %s [smoke|full|soak|chaos|regrowth]\n' "$0" >&2
     exit 2
     ;;
 esac
 
 export WOODLAND_E2E_PROFILE=$PROFILE
-if [[ "$PROFILE" == restock ]]; then
-  export WOODLAND_E2E_INITIAL_TREE_RESERVE=${WOODLAND_E2E_INITIAL_TREE_RESERVE:-5}
+if [[ "$PROFILE" == regrowth ]]; then
+  export AUTOMINE_INTERVAL=0
 fi
 if [[ "$PROFILE" == chaos ]]; then
-  export WOODLAND_CHAOS_UPSTREAM_URL="${WOODLAND_CHAOS_UPSTREAM_URL:-http://127.0.0.1:7073}"
-  export WOODLAND_CHAOS_PROXY_PORT="${WOODLAND_CHAOS_PROXY_PORT:-7074}"
+  export WOODLAND_CHAOS_UPSTREAM_URL="${WOODLAND_CHAOS_UPSTREAM_URL:-http://127.0.0.1:7074}"
+  export WOODLAND_CHAOS_PROXY_PORT="${WOODLAND_CHAOS_PROXY_PORT:-7075}"
   export WOODLAND_EMULATOR_URL="http://127.0.0.1:$WOODLAND_CHAOS_PROXY_PORT"
   export WOODLAND_SOAK_CHAOS_CONTROL_URL="${WOODLAND_SOAK_CHAOS_CONTROL_URL:-$WOODLAND_EMULATOR_URL/__chaos}"
   export WOODLAND_SOAK_PLAYERS="${WOODLAND_SOAK_PLAYERS:-12}"
@@ -61,6 +61,8 @@ WATCHER_LOG="$ARTIFACT_DIR/watcher.log"
 ARKD_LOG="$ARTIFACT_DIR/arkd.log"
 EMULATOR_LOG="$ARTIFACT_DIR/emulator.log"
 CHAOS_PROXY_LOG="$ARTIFACT_DIR/emulator-chaos-proxy.log"
+GATE_SOURCE_LOG="$ROOT/regtest/_build/emulator-gate.log"
+GATE_LOG="$ARTIFACT_DIR/emulator-gate.log"
 
 cleanup() {
   local status=$?
@@ -76,6 +78,9 @@ cleanup() {
   done
   if [[ -f "$WOODLAND_WORLD_MANIFEST" ]]; then
     cp "$WOODLAND_WORLD_MANIFEST" "$ARTIFACT_DIR/world.json"
+  fi
+  if [[ -f "$GATE_SOURCE_LOG" ]]; then
+    cp "$GATE_SOURCE_LOG" "$GATE_LOG" || true
   fi
   if [[ -d "$ARTIFACT_DIR" ]]; then
     docker logs --tail 2000 arkd >"$ARKD_LOG" 2>&1 || true
@@ -118,8 +123,10 @@ cargo build --locked --features server --bin woodland-server
 rm -f "$WOODLAND_SERVER_DB"
 cp "$WOODLAND_WORLD_MANIFEST" "$ARTIFACT_DIR/world.json"
 WOODLAND_SERVER_URL=self WOODLAND_WASM_FEATURES=regtest-e2e "$ROOT/scripts/build-web.sh"
-"$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" >"$WATCHER_LOG" 2>&1 &
-WATCHER_PID=$!
+if [[ "$PROFILE" != regrowth ]]; then
+  env -u WOODLAND_ROLLOVER_SECRET "$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" >"$WATCHER_LOG" 2>&1 &
+  WATCHER_PID=$!
+fi
 if curl --fail --silent --max-time 1 "$WOODLAND_SERVER_URL/health.json" >/dev/null 2>&1; then
   printf 'error: server port is already in use\n' >&2
   exit 1
@@ -144,8 +151,8 @@ for attempt in {1..60}; do
 done
 if [[ "$PROFILE" == soak || "$PROFILE" == chaos ]]; then
   setsid node "$ROOT/scripts/e2e-soak-regtest.mjs" &
-elif [[ "$PROFILE" == restock ]]; then
-  setsid node "$ROOT/scripts/e2e-restock-regtest.mjs" &
+elif [[ "$PROFILE" == regrowth ]]; then
+  setsid node "$ROOT/scripts/e2e-regrowth-regtest.mjs" &
 else
   setsid node "$ROOT/scripts/e2e-suite.mjs" &
 fi

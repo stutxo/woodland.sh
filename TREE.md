@@ -1,39 +1,41 @@
-# woodland.sh Tree Protocol v1
+# woodland.sh Tree Protocol v2
 
 ## Status
 
-Protocol v1 uses manifest schema 1 and stock arkd. Genesis metadata commits
-`game=woodland.sh`, `protocol=1`, and one of `TREE`, `LOG`, or `XP`.
-Every manifest field is mandatory; incomplete or unknown manifests fail closed.
+Protocol v2 uses manifest schema 2, stock arkd, and a woodland policy gate in
+front of the stock Arkade Script emulator. Genesis metadata commits
+`game=woodland.sh`, `protocol=2`, and one of `TREE`, `LOG`, or `XP`. Every
+manifest field is mandatory; incomplete or unknown manifests fail closed.
 
 ## Genesis
 
 One transaction creates three fixed-supply Asset V1 groups:
 
 ```text
-group 0: 2,100 TREE
+group 0: 420 TREE
 group 1: 21,000,000 LOG
 group 2: 21,000,000 XP
 ```
 
-All groups are uncontrolled. A deterministic deployment places one TREE, 1,000
-LOG, 1,000 XP, and 330 sats into each shared tree contract, and the remaining
-18,900,000 LOG, 18,900,000 XP, and 330 sats into one supply vault covenant.
-World bootstrap therefore needs 693,330 sats, all of it recovered in
-transit as trees are retired and restocked; no player reserve exists.
+All groups are uncontrolled. Deterministic deployment places one TREE, 50,000
+LOG, 50,000 XP, and 330 sats into each of exactly 420 shared tree contracts.
+That allocates the complete LOG and XP supplies locally; no supply vault,
+restock transaction, or player reserve exists. World bootstrap requires
+138,600 sats for the tree outputs.
 
 ## Tree State
 
 Every tree carries:
 
 - immutable `TreeState { tree_id, x, y }`;
-- numeric health from zero through five;
+- numeric health from zero through ten;
+- a numeric stump height, zero while active;
 - one TREE marker;
-- remaining LOG and XP inventory;
+- its remaining local LOG and XP inventory;
 - fixed value 330 sats.
 
 Reward entropy is deliberately absent from tree state. It belongs to the
-recursive player lineage, so scanning, renewing, or restocking trees cannot
+recursive player lineage, so scanning, renewing, or regrowing trees cannot
 change a player's next outcome.
 
 ## Swing
@@ -62,88 +64,69 @@ tree XP:          F -> F-G
 tree health:      H -> H-G
 ```
 
-It also requires:
+It also requires the canonical two-input/four-output shape, ordered uncontrolled
+asset groups, one conserved TREE marker, recursive player and tree scripts,
+fixed sat values, preserved identities, canonical player luck, and exact
+extension and anchor outputs. The player covenant pins this exact tree script,
+so both halves authorize the same transaction.
 
-- exactly two inputs and four outputs;
-- group zero is one uncontrolled, metadata-free PLAYER_ID transferred from
-  player input zero to player output zero;
-- the world asset IDs occupy TREE group one, LOG group two, and XP group
-  three;
-- no transfer metadata or control-asset references;
-- one TREE on the tree lineage;
-- unchanged player and tree scripts and sat values;
-- preserved tree identity and player identity/position;
-- canonical player roll successor and luck-credit transition;
-- a recursive Arkade script on player input zero;
-- canonical extension and anchor.
+Every swing carries a witness `[height, "WOODLAND_BLOCK_V1"]`. The covenant
+requires the minimally encoded height to be positive. The introspector extension
+serializes that witness into the transaction, so transaction signatures commit
+it without changing the zero-locktime Ark transaction shape rebuilt by stock
+arkd. A successful final swing, where output health becomes zero, records that
+height in the stump packet. Every non-final swing preserves stump height zero.
 
-The player covenant pins this exact tree script, so both halves authorize the
-same transaction.
+## Two-Tip Regrowth
 
-## Stump Refill
-
-A new tree has health five and a 1,000-unit reserve. Successful swings
-decrement health, LOG, and XP together, so a health-zero tree is a stump with
-995 LOG/XP remaining. The renewal covenant resets zero health back to five
-while preserving identity, assets, script, and sats; a healthy tree preserves
-health exactly. No signer clock exists: refill rides whichever batch renewal
-settles the stump, and the leaf is permissionless like every other tree leaf.
-Player roll and credit are not part of this transaction.
-
-## Retire and Restock
-
-Once the last LOG leaves a tree, only its TREE marker and 330 sats remain and
-refill can no longer help. Such a depleted tree is replaced atomically against
-the supply vault:
+A mature tree has health ten. Ten successful drops produce a funded stump while
+removing exactly ten LOG and ten XP from its local reserve. If the final chop
+records height `H`, the renewal covenant permits regrowth only when:
 
 ```text
-inputs:  depleted tree, supply vault
-outputs: fresh tree, vault change, merged extension, canonical anchor
-groups:  TREE, LOG, XP
+attested height >= H + 2
+output health = 10
+output stump height = 0
 ```
 
-The tree retire leaf and the vault restock leaf are reciprocal covenants over
-this one transaction. Together they pin:
+TREE, LOG, XP, identity, script, and 330 sats remain byte-for-byte conserved.
+Any caller may submit the path. No player state or reward entropy participates.
 
-- the dead tree input carries exactly one TREE, zero LOG, and zero XP;
-- the fresh tree output keeps the same identity (tree id and coordinate),
-  script, and 330 sats, and receives one TREE, 1,000 LOG, 1,000 XP, and health
-  five;
-- the TREE marker enters only from the dead tree input; LOG and XP enter only
-  from the vault input;
-- the vault change output preserves the vault script, sats, and remaining
-  supply exactly;
-- no player state or reward entropy participates.
+Arkade Script cannot query Bitcoin Core. The woodland emulator gate validates
+the witnessed height against its current Core tip before forwarding the request
+to the stock emulator. The gate-authenticated witness is committed in the
+transaction extension, and the covenant checks the two-height delta. The gate
+accepts only the current Core height; a tip race requires the client to refresh
+and rebuild rather than shortening the delay.
 
-Both leaves close over the Arkade operator and tweaked emulator and nothing
-else, so any caller can restock. `woodland-operator restock <manifest> tree
-<tree-id>` (or `due` for every depleted tree) is a convenience wrapper.
-Restocks continue until the vault reserve is exhausted; only then does a
-depleted coordinate stay empty.
+After 5,000 complete health cycles, a tree's 50,000 local LOG and XP are
+exhausted. Its health-zero state remains terminal: renewal preserves the zero
+health and stump height, and no protocol path can draw reserves from another
+tree or mint replacements.
 
 ## Renewal
 
-Swing transactions do not extend Arkade batch lifetime. A permissionless
-exact-self-send leaf enters the tree into a fresh batch while preserving:
+Swing transactions do not extend Arkade batch lifetime. The same permissionless
+exact-self-send leaf enters a tree into a fresh batch while preserving:
 
 - P2TR and 330 sats;
 - TREE, LOG, and XP amounts;
-- the identity packet.
+- identity;
+- active health and stump height.
 
-Health is the one exception: a stump refills to five (see Stump Refill). The
-leaf closes over the operator and tweaked emulator only, so any caller can
-renew. An unnecessary renewal can still race gameplay by rotating the
-outpoint, so the operator `watch` command renews healthy trees only near the
-observed expiry margin, refills stumps as soon as they appear, renews the
-vault on the same margin, and reports any live tree missing an indexed expiry.
+Only an eligible funded stump takes the regrowth branch above. An unnecessary
+renewal can race gameplay by rotating the outpoint, so the operator `watch`
+command renews active trees only near the observed expiry margin and selects
+funded stumps only after the two-tip threshold. The public client `regrow` API
+uses the same transaction and needs no player key.
 
 ## Trust
 
-The operator and emulator cooperate on every swing. Every other tree leaf —
-renewal with stump refill and retire-and-restock — closes over the same
-operator and tweaked emulator pair and nothing else, so tree liveness never
-depends on a project-held key; the watcher is a convenience, not a trust
-requirement. The vault covenant holds the undistributed supply: its only moves
-are the atomic restock above and an exact-self-send renewal, so nobody can
-redirect the reserve elsewhere. The NUMS-keyed CSV leaf satisfies Arkade
-expiry accounting but provides no unilateral bypass of the recursive covenant.
+Every usable tree leaf closes over the Arkade operator and covenant-tweaked
+emulator, not a woodland-held lifecycle key. Bitcoin Taproot enforces those
+signer requirements. The woodland gate is additionally trusted to report Core
+height honestly; its stock-emulator upstream must remain loopback-only.
+Compromising or bypassing the gate can waive the delay but does not create a
+covenant path that changes local reserves or redirects TREE, LOG, XP,
+or sats. The NUMS-keyed CSV leaf satisfies Arkade expiry accounting but provides
+no unilateral bypass of the recursive covenant.

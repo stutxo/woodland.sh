@@ -4,34 +4,11 @@
 //! is the headless equivalent for bots and alternative frontends. It holds no
 //! framework and no hidden state: connect with a world manifest and player
 //! keys, then drive [`WoodlandClient::activate`], [`WoodlandClient::chop`],
-//! and [`WoodlandClient::renew_player`]. Persistence of the player key,
-//! PLAYER_ID, and any submission journal is the caller's choice.
+//! [`WoodlandClient::regrow`], and [`WoodlandClient::renew_player`].
+//! Persistence of the player key, PLAYER_ID, and any submission journal is the caller's choice.
 
 use crate::arkade::{ArkadeRest, EmulatorParams, EmulatorRest, ServerParams, VtxoRecord};
 
-/// Build one covenant spend input for a retire/restock leaf.
-fn restock_vtxo_input(
-    record: &VtxoRecord,
-    vtxo: &ark_core::Vtxo,
-    spend_script: &bitcoin::ScriptBuf,
-) -> Result<ark_core::send::VtxoInput> {
-    if record.script != vtxo.script_pubkey() {
-        return Err(anyhow!("restock input does not match the covenant script"));
-    }
-    let control_block = vtxo
-        .get_spend_info(spend_script.clone())
-        .map_err(|error| anyhow!("restock spend info: {error}"))?;
-    Ok(ark_core::send::VtxoInput::new(
-        spend_script.clone(),
-        None,
-        control_block,
-        vtxo.tapscripts(),
-        vtxo.script_pubkey(),
-        Amount::from_sat(record.amount_sats),
-        record.outpoint,
-        record.assets.clone(),
-    ))
-}
 use crate::batch::BatchServices;
 use crate::chop::{ChopMutation, ChopWorld, PlayerChopState, TreeChopState};
 use crate::keys::Keys;
@@ -71,6 +48,8 @@ impl PlayerSnapshot {
 pub struct TreeSnapshot {
     pub state: TreeState,
     pub health: TreeHealth,
+    /// Bitcoin height recorded by the final successful chop; zero while active.
+    pub stump_height: tree::TreeStumpHeight,
     pub record: VtxoRecord,
     /// Current LOG reserve; one successful swing moves one unit to the player.
     pub logs: u64,
@@ -118,6 +97,10 @@ impl WoodlandClient {
             .get_info()
             .await
             .context("read emulator service info")?;
+        emulator
+            .get_block_tip()
+            .await
+            .context("verify trusted block-aware emulator gate")?;
         let world = manifest
             .validate(&keys.secp, &params, &emulator_params)
             .context("validate woodland.sh world manifest")?;
@@ -305,18 +288,40 @@ impl WoodlandClient {
         }
         let health = tree::tree_health_from_tx(&previous_tx)?
             .ok_or_else(|| anyhow!("tree transaction has no health packet"))?;
+        let stump_height = tree::tree_stump_height_from_tx(&previous_tx)?
+            .ok_or_else(|| anyhow!("tree transaction has no stump height packet"))?;
         let is_deployment = record.outpoint.txid == declared.deployment_txid;
         let transition = tree::classify_transition(&previous_tx, is_deployment)?;
         if record.outpoint.vout != transition.output_index()
-            || (is_deployment && health.value() != tree::LOGS_PER_TREE)
+            || (is_deployment
+                && (health.value() != tree::LOGS_PER_TREE || stump_height.value() != 0))
         {
             return Err(anyhow!("tree record has an invalid lineage"));
         }
         let logs = record.asset_amount(self.world.log_asset).unwrap_or(0);
         let xp_reserve = record.asset_amount(self.world.xp_asset).unwrap_or(0);
+        if record.amount_sats != self.manifest.dust_sats
+            || record.script != self.world.contract.vtxo.script_pubkey()
+            || record.asset_amount(self.world.tree_asset) != Some(1)
+            || logs > self.manifest.log_reserve_per_tree
+            || xp_reserve > self.manifest.xp_per_tree
+            || logs != xp_reserve
+            || health.value() > logs
+            || ((health.value() == 0) != (stump_height.value() > 0))
+            || !record.assets.iter().all(|asset| {
+                asset.asset_id == self.world.tree_asset
+                    || asset.asset_id == self.world.log_asset
+                    || asset.asset_id == self.world.xp_asset
+            })
+        {
+            return Err(anyhow!(
+                "tree record has an invalid local reserve or stump state"
+            ));
+        }
         Ok(TreeSnapshot {
             state,
             health,
+            stump_height,
             record,
             logs,
             xp_reserve,
@@ -447,6 +452,11 @@ impl WoodlandClient {
         let player_asset = self
             .player_asset
             .ok_or_else(|| anyhow!("activate the player before chopping"))?;
+        let block_tip = self
+            .emulator
+            .get_block_tip()
+            .await
+            .context("read attested Bitcoin tip before chop")?;
         let prepared = crate::chop::prepare_chop(
             &self.keys,
             &self.info(),
@@ -470,6 +480,7 @@ impl WoodlandClient {
                 previous_tx: &tree.previous_tx,
                 health: tree.health,
             },
+            block_tip.height,
             ChopMutation::None,
         )?;
         let txid = prepared.ark_tx.unsigned_tx.compute_txid();
@@ -634,147 +645,67 @@ impl WoodlandClient {
         })
     }
 
-    /// Restock one depleted tree atomically from the supply vault. Any caller
-    /// may restock; the covenant pins the replacement exactly.
-    pub async fn restock(&mut self, tree_id: u32) -> Result<()> {
-        let declared = *self
-            .world
-            .trees
-            .iter()
-            .find(|tree| tree.state.tree_id == tree_id)
-            .ok_or_else(|| anyhow!("tree {tree_id} is not part of this world"))?;
+    /// Permissionlessly regrow an eligible stump through the exact-self-send
+    /// batch path. The emulator gate attests the current Bitcoin height.
+    pub async fn regrow(&mut self, tree_id: u32) -> Result<OutPoint> {
         let tree = self.tree(tree_id).await?;
-        let logs = tree.record.asset_amount(self.world.log_asset).unwrap_or(0);
-        let xp_balance = tree.record.asset_amount(self.world.xp_asset).unwrap_or(0);
-        if logs > 0 || xp_balance > 0 {
-            return Err(anyhow!("tree {tree_id} is not depleted"));
+        if tree.health.value() != 0 {
+            return Err(anyhow!("tree {tree_id} is not a stump"));
         }
-        let vault_record = {
-            let script = self.world.vault.vtxo.script_pubkey().to_hex_string();
-            let records = self.rest.get_vtxos(&script, "spendableOnly").await?;
-            let candidates = records
-                .into_iter()
-                .filter(|record| {
-                    record.asset_amount(self.world.log_asset).is_some()
-                        && record.asset_amount(self.world.xp_asset).is_some()
-                })
-                .collect::<Vec<_>>();
-            match candidates.as_slice() {
-                [record] => record.clone(),
-                [] => return Err(anyhow!("no live supply vault in this world")),
-                _ => return Err(anyhow!("multiple live supply vault records")),
-            }
-        };
-        let vault_previous_tx = self
-            .rest
-            .get_virtual_txs(&[vault_record.outpoint.txid])
-            .await?
-            .remove(&vault_record.outpoint.txid)
-            .ok_or_else(|| anyhow!("indexer omitted the vault's creating transaction"))?;
-        let tree_input = crate::client::restock_vtxo_input(
-            &tree.record,
-            &self.world.contract.vtxo,
-            &self.world.contract.retire_spend_script,
-        )?;
-        let vault_input = crate::client::restock_vtxo_input(
-            &vault_record,
-            &self.world.vault.vtxo,
-            &self.world.vault.restock_spend_script,
-        )?;
-        let mut restock = ark_core::send::build_offchain_transactions(
-            &[
-                ark_core::send::SendReceiver::bitcoin(
-                    self.world.contract.vtxo.to_ark_address(),
-                    Amount::from_sat(self.params.dust_sats),
-                ),
-                ark_core::send::SendReceiver::bitcoin(
-                    self.world.vault.vtxo.to_ark_address(),
-                    Amount::from_sat(self.params.dust_sats),
-                ),
-            ],
-            &txbuild::player_vtxo(&self.keys, &self.params)?.to_ark_address(),
-            &[tree_input, vault_input],
-            &self.info(),
-        )
-        .map_err(|error| anyhow!("build tree restock: {error}"))?;
-        let vault_logs = vault_record.asset_amount(self.world.log_asset).unwrap_or(0);
-        let vault_xp_balance = vault_record.asset_amount(self.world.xp_asset).unwrap_or(0);
-        ark_core::asset::packet::add_asset_packet_to_psbt(
-            &mut restock.ark_tx,
-            &ark_core::asset::packet::Packet {
-                groups: vec![
-                    crate::chop::transfer_group(
-                        self.world.tree_asset,
-                        vec![(protocol::RESTOCK_TREE_INPUT_INDEX as u16, 1)],
-                        vec![(protocol::RESTOCK_TREE_OUTPUT_INDEX, 1)],
-                    ),
-                    crate::chop::transfer_group(
-                        self.world.log_asset,
-                        vec![(protocol::RESTOCK_VAULT_INPUT_INDEX as u16, vault_logs)],
-                        vec![
-                            (
-                                protocol::RESTOCK_TREE_OUTPUT_INDEX,
-                                crate::world::LOG_RESERVE_PER_TREE,
-                            ),
-                            (
-                                protocol::RESTOCK_VAULT_OUTPUT_INDEX,
-                                vault_logs - crate::world::LOG_RESERVE_PER_TREE,
-                            ),
-                        ],
-                    ),
-                    crate::chop::transfer_group(
-                        self.world.xp_asset,
-                        vec![(protocol::RESTOCK_VAULT_INPUT_INDEX as u16, vault_xp_balance)],
-                        vec![
-                            (
-                                protocol::RESTOCK_TREE_OUTPUT_INDEX,
-                                crate::world::XP_PER_TREE,
-                            ),
-                            (
-                                protocol::RESTOCK_VAULT_OUTPUT_INDEX,
-                                vault_xp_balance - crate::world::XP_PER_TREE,
-                            ),
-                        ],
-                    ),
-                ],
-            },
-        )
-        .map_err(|error| anyhow!("attach restock asset packet: {error}"))?;
-        tree::attach_restock_context(
-            &mut restock.ark_tx,
-            &restock.checkpoint_txs,
-            &self.world.contract,
-            &self.world.vault,
-            &tree.previous_tx,
-            &vault_previous_tx,
-            declared.state,
-        )?;
-        let txid = restock.ark_tx.unsigned_tx.compute_txid();
-        let (returned_ark, _) = self
+        if tree.record.asset_amount(self.world.log_asset).unwrap_or(0) == 0 {
+            return Err(anyhow!("tree {tree_id} has exhausted its local reserve"));
+        }
+        let block_tip = self
             .emulator
-            .submit_tx(&restock.ark_tx, &restock.checkpoint_txs)
+            .get_block_tip()
             .await
-            .context("submit tree restock to emulator")?;
-        if returned_ark.unsigned_tx != restock.ark_tx.unsigned_tx {
-            return Err(anyhow!("emulator changed the submitted restock"));
+            .context("read attested Bitcoin tip before regrowth")?;
+        let prepared = renewal::prepare_tree(
+            &tree.record,
+            &tree.previous_tx,
+            &self.world.contract,
+            self.world.tree_asset,
+            self.world.log_asset,
+            self.world.xp_asset,
+            self.params.dust_sats,
+            block_tip.height,
+            0,
+        )?;
+        let services = BatchServices::connect(
+            &self.arkade_url,
+            self.emulator.clone(),
+            self.params.clone(),
+            self.world.pins.clone(),
+        )
+        .await?;
+        let outcome = services
+            .settle_renewal(
+                &self.keys,
+                self.emulator_params.signer_pk,
+                prepared,
+                &tree.previous_tx,
+            )
+            .await?;
+        let renewed = self
+            .wait_for_vtxo(
+                &self.world.contract.vtxo.script_pubkey().to_hex_string(),
+                outcome.outpoint,
+            )
+            .await?;
+        let transaction = self
+            .rest
+            .get_virtual_txs(&[renewed.outpoint.txid])
+            .await?
+            .remove(&renewed.outpoint.txid)
+            .ok_or_else(|| anyhow!("indexer omitted the regrown tree transaction"))?;
+        let health = tree::tree_health_from_tx(&transaction)?
+            .ok_or_else(|| anyhow!("regrown tree has no health packet"))?;
+        let stump_height = tree::tree_stump_height_from_tx(&transaction)?
+            .ok_or_else(|| anyhow!("regrown tree has no stump height packet"))?;
+        if health.value() != tree::LOGS_PER_TREE || stump_height.value() != 0 {
+            return Err(anyhow!("regrown tree state is invalid"));
         }
-        self.wait_for_vtxo(
-            &self.world.contract.vtxo.script_pubkey().to_hex_string(),
-            OutPoint {
-                txid,
-                vout: u32::from(protocol::RESTOCK_TREE_OUTPUT_INDEX),
-            },
-        )
-        .await?;
-        self.wait_for_vtxo(
-            &self.world.vault.vtxo.script_pubkey().to_hex_string(),
-            OutPoint {
-                txid,
-                vout: u32::from(protocol::RESTOCK_VAULT_OUTPUT_INDEX),
-            },
-        )
-        .await?;
-        Ok(())
+        Ok(renewed.outpoint)
     }
 
     /// Owner-authorized exact-self-send renewal through the batch flow.

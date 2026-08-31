@@ -6,25 +6,25 @@ numeric XP counter independently verifiable.
 
 ## The Frontend Is Not the Game
 
-The map is presentation. The boundary is the schema 1 manifest, indexed Arkade
-state, fixed Asset V1 supply, Bitcoin Taproot signer closures, and Arkade Script.
-The browser calls the manifest-pinned Arkade and emulator services directly.
+The map is presentation. The boundary is the schema 2 manifest, indexed Arkade
+state, fixed Asset V1 supply, Bitcoin Taproot signer closures, Arkade Script,
+and the Bitcoin-height policy enforced by the emulator gate. The browser calls
+the manifest-pinned Arkade service and emulator gate directly.
 
 ## Three World Assets, One Marker per Player
 
-Protocol v1 creates:
+Protocol v2 creates:
 
 ```text
-2,100 TREE
+420 TREE
 21,000,000 LOG
 21,000,000 XP
 ```
 
-Each initial tree owns one TREE, 1,000 LOG, 1,000 XP, health five, and 330 sats.
-The remaining 18,900,000 LOG and 18,900,000 XP sit in one supply vault covenant
-until restocks draw them down. There is no player-ticket reserve and no allocator
-service. PLAYER_ID is not a world reserve: each activation issues its own
-one-unit, uncontrolled marker.
+Each initial tree owns one TREE, 50,000 LOG, 50,000 XP, health ten, stump
+height zero, and 330 sats. No shared vault or shared reserve exists. There is
+no player-ticket reserve and no allocator service. PLAYER_ID is not a world
+reserve: each activation issues its own one-unit, uncontrolled marker.
 
 ## Deposit and Start
 
@@ -62,7 +62,7 @@ equal player-held XP. XP is fixed supply with no control asset. Every
 successful swing moves one unit from tree to player; misses move none. Thus:
 
 ```text
-sum(tree XP) + sum(player XP) + vault XP = 21,000,000
+sum(tree XP) + sum(player XP) = 21,000,000
 ```
 
 LOG obeys the same conservation equation.
@@ -116,18 +116,20 @@ emulator. The tree tapleaf closes over operator and tweaked emulator. The
 transaction succeeds only when both covenant programs and both signer closures
 agree on the same bytes.
 
-## Stumps and Restock
+## Stumps and Two-Tip Regrowth
 
-A stump — zero health with reserve left — refills to full health on its next
-batch renewal. The permissionless renewal leaf carries no clock or privileged
-signer, so refill is paced by batch settlement. Once the last LOG leaves, only
-the TREE marker and 330 sats remain. That depleted tree is
-retired and restocked in one atomic transaction with the supply vault: the
-fresh tree reappears at the same coordinate with the same script, a full
-1,000-unit reserve and health five, while the vault keeps the change. Player
-luck is untouched by stump renewal and restock. Anyone can submit a restock;
-the operator CLI is a convenience. A coordinate stays empty only once the vault
-itself is exhausted.
+Ten successful drops reduce a mature tree from health ten to zero. The final
+successful chop records the emulator-attested Bitcoin height `H`. Any caller
+may regrow that funded stump to health ten once the attested height is at least
+`H + 2`. Regrowth preserves its TREE marker, coordinate, script, 330 sats,
+and remaining local LOG and XP exactly, then clears the stump height.
+
+The canonical witness is serialized in the transaction's introspector extension,
+so transaction signatures commit it. Before the stock emulator signs, the
+woodland emulator gate checks that height against Bitcoin Core. This trusted
+gate emulates the two-block relative delay that Arkade Script cannot observe
+directly. A stump with no local LOG has no source
+of replacement supply and remains terminal.
 
 ## Renewal
 
@@ -138,22 +140,22 @@ XP inventory. A separate rollover leaf allows an optional watchtower to do
 the same exact self-send unattended; its CLI input includes the selected
 PLAYER_ID so decoy states are ignored. A renewal cannot alter state, but its
 outpoint rotation can race gameplay, so watchtowers act only near expiry. Tree
-and vault renewal are permissionless covenant paths outside the player web
-path; the operator watcher performs them on the expiry margin (and refills
-stumps immediately) as a convenience, not a trust requirement.
+renewal is a permissionless covenant path outside the player web path. The
+operator watcher renews active trees near expiry and regrows eligible funded
+stumps after the two-tip gate; it is a convenience, not a trust requirement.
 
 ## Honest Boundary
 
-Protocol v1 proves fixed world supply, XP backing, soulbound XP, selected
+Protocol v2 proves fixed world supply, XP backing, soulbound XP, selected
 player lineage, canonical direct-activation and recursive player-luck
-transitions, packet canonicality, atomic reward movement, and
-vault-conserving restock. PLAYER_ID means “this recursive state,” not “one
-human”: Sybil creation and identity grinding remain permissionless. A covenant
-cannot inspect ancestry from before a marker entered player state, so an owner
-can use an intermediate output to choose any starting roll and credit within the
-corridor. This can bias reward timing inside the corridor; the recursive rate
-budget and streak bounds still apply after entry. Movement and adjacency
-are frontend policy. Randomness is public and predictable. Browser key custody
-and service availability are not solved. Arkade Script is enforced by the
-configured emulator, so bypassing covenant evaluation requires trusting the
-emulator and every other signer on that leaf.
+transitions, packet canonicality, atomic reward movement, local-reserve
+preservation, and the covenant side of two-tip regrowth. PLAYER_ID means “this
+recursive state,” not “one human”: Sybil creation and identity grinding remain
+permissionless. A covenant cannot inspect ancestry from before a marker entered
+player state, so an owner can use an intermediate output to choose any starting
+roll and credit within the corridor. This can bias reward timing inside the
+corridor; the recursive rate budget and streak bounds still apply after entry.
+Movement and adjacency are frontend policy. Randomness is public and predictable.
+Browser key custody and service availability are not solved. Arkade Script is
+enforced by the stock emulator; the woodland gate is additionally trusted to
+report Bitcoin Core height honestly.

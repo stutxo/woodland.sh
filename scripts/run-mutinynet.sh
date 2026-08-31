@@ -81,7 +81,7 @@ esac
 unset WOODLAND_DEPLOYER_SECRET
 WOODLAND_SERVER_URL=self WOODLAND_WASM_FEATURES=woodland-app "$ROOT/scripts/build-web.sh"
 
-"$OPERATOR" watch "$WOODLAND_WORLD_MANIFEST" &
+env -u WOODLAND_ROLLOVER_SECRET "$OPERATOR" watch "$WOODLAND_WORLD_MANIFEST" &
 WATCHER_PID=$!
 "$ROOT/target/release/woodland-server" &
 SERVER_PID=$!

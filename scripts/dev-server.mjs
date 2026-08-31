@@ -14,10 +14,6 @@ const WORLD_MANIFEST = path.resolve(
   configuredSetting('WOODLAND_WORLD_MANIFEST', 'regtest/_build/woodland-world.json'),
 );
 const WEB_ROOT = path.resolve(ROOT, process.env.WOODLAND_WEB_ROOT || 'dist');
-const ROLLOVER_SECRET = configuredSetting(
-  'WOODLAND_ROLLOVER_SECRET',
-  '4444444444444444444444444444444444444444444444444444444444444444',
-);
 for (const name of [
   'WOODLAND_DEPLOYER_SECRET',
   'WOODLAND_ROLLOVER_SECRET',
@@ -45,7 +41,7 @@ const ARKADE_UPSTREAM = configuredSetting(
 ).replace(/\/+$/, '');
 const EMULATOR_UPSTREAM = configuredSetting(
   'WOODLAND_EMULATOR_URL',
-  'http://127.0.0.1:7073',
+  'http://127.0.0.1:7074',
 ).replace(/\/+$/, '');
 
 const watcherLockId = createHash('sha256').update(WORLD_MANIFEST).digest('hex').slice(0, 16);
@@ -173,10 +169,6 @@ function startWatcher() {
     ],
     {
       cwd: ROOT,
-      env: {
-        ...process.env,
-        WOODLAND_ROLLOVER_SECRET: ROLLOVER_SECRET,
-      },
       stdio: ['ignore', 'ignore', 'pipe'],
     },
   );

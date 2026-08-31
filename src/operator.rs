@@ -11,7 +11,7 @@ use crate::world::{
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::packet::{AssetGroup, AssetInput, AssetOutput, Packet};
 use ark_core::asset::AssetId;
-use ark_core::send::{build_offchain_transactions, SendReceiver, VtxoInput};
+use ark_core::send::{build_offchain_transactions, SendReceiver};
 use ark_core::Asset;
 use bitcoin::{Amount, OutPoint, Psbt, Txid, XOnlyPublicKey};
 use futures::stream::{self, StreamExt};
@@ -30,8 +30,6 @@ const EXPECTED_EMULATOR_SIGNER_ENV: &str = "WOODLAND_EXPECTED_EMULATOR_SIGNER";
 const EXPECTED_EMULATOR_VERSION_ENV: &str = "WOODLAND_EXPECTED_EMULATOR_VERSION";
 const FORCE_ROLLOVER_ENV: &str = "WOODLAND_FORCE_ROLLOVER";
 const STARTUP_RENEWAL_ENV: &str = "WOODLAND_RENEWAL_STARTUP";
-#[cfg(feature = "regtest-e2e")]
-const INITIAL_TREE_RESERVE_ENV: &str = "WOODLAND_E2E_INITIAL_TREE_RESERVE";
 const INDEX_ATTEMPTS: usize = 80;
 const INDEX_POLL_MS: u64 = 250;
 /// Renew a tree once its remaining batch lifetime drops below this margin,
@@ -62,7 +60,6 @@ struct PlannedShard {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BootstrapPlan {
     manifest: WorldManifest,
-    initial_tree_reserve: u64,
     deployer_script: String,
     funding_outpoints: Vec<String>,
     issuance_ark: String,
@@ -84,6 +81,7 @@ struct Services {
 struct CurrentTree {
     state: tree::TreeState,
     health: tree::TreeHealth,
+    stump_height: tree::TreeStumpHeight,
     record: VtxoRecord,
     previous_tx: bitcoin::Transaction,
 }
@@ -107,22 +105,6 @@ fn optional_setting(name: &str) -> Result<Option<String>> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(anyhow!("{name} is not valid UTF-8")),
     }
-}
-
-fn deployment_reserve_per_tree() -> Result<u64> {
-    #[cfg(feature = "regtest-e2e")]
-    if let Some(raw) = optional_setting(INITIAL_TREE_RESERVE_ENV)? {
-        let reserve = raw.parse::<u64>().with_context(|| {
-            format!("{INITIAL_TREE_RESERVE_ENV} must be a positive whole number")
-        })?;
-        if !(ACTIVE_LOGS_PER_TREE..=LOG_RESERVE_PER_TREE).contains(&reserve) {
-            return Err(anyhow!(
-                "{INITIAL_TREE_RESERVE_ENV} must be between {ACTIVE_LOGS_PER_TREE} and {LOG_RESERVE_PER_TREE}"
-            ));
-        }
-        return Ok(reserve);
-    }
-    Ok(LOG_RESERVE_PER_TREE)
 }
 
 fn parse_signer_pin(name: &str, value: &str) -> Result<XOnlyPublicKey> {
@@ -206,7 +188,7 @@ pub async fn run_cli() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next().ok_or_else(|| {
         anyhow!(
-            "usage: woodland-operator <status|ensure|renew-once|watch> <manifest>\n       woodland-operator renew <manifest> <tree <tree_id>|player <owner_pubkey> <player_asset>>\n       woodland-operator restock <manifest> <tree <tree_id>|due>"
+            "usage: woodland-operator <status|ensure|renew-once|watch> <manifest>\n       woodland-operator renew <manifest> <tree <tree_id>|player <owner_pubkey> <player_asset>>"
         )
     })?;
     let manifest_path = args
@@ -237,13 +219,15 @@ pub async fn run_cli() -> Result<()> {
                     "missing renew target: expected tree <tree_id> or player <owner_pubkey> <player_asset>"
                 )
             })?;
-            let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
             match (target.as_str(), args.next(), args.next(), args.next()) {
                 ("tree", Some(tree_id), None, None) => {
                     let tree_id = tree_id.parse::<u32>().context("parse tree id")?;
-                    renew_tree(&manifest_path, &rollover, &services, tree_id).await
+                    let participant =
+                        Keys::generate().context("generate tree renewal batch participant")?;
+                    renew_tree(&manifest_path, &participant, &services, tree_id).await
                 }
                 ("player", Some(owner), Some(player_asset), None) => {
+                    let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
                     let owner = owner
                         .parse::<XOnlyPublicKey>()
                         .context("parse player owner public key")?;
@@ -264,36 +248,15 @@ pub async fn run_cli() -> Result<()> {
                 )),
             }
         }
-        "restock" => {
-            let target = args
-                .next()
-                .ok_or_else(|| anyhow!("missing restock target: expected tree <tree_id> or due"))?;
-            let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
-            match (target.as_str(), args.next(), args.next()) {
-                ("tree", Some(tree_id), None) => {
-                    let tree_id = tree_id.parse::<u32>().context("parse tree id")?;
-                    let count = restock_tree(&manifest_path, &rollover, &services, tree_id).await?;
-                    println!("{{\"restocked\":{count}}}");
-                    Ok(())
-                }
-                ("due", None, None) => {
-                    let count = restock_due_trees(&manifest_path, &rollover, &services).await?;
-                    println!("{{\"restocked\":{count}}}");
-                    Ok(())
-                }
-                _ => Err(anyhow!(
-                    "invalid restock target: expected tree <tree_id> or due"
-                )),
-            }
-        }
         "renew-once" => {
             require_mode_flag(STARTUP_RENEWAL_ENV, "automatic tree renewal")?;
             if args.next().is_some() {
                 return Err(anyhow!("unexpected renew-once argument"));
             }
-            let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
+            let participant =
+                Keys::generate().context("generate tree renewal batch participant")?;
             let (renewed, missing_expiry) =
-                renew_world(&manifest_path, &rollover, &services).await?;
+                renew_world(&manifest_path, &participant, &services).await?;
             println!("{{\"renewed\":{renewed},\"missingExpiry\":{missing_expiry}}}");
             Ok(())
         }
@@ -301,8 +264,9 @@ pub async fn run_cli() -> Result<()> {
             if args.next().is_some() {
                 return Err(anyhow!("unexpected watch argument"));
             }
-            let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
-            let mut last_error = match renew_world(&manifest_path, &rollover, &services).await {
+            let participant =
+                Keys::generate().context("generate tree renewal batch participant")?;
+            let mut last_error = match renew_world(&manifest_path, &participant, &services).await {
                 Ok((initial_renewed, _)) => {
                     if initial_renewed > 0 {
                         eprintln!("woodland.sh rolled over {initial_renewed} tree(s)");
@@ -337,7 +301,7 @@ pub async fn run_cli() -> Result<()> {
                 next_rollover = tokio::time::Instant::now()
                     + std::time::Duration::from_secs(TREE_ROLLOVER_CHECK_SECS);
                 let result =
-                    renew_expiring_trees(&manifest_path, &rollover, &current_services).await;
+                    renew_expiring_trees(&manifest_path, &participant, &current_services).await;
                 match result {
                     Ok((renewed, _)) => {
                         if last_error.take().is_some() {
@@ -435,6 +399,10 @@ async fn connect_services() -> Result<Services> {
         .get_info()
         .await
         .context("read emulator info")?;
+    emulator_rest
+        .get_block_tip()
+        .await
+        .context("verify trusted block-aware emulator gate")?;
     if emulator.version.trim().is_empty() {
         return Err(anyhow!("emulator did not report a version"));
     }
@@ -556,12 +524,11 @@ async fn ensure_world(
     execute_plan(path, &pending_path, deployer_keys, services, plan).await
 }
 
-/// Funding covers one dust per tree plus one dust for the supply vault; all of
-/// it is recovered as trees are retired and restocked.
+/// Funding covers one dust per recursive tree.
 fn world_funding_sats(params: &ServerParams) -> Result<u64> {
     params
         .dust_sats
-        .checked_mul(TREE_COUNT as u64 + 1)
+        .checked_mul(TREE_COUNT as u64)
         .ok_or_else(|| anyhow!("world tree funding amount overflow"))
 }
 
@@ -575,8 +542,18 @@ fn build_plan(
     let address = deployer.to_ark_address();
     let tree_states = tree_states();
     let tree_count = tree_states.len();
-    let initial_tree_reserve = deployment_reserve_per_tree()?;
     let funding_sats = world_funding_sats(&services.params)?;
+    if LOG_RESERVE_PER_TREE
+        .checked_mul(tree_count as u64)
+        .filter(|total| *total == crate::world::LOG_SUPPLY)
+        .is_none()
+        || XP_PER_TREE
+            .checked_mul(tree_count as u64)
+            .filter(|total| *total == crate::world::XP_SUPPLY)
+            .is_none()
+    {
+        return Err(anyhow!("per-tree reserves do not exhaust the fixed supply"));
+    }
     let funding_total = funding.iter().try_fold(0_u64, |total, record| {
         total
             .checked_add(record.amount_sats)
@@ -650,27 +627,9 @@ fn build_plan(
         tree_asset,
         log_asset,
         xp_asset,
-        LOG_RESERVE_PER_TREE,
-        XP_PER_TREE,
-        services.params.dust_sats,
-    )?;
-    let vault = crate::vault::build_vault_contract(
-        &keys.secp,
-        services.params.signer_pk,
-        services.emulator.signer_pk,
-        services.params.unilateral_exit_delay,
-        services.params.network,
-        tree_asset,
-        log_asset,
-        xp_asset,
-        &contract.vtxo.script_pubkey(),
-        LOG_RESERVE_PER_TREE,
-        XP_PER_TREE,
         services.params.dust_sats,
     )?;
     let tree_value = services.params.dust_sats;
-    let vault_log = crate::world::LOG_SUPPLY - initial_tree_reserve * tree_count as u64;
-    let vault_xp = crate::world::XP_SUPPLY - initial_tree_reserve * tree_count as u64;
     let treasury_assets = |remaining_trees: u64| {
         [
             Asset {
@@ -679,11 +638,11 @@ fn build_plan(
             },
             Asset {
                 asset_id: log_asset,
-                amount: initial_tree_reserve * remaining_trees,
+                amount: LOG_RESERVE_PER_TREE * remaining_trees,
             },
             Asset {
                 asset_id: xp_asset,
-                amount: initial_tree_reserve * remaining_trees,
+                amount: XP_PER_TREE * remaining_trees,
             },
         ]
         .to_vec()
@@ -710,7 +669,7 @@ fn build_plan(
         is_unrolled: false,
         is_spent: false,
     };
-    let mut distribution_receivers = shard_counts
+    let distribution_receivers = shard_counts
         .iter()
         .map(|count| {
             tree_value
@@ -719,11 +678,6 @@ fn build_plan(
                 .ok_or_else(|| anyhow!("deployment shard amount overflow"))
         })
         .collect::<Result<Vec<_>>>()?;
-    distribution_receivers.push(SendReceiver::bitcoin(
-        vault.vtxo.to_ark_address(),
-        Amount::from_sat(tree_value),
-    ));
-    let vault_output_index = shard_counts.len() as u16;
     let mut distribution = build_offchain_transactions(
         &distribution_receivers,
         &address,
@@ -746,18 +700,12 @@ fn build_plan(
                 transfer_group(
                     log_asset,
                     vec![(0, crate::world::LOG_SUPPLY)],
-                    shard_outputs(initial_tree_reserve)
-                        .into_iter()
-                        .chain([(vault_output_index, vault_log)])
-                        .collect(),
+                    shard_outputs(LOG_RESERVE_PER_TREE),
                 ),
                 transfer_group(
                     xp_asset,
                     vec![(0, crate::world::XP_SUPPLY)],
-                    shard_outputs(initial_tree_reserve)
-                        .into_iter()
-                        .chain([(vault_output_index, vault_xp)])
-                        .collect(),
+                    shard_outputs(XP_PER_TREE),
                 ),
             ],
         },
@@ -819,23 +767,23 @@ fn build_plan(
             )
             .map_err(|error| anyhow!("build world tree {} deployment: {error}", state.tree_id))?;
             let mut tree_outputs = vec![(0, 1)];
-            let mut log_outputs = vec![(0, initial_tree_reserve)];
-            let mut xp_outputs = vec![(0, initial_tree_reserve)];
+            let mut log_outputs = vec![(0, LOG_RESERVE_PER_TREE)];
+            let mut xp_outputs = vec![(0, XP_PER_TREE)];
             if remaining_after > 0 {
                 tree_outputs.push((1, remaining_after));
-                log_outputs.push((1, initial_tree_reserve * remaining_after));
-                xp_outputs.push((1, initial_tree_reserve * remaining_after));
+                log_outputs.push((1, LOG_RESERVE_PER_TREE * remaining_after));
+                xp_outputs.push((1, XP_PER_TREE * remaining_after));
             }
             let groups = vec![
                 transfer_group(tree_asset, vec![(0, remaining_before)], tree_outputs),
                 transfer_group(
                     log_asset,
-                    vec![(0, initial_tree_reserve * remaining_before)],
+                    vec![(0, LOG_RESERVE_PER_TREE * remaining_before)],
                     log_outputs,
                 ),
                 transfer_group(
                     xp_asset,
-                    vec![(0, initial_tree_reserve * remaining_before)],
+                    vec![(0, XP_PER_TREE * remaining_before)],
                     xp_outputs,
                 ),
             ];
@@ -848,6 +796,10 @@ fn build_plan(
             tree::attach_tree_health_packet(
                 &mut deployment.ark_tx,
                 tree::TreeHealth::new(ACTIVE_LOGS_PER_TREE)?,
+            )?;
+            tree::attach_tree_stump_height_packet(
+                &mut deployment.ark_tx,
+                tree::TreeStumpHeight::new(0)?,
             )?;
             let deployment_txid = deployment.ark_tx.unsigned_tx.compute_txid();
             manifest_deployments.push((state, deployment_txid));
@@ -896,13 +848,11 @@ fn build_plan(
         log_asset,
         xp_asset,
         &contract,
-        &vault,
         genesis_txid,
         &manifest_deployments,
     );
     Ok(BootstrapPlan {
         manifest,
-        initial_tree_reserve,
         deployer_script: deployer.script_pubkey().to_hex_string(),
         funding_outpoints: funding
             .iter()
@@ -931,10 +881,6 @@ async fn execute_plan(
     let world =
         plan.manifest
             .validate(&deployer_keys.secp, &services.params, &services.emulator)?;
-    let initial_tree_reserve = plan.initial_tree_reserve;
-    if !(ACTIVE_LOGS_PER_TREE..=LOG_RESERVE_PER_TREE).contains(&initial_tree_reserve) {
-        return Err(anyhow!("bootstrap plan initial tree reserve is invalid"));
-    }
     let deployer = txbuild::player_vtxo(deployer_keys, &services.params)?;
     let planned_count = plan
         .shards
@@ -1115,13 +1061,13 @@ async fn execute_plan(
         require_asset_amount(
             record,
             world.log_asset,
-            initial_tree_reserve * shard.tree_count,
+            LOG_RESERVE_PER_TREE * shard.tree_count,
             "shard LOG",
         )?;
         require_asset_amount(
             record,
             world.xp_asset,
-            initial_tree_reserve * shard.tree_count,
+            XP_PER_TREE * shard.tree_count,
             "shard XP",
         )?;
     }
@@ -1134,7 +1080,6 @@ async fn execute_plan(
             &plan.deployer_script,
             shard,
             &deployed,
-            initial_tree_reserve,
         )
     }))
     .buffer_unordered(RENEWAL_CONCURRENCY)
@@ -1165,7 +1110,6 @@ async fn execute_deployment_shard(
     deployer_script: &str,
     shard: &PlannedShard,
     deployed: &std::collections::HashSet<Txid>,
-    initial_tree_reserve: u64,
 ) -> Result<usize> {
     let mut submitted = 0;
     for (index, planned) in shard.deployments.iter().enumerate() {
@@ -1193,13 +1137,13 @@ async fn execute_deployment_shard(
         require_asset_amount(
             &asset_record,
             world.log_asset,
-            initial_tree_reserve * remaining,
+            LOG_RESERVE_PER_TREE * remaining,
             "shard LOG",
         )?;
         require_asset_amount(
             &asset_record,
             world.xp_asset,
-            initial_tree_reserve * remaining,
+            XP_PER_TREE * remaining,
             "shard XP",
         )?;
         submit_direct(
@@ -1214,15 +1158,10 @@ async fn execute_deployment_shard(
         require_asset_amount(
             &tree_record,
             world.log_asset,
-            initial_tree_reserve,
+            LOG_RESERVE_PER_TREE,
             "deployed LOG reserve",
         )?;
-        require_asset_amount(
-            &tree_record,
-            world.xp_asset,
-            initial_tree_reserve,
-            "deployed XP",
-        )?;
+        require_asset_amount(&tree_record, world.xp_asset, XP_PER_TREE, "deployed XP")?;
         submitted += 1;
     }
     Ok(submitted)
@@ -1308,8 +1247,13 @@ async fn load_current_trees(
             .ok_or_else(|| anyhow!("current tree transaction has no state packet"))?;
         let health = tree::tree_health_from_tx(transaction)?
             .ok_or_else(|| anyhow!("current tree transaction has no health packet"))?;
-        if health.value() > logs || health.value() > xp_balance {
-            return Err(anyhow!("tree health exceeds its fixed inventory"));
+        let stump_height = tree::tree_stump_height_from_tx(transaction)?
+            .ok_or_else(|| anyhow!("current tree transaction has no stump height packet"))?;
+        if health.value() > logs
+            || health.value() > xp_balance
+            || (health.value() == 0) != (stump_height.value() > 0)
+        {
+            return Err(anyhow!("tree health or stump height is invalid"));
         }
         let declared = declared_trees
             .iter()
@@ -1319,7 +1263,8 @@ async fn load_current_trees(
         let transition = tree::classify_transition(transaction, is_deployment)?;
         let expected_vout = transition.output_index();
         if record.outpoint.vout != expected_vout
-            || (is_deployment && health.value() != ACTIVE_LOGS_PER_TREE)
+            || (is_deployment
+                && (health.value() != ACTIVE_LOGS_PER_TREE || stump_height.value() != 0))
         {
             return Err(anyhow!("current tree lineage is invalid"));
         }
@@ -1333,6 +1278,7 @@ async fn load_current_trees(
         current.push(CurrentTree {
             state,
             health,
+            stump_height,
             record,
             previous_tx: transaction.clone(),
         });
@@ -1347,14 +1293,18 @@ async fn load_current_trees(
 fn tree_rollover_due(
     expires_at: Option<i64>,
     health: u64,
+    stump_height: u64,
     logs: u64,
-    _xp_balance: u64,
+    block_height: u32,
     now: i64,
     margin: i64,
 ) -> bool {
-    // Stumps renew as soon as they are seen (renewal refills their health);
-    // everything else renews once its expiry enters the margin.
-    (health == 0 && logs > 0) || expires_at.is_some_and(|expiry| expiry - now < margin)
+    if health == 0 && logs > 0 {
+        return stump_height
+            .checked_add(tree::REGROWTH_BLOCKS)
+            .is_some_and(|eligible| u64::from(block_height) >= eligible);
+    }
+    expires_at.is_some_and(|expiry| expiry - now < margin)
 }
 
 /// Split the live tree lineages into renewal candidates and the records the
@@ -1364,8 +1314,8 @@ fn tree_rollover_due(
 fn partition_rollover_candidates(
     trees: Vec<CurrentTree>,
     log_asset: AssetId,
-    xp_asset: AssetId,
     now: i64,
+    block_height: u32,
 ) -> (Vec<(i64, CurrentTree)>, Vec<OutPoint>) {
     let mut candidates = Vec::new();
     let mut missing_expiry = Vec::new();
@@ -1375,12 +1325,12 @@ fn partition_rollover_candidates(
             continue;
         };
         let logs = current.record.asset_amount(log_asset).unwrap_or(0);
-        let xp_balance = current.record.asset_amount(xp_asset).unwrap_or(0);
         if !tree_rollover_due(
             Some(expires_at),
             current.health.value(),
+            current.stump_height.value(),
             logs,
-            xp_balance,
+            block_height,
             now,
             current.record.rollover_margin_seconds(),
         ) {
@@ -1394,15 +1344,20 @@ fn partition_rollover_candidates(
 
 async fn renew_expiring_trees(
     path: &Path,
-    rollover_keys: &Keys,
+    participant_keys: &Keys,
     services: &Services,
 ) -> Result<(usize, usize)> {
     let manifest = read_manifest(path)?;
-    let world = manifest.validate(&rollover_keys.secp, &services.params, &services.emulator)?;
+    let world = manifest.validate(&participant_keys.secp, &services.params, &services.emulator)?;
     let trees = wait_for_current_trees(&services.rest, &manifest, &world).await?;
+    let block_tip = services
+        .emulator_rest
+        .get_block_tip()
+        .await
+        .context("read attested Bitcoin tip for tree rollover")?;
     let now = crate::arkade::now_unix();
     let (candidates, missing_expiry) =
-        partition_rollover_candidates(trees, world.log_asset, world.xp_asset, now);
+        partition_rollover_candidates(trees, world.log_asset, now, block_tip.height);
     if !missing_expiry.is_empty() {
         eprintln!(
             "woodland.sh rollover: {} live tree(s) have no indexed expiry and cannot be renewed",
@@ -1426,11 +1381,12 @@ async fn renew_expiring_trees(
                 (
                     current.state.tree_id,
                     renew_current_tree(
-                        rollover_keys,
+                        participant_keys,
                         services,
                         world,
                         &current.record,
                         &current.previous_tx,
+                        block_tip.height,
                     )
                     .await,
                 )
@@ -1471,13 +1427,6 @@ async fn renew_expiring_trees(
             candidate_count - attempted
         );
     }
-    if !paused_for_arkd_ban {
-        if let Err(error) = renew_vault_if_due(rollover_keys, services, &world, now).await {
-            let message = format!("supply vault rollover: {error:#}");
-            eprintln!("woodland.sh {message}");
-            failures.push(message);
-        }
-    }
     if !failures.is_empty() {
         return Err(anyhow!(
             "tree rollover did not finish cleanly: {}",
@@ -1490,402 +1439,12 @@ async fn renew_expiring_trees(
     Ok((renewed, missing_expiry.len()))
 }
 
-/// Renew the supply vault once its expiry enters the same margin as trees.
-async fn renew_vault_if_due(
-    rollover_keys: &Keys,
-    services: &Services,
-    world: &crate::world::ValidatedWorld,
-    now: i64,
-) -> Result<()> {
-    let record = load_vault_record(&services.rest, world).await?;
-    let Some(expires_at) = record.expires_at else {
-        eprintln!("woodland.sh rollover: the supply vault has no indexed expiry");
-        return Ok(());
-    };
-    if expires_at - now >= record.rollover_margin_seconds() {
-        return Ok(());
-    }
-    let previous_tx = services
-        .rest
-        .get_virtual_txs(&[record.outpoint.txid])
-        .await?
-        .remove(&record.outpoint.txid)
-        .ok_or_else(|| anyhow!("indexer omitted the vault's creating transaction"))?;
-    let old_expires_at = record.expires_at;
-    let prepared = crate::renewal::prepare_vault(
-        &record,
-        &previous_tx,
-        &world.vault,
-        world.log_asset,
-        world.xp_asset,
-        renewal_expiry_margin_secs(),
-    )?;
-    let outcome = run_one_renewal(rollover_keys, services, world, prepared, &previous_tx).await?;
-    let renewed = wait_for_record(
-        &services.rest,
-        &world.vault.vtxo.script_pubkey().to_hex_string(),
-        outcome.outpoint,
-    )
-    .await?;
-    if renewed.expires_at <= old_expires_at {
-        return Err(anyhow!("vault renewal did not extend the indexed expiry"));
-    }
-    eprintln!("woodland.sh rolled over the supply vault");
-    Ok(())
-}
-
 async fn renew_world(
     path: &Path,
-    rollover_keys: &Keys,
+    participant_keys: &Keys,
     services: &Services,
 ) -> Result<(usize, usize)> {
-    renew_expiring_trees(path, rollover_keys, services).await
-}
-
-/// Restock every depleted tree (LOG reserve is gone) from the supply vault.
-async fn restock_due_trees(path: &Path, keys: &Keys, services: &Services) -> Result<usize> {
-    let manifest = read_manifest(path)?;
-    let world = manifest.validate(&keys.secp, &services.params, &services.emulator)?;
-    let trees = wait_for_current_trees(&services.rest, &manifest, &world).await?;
-    let mut restocked = 0;
-    let mut failures = Vec::new();
-    for current in trees {
-        let logs = current.record.asset_amount(world.log_asset).unwrap_or(0);
-        if logs > 0 {
-            continue;
-        }
-        let tree_id = current.state.tree_id;
-        match restock_one_tree(keys, services, &world, &current).await {
-            Ok(()) => restocked += 1,
-            Err(error) => {
-                let message = format!("tree {tree_id} restock: {error:#}");
-                eprintln!("woodland.sh {message}");
-                failures.push(message);
-            }
-        }
-    }
-    if !failures.is_empty() {
-        return Err(anyhow!("tree restock failed: {}", failures.join("; ")));
-    }
-    Ok(restocked)
-}
-
-/// Restock one depleted tree by id, whether or not it is due elsewhere.
-async fn restock_tree(
-    path: &Path,
-    keys: &Keys,
-    services: &Services,
-    tree_id: u32,
-) -> Result<usize> {
-    let manifest = read_manifest(path)?;
-    let world = manifest.validate(&keys.secp, &services.params, &services.emulator)?;
-    let declared = world
-        .trees
-        .iter()
-        .find(|tree| tree.state.tree_id == tree_id)
-        .copied()
-        .ok_or_else(|| anyhow!("tree {tree_id} is not part of this world"))?;
-    let mut records = world
-        .load_tree_lineage_records(&services.rest, std::slice::from_ref(&declared))
-        .await?;
-    let record = records
-        .pop()
-        .ok_or_else(|| anyhow!("no live tree {tree_id} in this world"))?;
-    let previous_tx = services
-        .rest
-        .get_virtual_txs(&[record.outpoint.txid])
-        .await?
-        .remove(&record.outpoint.txid)
-        .ok_or_else(|| anyhow!("indexer omitted the tree's creating transaction"))?;
-    let health = tree::tree_health_from_tx(&previous_tx)?
-        .ok_or_else(|| anyhow!("tree transaction has no health packet"))?;
-    restock_one_tree(
-        keys,
-        services,
-        &world,
-        &CurrentTree {
-            state: declared.state,
-            health,
-            record,
-            previous_tx,
-        },
-    )
-    .await?;
-    Ok(1)
-}
-
-/// Atomically retire one depleted tree and replace it at the same coordinate
-/// with fresh reserve drawn from the supply vault.
-async fn restock_one_tree(
-    keys: &Keys,
-    services: &Services,
-    world: &crate::world::ValidatedWorld,
-    current: &CurrentTree,
-) -> Result<()> {
-    let logs = current.record.asset_amount(world.log_asset).unwrap_or(0);
-    let xp_balance = current.record.asset_amount(world.xp_asset).unwrap_or(0);
-    if logs > 0 || xp_balance > 0 {
-        return Err(anyhow!(
-            "tree {} is not depleted and cannot be restocked",
-            current.state.tree_id
-        ));
-    }
-    require_asset_amount(&current.record, world.tree_asset, 1, "tree marker")?;
-    if current.record.assets.len() != 1 {
-        return Err(anyhow!("depleted tree must carry only its TREE marker"));
-    }
-    if current.record.amount_sats != services.params.dust_sats {
-        return Err(anyhow!("depleted tree does not retain the fixed value"));
-    }
-    let vault_record = load_vault_record(&services.rest, world).await?;
-    let vault_previous_tx = services
-        .rest
-        .get_virtual_txs(&[vault_record.outpoint.txid])
-        .await?
-        .remove(&vault_record.outpoint.txid)
-        .ok_or_else(|| anyhow!("indexer omitted the vault's creating transaction"))?;
-
-    let tree_input = restock_vtxo_input(
-        &current.record,
-        &world.contract.vtxo,
-        &world.contract.retire_spend_script,
-    )?;
-    let vault_input = restock_vtxo_input(
-        &vault_record,
-        &world.vault.vtxo,
-        &world.vault.restock_spend_script,
-    )?;
-    let mut restock = build_offchain_transactions(
-        &[
-            SendReceiver::bitcoin(
-                world.contract.vtxo.to_ark_address(),
-                Amount::from_sat(services.params.dust_sats),
-            ),
-            SendReceiver::bitcoin(
-                world.vault.vtxo.to_ark_address(),
-                Amount::from_sat(services.params.dust_sats),
-            ),
-        ],
-        &txbuild::player_vtxo(keys, &services.params)?.to_ark_address(),
-        &[tree_input, vault_input],
-        &txbuild::server_info(&services.params),
-    )
-    .map_err(|error| anyhow!("build tree restock: {error}"))?;
-    if restock.ark_tx.unsigned_tx.output.len() != 3 {
-        return Err(anyhow!(
-            "restock builder produced an unexpected output count"
-        ));
-    }
-    let vault_logs = vault_record.asset_amount(world.log_asset).unwrap_or(0);
-    let vault_xp_balance = vault_record.asset_amount(world.xp_asset).unwrap_or(0);
-    if vault_logs < LOG_RESERVE_PER_TREE || vault_xp_balance < XP_PER_TREE {
-        return Err(anyhow!("the supply vault cannot fund this restock"));
-    }
-    ark_core::asset::packet::add_asset_packet_to_psbt(
-        &mut restock.ark_tx,
-        &Packet {
-            groups: vec![
-                transfer_group(
-                    world.tree_asset,
-                    vec![(crate::protocol::RESTOCK_TREE_INPUT_INDEX as u16, 1)],
-                    vec![(crate::protocol::RESTOCK_TREE_OUTPUT_INDEX, 1)],
-                ),
-                transfer_group(
-                    world.log_asset,
-                    vec![(
-                        crate::protocol::RESTOCK_VAULT_INPUT_INDEX as u16,
-                        vault_logs,
-                    )],
-                    vec![
-                        (
-                            crate::protocol::RESTOCK_TREE_OUTPUT_INDEX,
-                            LOG_RESERVE_PER_TREE,
-                        ),
-                        (
-                            crate::protocol::RESTOCK_VAULT_OUTPUT_INDEX,
-                            vault_logs - LOG_RESERVE_PER_TREE,
-                        ),
-                    ],
-                ),
-                transfer_group(
-                    world.xp_asset,
-                    vec![(
-                        crate::protocol::RESTOCK_VAULT_INPUT_INDEX as u16,
-                        vault_xp_balance,
-                    )],
-                    vec![
-                        (crate::protocol::RESTOCK_TREE_OUTPUT_INDEX, XP_PER_TREE),
-                        (
-                            crate::protocol::RESTOCK_VAULT_OUTPUT_INDEX,
-                            vault_xp_balance - XP_PER_TREE,
-                        ),
-                    ],
-                ),
-            ],
-        },
-    )
-    .map_err(|error| anyhow!("attach restock asset packet: {error}"))?;
-    tree::attach_restock_context(
-        &mut restock.ark_tx,
-        &restock.checkpoint_txs,
-        &world.contract,
-        &world.vault,
-        &current.previous_tx,
-        &vault_previous_tx,
-        current.state,
-    )?;
-    if restock.ark_tx.unsigned_tx.output.len() != crate::protocol::RESTOCK_OUTPUT_COUNT {
-        return Err(anyhow!("restock transaction has an invalid output count"));
-    }
-
-    let expected_ark = restock.ark_tx.clone();
-    let expected_checkpoints = restock.checkpoint_txs.clone();
-    let txid = expected_ark.unsigned_tx.compute_txid();
-    let (returned_ark, returned_checkpoints) = services
-        .emulator_rest
-        .submit_tx(&expected_ark, &expected_checkpoints)
-        .await
-        .context("submit tree restock to emulator")?;
-    verify_restock_response(
-        keys,
-        services,
-        world,
-        &expected_ark,
-        &expected_checkpoints,
-        &returned_ark,
-        returned_checkpoints,
-    )?;
-    let tree_record = wait_for_vtxo(
-        &services.rest,
-        &world.contract.vtxo.script_pubkey().to_hex_string(),
-        OutPoint {
-            txid,
-            vout: u32::from(crate::protocol::RESTOCK_TREE_OUTPUT_INDEX),
-        },
-    )
-    .await?;
-    require_asset_amount(&tree_record, world.tree_asset, 1, "tree marker")?;
-    require_asset_amount(
-        &tree_record,
-        world.log_asset,
-        LOG_RESERVE_PER_TREE,
-        "tree LOG",
-    )?;
-    require_asset_amount(&tree_record, world.xp_asset, XP_PER_TREE, "tree XP")?;
-    wait_for_vtxo(
-        &services.rest,
-        &world.vault.vtxo.script_pubkey().to_hex_string(),
-        OutPoint {
-            txid,
-            vout: u32::from(crate::protocol::RESTOCK_VAULT_OUTPUT_INDEX),
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Locate the sole live supply-vault record and require canonical holdings.
-async fn load_vault_record(
-    rest: &ArkadeRest,
-    world: &crate::world::ValidatedWorld,
-) -> Result<VtxoRecord> {
-    let script = world.vault.vtxo.script_pubkey().to_hex_string();
-    let records = rest.get_vtxos(&script, "spendableOnly").await?;
-    let candidates = records
-        .into_iter()
-        .filter(|record| {
-            !record.is_spent
-                && record.asset_amount(world.log_asset).is_some()
-                && record.asset_amount(world.xp_asset).is_some()
-        })
-        .collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [record] => Ok(record.clone()),
-        [] => Err(anyhow!("no live supply vault in this world")),
-        _ => Err(anyhow!("multiple live supply vault records")),
-    }
-}
-
-fn restock_vtxo_input(
-    record: &VtxoRecord,
-    vtxo: &ark_core::Vtxo,
-    spend_script: &bitcoin::ScriptBuf,
-) -> Result<VtxoInput> {
-    if record.script != vtxo.script_pubkey() {
-        return Err(anyhow!("restock input does not match the covenant script"));
-    }
-    let control_block = vtxo
-        .get_spend_info(spend_script.clone())
-        .map_err(|error| anyhow!("restock spend info: {error}"))?;
-    Ok(VtxoInput::new(
-        spend_script.clone(),
-        None,
-        control_block,
-        vtxo.tapscripts(),
-        vtxo.script_pubkey(),
-        Amount::from_sat(record.amount_sats),
-        record.outpoint,
-        record.assets.clone(),
-    ))
-}
-
-/// Verify the emulator returned the exact submitted restock with the
-/// {operator, tweaked-emulator} signature matrix on both covenant inputs.
-fn verify_restock_response(
-    keys: &Keys,
-    services: &Services,
-    world: &crate::world::ValidatedWorld,
-    expected_ark: &Psbt,
-    expected_checkpoints: &[Psbt],
-    returned_ark: &Psbt,
-    returned_checkpoints: Vec<Psbt>,
-) -> Result<()> {
-    if expected_ark.unsigned_tx != returned_ark.unsigned_tx
-        || expected_ark.inputs.len() != crate::protocol::RESTOCK_INPUT_COUNT
-        || returned_ark.inputs.len() != crate::protocol::RESTOCK_INPUT_COUNT
-        || expected_checkpoints.len() != returned_checkpoints.len()
-    {
-        return Err(anyhow!(
-            "emulator changed the submitted tree restock transaction"
-        ));
-    }
-    let tree_emulator = ark_script::compute_arkade_script_public_key(
-        &services.emulator.signer_pk,
-        &world.contract.retire_arkade_script,
-    )
-    .context("derive tree retire emulator signer")?;
-    let vault_emulator = ark_script::compute_arkade_script_public_key(
-        &services.emulator.signer_pk,
-        &world.vault.restock_arkade_script,
-    )
-    .context("derive vault restock emulator signer")?;
-    for (input_index, tweaked) in [
-        (crate::protocol::RESTOCK_TREE_INPUT_INDEX, tree_emulator),
-        (crate::protocol::RESTOCK_VAULT_INPUT_INDEX, vault_emulator),
-    ] {
-        crate::txbuild::verified_signature_for_key(
-            keys,
-            expected_ark,
-            returned_ark,
-            input_index,
-            services.params.signer_pk,
-            "operator",
-        )?;
-        crate::txbuild::verified_signature_for_key(
-            keys,
-            expected_ark,
-            returned_ark,
-            input_index,
-            tweaked,
-            "emulator",
-        )?;
-    }
-    for (input_index, checkpoint) in expected_checkpoints.iter().enumerate() {
-        if checkpoint.unsigned_tx != returned_checkpoints[input_index].unsigned_tx {
-            return Err(anyhow!("emulator changed a restock checkpoint"));
-        }
-    }
-    Ok(())
+    renew_expiring_trees(path, participant_keys, services).await
 }
 
 fn clean_funding_balance(records: &[VtxoRecord]) -> Result<u64> {
@@ -1927,28 +1486,6 @@ async fn wait_for_funding(rest: &ArkadeRest, script: &str, amount: u64) -> Resul
         tokio::time::sleep(std::time::Duration::from_millis(INDEX_POLL_MS)).await;
     }
     Err(anyhow!("world deployer has not received {amount} sats"))
-}
-
-async fn find_vtxo(
-    rest: &ArkadeRest,
-    script: &str,
-    outpoint: OutPoint,
-) -> Result<Option<VtxoRecord>> {
-    Ok(rest
-        .get_vtxos(script, "spendableOnly")
-        .await?
-        .into_iter()
-        .find(|record| record.outpoint == outpoint))
-}
-
-async fn wait_for_vtxo(rest: &ArkadeRest, script: &str, outpoint: OutPoint) -> Result<VtxoRecord> {
-    for _ in 0..INDEX_ATTEMPTS {
-        if let Some(record) = find_vtxo(rest, script, outpoint).await? {
-            return Ok(record);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(INDEX_POLL_MS)).await;
-    }
-    Err(anyhow!("indexer did not expose VTXO {outpoint}"))
 }
 
 async fn wait_for_exact_vtxo(rest: &ArkadeRest, outpoint: OutPoint) -> Result<VtxoRecord> {
@@ -2055,18 +1592,10 @@ fn read_manifest(path: &Path) -> Result<WorldManifest> {
     WorldManifest::from_json(&json)
 }
 
-fn require_rollover_key(keys: &Keys, world: &crate::world::ValidatedWorld) -> Result<()> {
-    if keys.owner_pk() != world.rollover_signer {
-        return Err(anyhow!(
-            "the configured key is not this world's rollover signer"
-        ));
-    }
-    Ok(())
-}
-
-/// Sign, emulator-approve, and batch-settle one exact-self-send rollover.
+/// Emulator-approve and batch-settle one permissionless tree self-send. The
+/// caller key contributes only the ephemeral batch cosigner.
 async fn run_one_renewal(
-    rollover_keys: &Keys,
+    participant_keys: &Keys,
     services: &Services,
     world: &crate::world::ValidatedWorld,
     prepared: crate::renewal::RenewalIntent,
@@ -2081,7 +1610,7 @@ async fn run_one_renewal(
     .await?;
     batch_services
         .settle_renewal(
-            rollover_keys,
+            participant_keys,
             services.emulator.signer_pk,
             prepared,
             previous_tx,
@@ -2119,20 +1648,27 @@ fn renewal_expiry_margin_secs() -> i64 {
     }
 }
 
-fn require_rollover_due(record: &VtxoRecord) -> Result<()> {
-    if force_rollover_enabled() {
+fn require_rollover_due(
+    record: &VtxoRecord,
+    health: tree::TreeHealth,
+    stump_height: tree::TreeStumpHeight,
+    logs: u64,
+    block_height: u32,
+) -> Result<()> {
+    if force_rollover_enabled()
+        || tree_rollover_due(
+            record.expires_at,
+            health.value(),
+            stump_height.value(),
+            logs,
+            block_height,
+            crate::arkade::now_unix(),
+            record.rollover_margin_seconds(),
+        )
+    {
         return Ok(());
     }
-    let remaining = record
-        .expires_in(crate::arkade::now_unix())
-        .ok_or_else(|| anyhow!("rollover input has no indexed expiry"))?;
-    let margin = record.rollover_margin_seconds();
-    if remaining >= margin {
-        return Err(anyhow!(
-            "rollover is not due: {remaining}s remain, margin is {margin}s"
-        ));
-    }
-    Ok(())
+    Err(anyhow!("tree renewal or regrowth is not due"))
 }
 
 /// Result of one settled tree renewal, for CLI reporting.
@@ -2148,11 +1684,12 @@ struct RenewedTree {
 /// Prepare, settle, and verify one exact-self-send tree renewal from an
 /// already-validated live tree record and its creating transaction.
 async fn renew_current_tree(
-    rollover_keys: &Keys,
+    participant_keys: &Keys,
     services: &Services,
     world: &crate::world::ValidatedWorld,
     record: &VtxoRecord,
     previous_tx: &bitcoin::Transaction,
+    block_height: u32,
 ) -> Result<RenewedTree> {
     let tree_id = crate::renewal::tree_state_from_tx(previous_tx)?
         .map(|state| state.tree_id)
@@ -2167,9 +1704,10 @@ async fn renew_current_tree(
         world.log_asset,
         world.xp_asset,
         services.params.dust_sats,
+        block_height,
         renewal_expiry_margin_secs(),
     )?;
-    let outcome = run_one_renewal(rollover_keys, services, world, prepared, previous_tx).await?;
+    let outcome = run_one_renewal(participant_keys, services, world, prepared, previous_tx).await?;
     let renewed = wait_for_record(&services.rest, &tree_script, outcome.outpoint).await?;
     require_new_expiry(old_expires_at, renewed.expires_at, renewed.outpoint)?;
     Ok(RenewedTree {
@@ -2184,13 +1722,12 @@ async fn renew_current_tree(
 
 async fn renew_tree(
     path: &Path,
-    rollover_keys: &Keys,
+    participant_keys: &Keys,
     services: &Services,
     tree_id: u32,
 ) -> Result<()> {
     let manifest = read_manifest(path)?;
-    let world = manifest.validate(&rollover_keys.secp, &services.params, &services.emulator)?;
-    require_rollover_key(rollover_keys, &world)?;
+    let world = manifest.validate(&participant_keys.secp, &services.params, &services.emulator)?;
     let declared = world
         .trees
         .iter()
@@ -2212,9 +1749,31 @@ async fn renew_tree(
     {
         return Err(anyhow!("live tree {tree_id} has the wrong identity"));
     }
-    require_rollover_due(&record)?;
-    let renewed =
-        renew_current_tree(rollover_keys, services, &world, &record, &previous_tx).await?;
+    let health = tree::tree_health_from_tx(&previous_tx)?
+        .ok_or_else(|| anyhow!("tree transaction has no health packet"))?;
+    let stump_height = tree::tree_stump_height_from_tx(&previous_tx)?
+        .ok_or_else(|| anyhow!("tree transaction has no stump height packet"))?;
+    let block_tip = services
+        .emulator_rest
+        .get_block_tip()
+        .await
+        .context("read attested Bitcoin tip for tree renewal")?;
+    require_rollover_due(
+        &record,
+        health,
+        stump_height,
+        record.asset_amount(world.log_asset).unwrap_or(0),
+        block_tip.height,
+    )?;
+    let renewed = renew_current_tree(
+        participant_keys,
+        services,
+        &world,
+        &record,
+        &previous_tx,
+        block_tip.height,
+    )
+    .await?;
     println!(
         "{}",
         serde_json::json!({
@@ -2384,7 +1943,7 @@ mod tests {
         assert!(validate_service_urls(
             bitcoin::Network::Signet,
             "http://127.0.0.1:7070",
-            "http://127.0.0.1:7073",
+            "http://127.0.0.1:7074",
         )
         .is_ok());
         for (arkade, emulator) in [
@@ -2490,6 +2049,7 @@ mod tests {
                 y: 0,
             },
             health: tree::TreeHealth::new(5).unwrap(),
+            stump_height: tree::TreeStumpHeight::new(0).unwrap(),
             record: VtxoRecord {
                 outpoint: OutPoint {
                     txid: Txid::from_str(&format!("{:064x}", tree_id)).unwrap(),
@@ -2517,20 +2077,19 @@ mod tests {
     }
 
     #[test]
-    fn rollover_selection_renews_due_trees_and_stumps_immediately() {
+    fn rollover_selection_obeys_expiry_and_two_block_regrowth_gate() {
         let now = 10_000;
         let due = Some(now + 99);
         let far = Some(now + 100);
-        assert!(tree_rollover_due(due, 5, 10, 10, now, 100));
-        assert!(tree_rollover_due(due, 0, 0, 0, now, 100));
-        // A stump with reserve left renews immediately so renewal can refill
-        // its health; a healthy tree waits for the expiry margin.
-        assert!(tree_rollover_due(far, 0, 5, 5, now, 100));
-        assert!(tree_rollover_due(due, 0, 5, 5, now, 100));
-        assert!(!tree_rollover_due(far, 5, 10, 10, now, 100));
-        // A missing expiry is never "due"; partition_rollover_candidates
-        // surfaces it as an anomaly instead of a candidate.
-        assert!(!tree_rollover_due(None, 5, 10, 10, now, 100));
+        assert!(tree_rollover_due(due, 5, 0, 10, 100, now, 100));
+        assert!(tree_rollover_due(due, 0, 100, 0, 100, now, 100));
+        // A funded stump cannot renew at the first observed tip advance.
+        assert!(!tree_rollover_due(far, 0, 100, 5, 101, now, 100));
+        assert!(!tree_rollover_due(due, 0, 100, 5, 101, now, 100));
+        assert!(tree_rollover_due(far, 0, 100, 5, 102, now, 100));
+        assert!(!tree_rollover_due(far, 5, 0, 10, 102, now, 100));
+        // A missing expiry is never due; the partitioner surfaces it.
+        assert!(!tree_rollover_due(None, 5, 0, 10, 102, now, 100));
         assert_eq!(
             plan_path(Path::new("/tmp/mutinynet-season-1.json")),
             PathBuf::from("/tmp/mutinynet-season-1-plan.json")
@@ -2549,7 +2108,7 @@ mod tests {
         let missing = current_tree(3, None);
         let missing_outpoint = missing.record.outpoint;
         let (candidates, missing_expiry) =
-            partition_rollover_candidates(vec![far, due, missing], asset(4), asset(5), now);
+            partition_rollover_candidates(vec![far, due, missing], asset(4), now, 100);
         let candidate_ids = candidates
             .iter()
             .map(|(_, current)| current.state.tree_id)

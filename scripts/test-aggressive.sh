@@ -10,6 +10,6 @@ if ! flock -n 9; then
 fi
 export WOODLAND_RELEASE_SOAK_LOCKED=1
 export WOODLAND_OVERNIGHT_HOURS="${WOODLAND_OVERNIGHT_HOURS:-4}"
-export WOODLAND_OVERNIGHT_PLAN="${WOODLAND_OVERNIGHT_PLAN:-full,burst,chaos,fanout,reload,renewal,restock}"
+export WOODLAND_OVERNIGHT_PLAN="${WOODLAND_OVERNIGHT_PLAN:-full,burst,chaos,fanout,reload,renewal,regrowth}"
 export WOODLAND_OVERNIGHT_COOLDOWN_SECONDS="${WOODLAND_OVERNIGHT_COOLDOWN_SECONDS:-5}"
 exec node "$ROOT/scripts/e2e-overnight.mjs"

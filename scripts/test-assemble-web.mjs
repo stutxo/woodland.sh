@@ -10,8 +10,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'woodland-web-test-'));
 const assembler = path.join(ROOT, 'scripts/assemble-web.mjs');
 const base = {
-  schemaVersion: 1,
-  protocolVersion: 1,
+  schemaVersion: 2,
+  protocolVersion: 2,
   gameId: 'woodland.sh',
   network: 'signet',
   arkadeServiceUrl: 'https://arkade.example',
@@ -96,10 +96,10 @@ try {
   assert.match(insecureServer.stderr, /must be a canonical HTTPS origin on mainnet/);
 
   const wrongProtocol = path.join(temporary, 'wrong-protocol.json');
-  await writeFile(wrongProtocol, JSON.stringify({ ...base, protocolVersion: 2 }));
+  await writeFile(wrongProtocol, JSON.stringify({ ...base, protocolVersion: 1 }));
   const wrong = run(wrongProtocol, path.join(temporary, 'wrong'));
   assert.notEqual(wrong.status, 0);
-  assert.match(wrong.stderr, /requires a woodland\.sh protocol v1 schema 1 manifest/);
+  assert.match(wrong.stderr, /requires a woodland\.sh protocol v2 schema 2 manifest/);
 
   console.log('GitHub Pages artifact tests passed');
 } finally {

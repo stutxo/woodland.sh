@@ -268,6 +268,12 @@ pub struct EmulatorParams {
     pub version: String,
     pub signer_pk: XOnlyPublicKey,
 }
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BlockTip {
+    pub height: u32,
+    pub block_hash: bitcoin::BlockHash,
+}
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 struct InfoResponse {
@@ -1479,6 +1485,17 @@ impl EmulatorRest {
             version: info.version.unwrap_or_else(|| "unknown".to_string()),
             signer_pk: signer.inner.x_only_public_key().0,
         })
+    }
+    pub async fn get_block_tip(&self) -> Result<BlockTip> {
+        let text = fetch_text(
+            &self.client,
+            "GET",
+            &format!("{}/v1/block-tip", self.base),
+            None,
+            FetchCache::NoStore,
+        )
+        .await?;
+        serde_json::from_str(&text).context("parse emulator gate block tip")
     }
 
     /// Execute the Arkade scripts in an unsigned intent proof and return the

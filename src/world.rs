@@ -14,17 +14,16 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 pub(crate) const GAME_ID: &str = "woodland.sh";
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
-/// Initial manifest schema for player luck, reachable XP, permissionless tree
-/// lifecycle, and the fixed-supply restock vault.
-pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
+/// No-vault world: all fixed-supply assets live on 420 recursive trees and
+/// stumps regrow only after two emulator-attested Bitcoin tip advances.
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub(crate) const PROTOCOL_DUST_SATS: u64 = 330;
-pub(crate) const ACTIVE_LOGS_PER_TREE: u64 = 5;
-pub(crate) const LOG_RESERVE_PER_TREE: u64 = 1_000;
-pub(crate) const XP_PER_TREE: u64 = 1_000;
-pub(crate) const TREE_COUNT: usize = 2_100;
-/// Fixed total LOG and XP supply: 2.1M on initial trees, the rest in the
-/// supply vault until restocks draw it down.
+pub(crate) const ACTIVE_LOGS_PER_TREE: u64 = 10;
+pub(crate) const LOG_RESERVE_PER_TREE: u64 = 50_000;
+pub(crate) const XP_PER_TREE: u64 = 50_000;
+pub(crate) const TREE_COUNT: usize = 420;
+/// Fixed LOG and XP supply, distributed completely across the initial trees.
 pub(crate) const LOG_SUPPLY: u64 = 21_000_000;
 pub(crate) const XP_SUPPLY: u64 = 21_000_000;
 pub(crate) const MAP_WIDTH: u16 = 425;
@@ -164,10 +163,6 @@ pub struct WorldManifest {
     pub tree_script: String,
     pub tree_chop_arkade_script: String,
     pub tree_renewal_arkade_script: String,
-    pub tree_retire_arkade_script: String,
-    pub vault_script: String,
-    pub vault_restock_arkade_script: String,
-    pub vault_renewal_arkade_script: String,
     pub genesis_txid: String,
     pub trees: Vec<ManifestTree>,
 }
@@ -201,7 +196,6 @@ pub struct ValidatedWorld {
     pub pins: WorldPins,
     pub rollover_signer: bitcoin::XOnlyPublicKey,
     pub contract: TreeContract,
-    pub vault: crate::vault::VaultContract,
 }
 
 impl WorldManifest {
@@ -217,7 +211,6 @@ impl WorldManifest {
         log_asset: AssetId,
         xp_asset: AssetId,
         contract: &TreeContract,
-        vault: &crate::vault::VaultContract,
         genesis_txid: Txid,
         deployments: &[(TreeState, Txid)],
     ) -> Self {
@@ -254,10 +247,6 @@ impl WorldManifest {
             tree_script: contract.vtxo.script_pubkey().to_hex_string(),
             tree_chop_arkade_script: contract.chop_arkade_script.to_hex_string(),
             tree_renewal_arkade_script: contract.renewal_arkade_script.to_hex_string(),
-            tree_retire_arkade_script: contract.retire_arkade_script.to_hex_string(),
-            vault_script: vault.vtxo.script_pubkey().to_hex_string(),
-            vault_restock_arkade_script: vault.restock_arkade_script.to_hex_string(),
-            vault_renewal_arkade_script: vault.renewal_arkade_script.to_hex_string(),
             genesis_txid: genesis_txid.to_string(),
             trees: deployments
                 .iter()
@@ -425,31 +414,11 @@ impl WorldManifest {
             tree_asset,
             log_asset,
             xp_asset,
-            LOG_RESERVE_PER_TREE,
-            XP_PER_TREE,
-            params.dust_sats,
-        )?;
-        let vault = crate::vault::build_vault_contract(
-            secp,
-            params.signer_pk,
-            emulator.signer_pk,
-            params.unilateral_exit_delay,
-            params.network,
-            tree_asset,
-            log_asset,
-            xp_asset,
-            &contract.vtxo.script_pubkey(),
-            LOG_RESERVE_PER_TREE,
-            XP_PER_TREE,
             params.dust_sats,
         )?;
         if self.tree_script != contract.vtxo.script_pubkey().to_hex_string()
             || self.tree_chop_arkade_script != contract.chop_arkade_script.to_hex_string()
             || self.tree_renewal_arkade_script != contract.renewal_arkade_script.to_hex_string()
-            || self.tree_retire_arkade_script != contract.retire_arkade_script.to_hex_string()
-            || self.vault_script != vault.vtxo.script_pubkey().to_hex_string()
-            || self.vault_restock_arkade_script != vault.restock_arkade_script.to_hex_string()
-            || self.vault_renewal_arkade_script != vault.renewal_arkade_script.to_hex_string()
         {
             return Err(anyhow!("world manifest covenant script mismatch"));
         }
@@ -463,7 +432,6 @@ impl WorldManifest {
             pins: self.pins(params.network)?,
             rollover_signer,
             contract,
-            vault,
         })
     }
 }
@@ -668,23 +636,6 @@ mod tests {
             tree_asset,
             log_asset,
             xp_asset,
-            LOG_RESERVE_PER_TREE,
-            XP_PER_TREE,
-            params.dust_sats,
-        )
-        .unwrap();
-        let vault = crate::vault::build_vault_contract(
-            &secp,
-            operator,
-            emulator,
-            params.unilateral_exit_delay,
-            params.network,
-            tree_asset,
-            log_asset,
-            xp_asset,
-            &contract.vtxo.script_pubkey(),
-            LOG_RESERVE_PER_TREE,
-            XP_PER_TREE,
             params.dust_sats,
         )
         .unwrap();
@@ -701,13 +652,12 @@ mod tests {
             &params,
             &emulator_params,
             "http://127.0.0.1:7070",
-            "http://127.0.0.1:7073",
+            "http://127.0.0.1:7074",
             rollover,
             tree_asset,
             log_asset,
             xp_asset,
             &contract,
-            &vault,
             genesis_txid,
             &deployments,
         );
@@ -726,7 +676,7 @@ mod tests {
         assert_eq!(world.trees[0].state, tree_states()[0]);
         assert_eq!(world.xp_asset.to_string(), parsed.xp_asset);
         assert_eq!(parsed.arkade_service_url, "http://127.0.0.1:7070");
-        assert_eq!(parsed.emulator_url, "http://127.0.0.1:7073");
+        assert_eq!(parsed.emulator_url, "http://127.0.0.1:7074");
         assert_eq!(parsed.game_id, GAME_ID);
         assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
         assert_eq!(parsed.player_level_curve, crate::player::PLAYER_LEVEL_CURVE);
@@ -748,12 +698,12 @@ mod tests {
             crate::player::INITIAL_LUCK_CREDIT
         );
         assert_eq!(
-            world.contract.retire_arkade_script.to_hex_string(),
-            parsed.tree_retire_arkade_script
+            world.contract.chop_arkade_script.to_hex_string(),
+            parsed.tree_chop_arkade_script
         );
         assert_eq!(
-            world.vault.restock_arkade_script.to_hex_string(),
-            parsed.vault_restock_arkade_script
+            world.contract.renewal_arkade_script.to_hex_string(),
+            parsed.tree_renewal_arkade_script
         );
     }
 
@@ -778,13 +728,9 @@ mod tests {
     fn manifest_rejects_changed_tree_leaf_commitments() {
         let (secp, params, emulator, manifest) = fixture();
 
-        let mut retire = manifest.clone();
-        retire.tree_retire_arkade_script.push_str("00");
-        assert!(retire.validate(&secp, &params, &emulator).is_err());
-
-        let mut vault = manifest.clone();
-        vault.vault_restock_arkade_script.push_str("00");
-        assert!(vault.validate(&secp, &params, &emulator).is_err());
+        let mut renewal = manifest.clone();
+        renewal.tree_renewal_arkade_script.push_str("00");
+        assert!(renewal.validate(&secp, &params, &emulator).is_err());
 
         let mut chop = manifest;
         chop.tree_chop_arkade_script.push_str("00");
@@ -832,7 +778,6 @@ mod tests {
             |manifest: &mut WorldManifest| manifest.max_player_level += 1,
             |manifest: &mut WorldManifest| manifest.log_reserve_per_tree += 1,
             |manifest: &mut WorldManifest| manifest.xp_per_tree += 1,
-            |manifest: &mut WorldManifest| manifest.vault_script.push('0'),
         ] {
             let mut changed = manifest.clone();
             mutate(&mut changed);

@@ -15,7 +15,7 @@ on:
           - smoke
           - full
           - soak
-          - restock
+          - regrowth
         default: smoke
 
 concurrency:

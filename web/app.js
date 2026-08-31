@@ -6,11 +6,11 @@ const SERVER_URL = SERVER_SETTING === 'self'
   ? location.origin
   : SERVER_SETTING.replace(/\/+$/, '');
 const STORAGE_SCOPE = location.origin;
-const KEY = `woodland.sh:web:v1:key:${STORAGE_SCOPE}`;
-const PROFILE = `woodland.sh:web:v1:profile:${STORAGE_SCOPE}`;
+const KEY = `woodland.sh:web:v2:key:${STORAGE_SCOPE}`;
+const PROFILE = `woodland.sh:web:v2:profile:${STORAGE_SCOPE}`;
 let profileStorageKey = PROFILE;
-let pendingStorageKey = `woodland.sh:web:v1:pending:${STORAGE_SCOPE}`;
-const POSITION = `woodland.sh:web:v1:position:${STORAGE_SCOPE}`;
+let pendingStorageKey = `woodland.sh:web:v2:pending:${STORAGE_SCOPE}`;
+const POSITION = `woodland.sh:web:v2:position:${STORAGE_SCOPE}`;
 const PLAYER_BACKUP_FORMAT = 'woodland.sh/player-backup';
 const PLAYER_BACKUP_VERSION = 1;
 const MAX_PLAYER_BACKUP_BYTES = 64 * 1024;
@@ -545,24 +545,34 @@ async function walkTo(targets, treeId = null) {
 
 async function handleMapPosition(x, y) {
   if (!state || !isMapCoordinate(x, y)) return;
-  if (!state.playerActive) {
-    status.textContent = 'Create a player before moving.';
-    return;
-  }
   if (chopping) {
     attemptChop();
     return;
   }
   if (busy) return;
   const tree = worldTrees().find((candidate) => candidate.x === x && candidate.y === y);
-  if (tree) {
+  if (tree?.health === 0) {
     focusedTreeId = tree.treeId;
-    lockedTreeId = tree.health > 0 ? tree.treeId : null;
-    if (tree.health === 0) {
-      status.textContent = `Tree #${tree.treeId} is a stump.`;
+    lockedTreeId = null;
+    if (tree.depleted) {
+      status.textContent = `Tree #${tree.treeId} has exhausted its local reserve.`;
       render();
       return;
     }
+    run(
+      `Submitting permissionless regrowth for tree #${tree.treeId}...`,
+      () => withApp(() => app.regrow(tree.treeId)),
+      () => `Tree #${tree.treeId} regrew with ${worldManifest.activeLogsPerTree} health.`,
+    );
+    return;
+  }
+  if (!state.playerActive) {
+    status.textContent = 'Create a player before moving.';
+    return;
+  }
+  if (tree) {
+    focusedTreeId = tree.treeId;
+    lockedTreeId = tree.treeId;
     const destinations = DIRECTIONS
       .map(([dx, dy]) => ({ x: tree.x + dx, y: tree.y + dy }))
       .filter((position) => (
@@ -732,13 +742,13 @@ function updateMapHint(adjacent) {
   else if (state.pendingChopTxid) {
     mapHint.textContent = `Recovering submitted swing ${state.pendingChopTxid.slice(0, 12)}...`;
   }
-  else if (!state.playerActive) mapHint.textContent = 'Fund and activate the player.';
-  else if (!state.fundingReady) mapHint.textContent = 'Player state is reconciling.';
   else if (adjacent?.health === 0) {
     mapHint.textContent = adjacent.depleted
-      ? `Tree #${adjacent.treeId} is depleted until the vault restocks it.`
-      : `Tree #${adjacent.treeId} is a stump; it refills on its next batch renewal.`;
+      ? `Tree #${adjacent.treeId} has exhausted its local reserve.`
+      : `Tree #${adjacent.treeId} can regrow at Bitcoin height ${adjacent.regrowAtHeight}; click it to try.`;
   }
+  else if (!state.playerActive) mapHint.textContent = 'Fund and activate the player.';
+  else if (!state.fundingReady) mapHint.textContent = 'Player state is reconciling.';
   else if (adjacent) {
     mapHint.textContent = `In range of tree #${adjacent.treeId}. Click the tree to chop until LOG.`;
   }
@@ -1001,7 +1011,9 @@ function render() {
   details.hidden = !tree;
   if (tree) {
     element('tree-id').textContent = `#${tree.treeId} at (${tree.x}, ${tree.y})`;
-    element('tree-health').textContent = tree.health === 0 ? 'stump' : `${tree.health} active`;
+    element('tree-health').textContent = tree.health === 0
+      ? (tree.depleted ? 'exhausted stump' : `stump; regrow at height ${tree.regrowAtHeight}`)
+      : `${tree.health} active`;
     element('tree-reserve').textContent = `${tree.logReserveRemaining} LOG`;
     element('tree-xp').textContent = `${tree.xpRemaining} XP`;
     element('player-asset').textContent = state.playerAsset || 'not issued';
@@ -1447,6 +1459,8 @@ async function boot() {
       x: tree.x,
       y: tree.y,
       health: manifest.activeLogsPerTree,
+      stumpHeight: 0,
+      regrowAtHeight: null,
       logReserveRemaining: manifest.logReservePerTree,
       xpRemaining: manifest.xpPerTree,
       valueSats: manifest.dustSats,
@@ -1459,7 +1473,7 @@ async function boot() {
       depleted: false,
     }));
     profileStorageKey = `${PROFILE}:${manifest.genesisTxid}`;
-    pendingStorageKey = `woodland.sh:web:v1:pending:${manifest.arkadeServiceUrl.replace(/\/+$/, '')}:${manifest.genesisTxid}`;
+    pendingStorageKey = `woodland.sh:web:v2:pending:${manifest.arkadeServiceUrl.replace(/\/+$/, '')}:${manifest.genesisTxid}`;
     const storedProfile = localStorage.getItem(profileStorageKey);
     app = await WoodlandApp.init(
       manifest.arkadeServiceUrl,
@@ -1490,7 +1504,9 @@ async function boot() {
     appendLog('Connected to woodland.sh');
     globalThis.__WOODLAND_E2E_READY = true;
     globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT = (minX, minY, maxX, maxY) => {
-      treeViewportOverride = { minX, minY, maxX, maxY };
+      treeViewportOverride = [minX, minY, maxX, maxY].every(Number.isInteger)
+        ? { minX, minY, maxX, maxY }
+        : null;
     };
     globalThis.__WOODLAND_E2E_SUBMISSION_RECOVERY = async (treeId) => {
       adoptState(await withApp(() => app.testSubmissionRecovery(treeId)));
@@ -1510,6 +1526,11 @@ async function boot() {
     globalThis.__WOODLAND_E2E_CLICK_TREE = (treeId) => {
       const tree = worldTrees().find((candidate) => candidate.treeId === Number(treeId));
       if (tree) void handleMapPosition(tree.x, tree.y);
+    };
+    globalThis.__WOODLAND_E2E_REGROW = async (treeId) => {
+      adoptState(await withApp(() => app.regrow(Number(treeId))));
+      render();
+      return state;
     };
     globalThis.__WOODLAND_E2E_INVALID_XP = async (treeId) => {
       await withApp(() => app.testInvalidXpTransition(treeId));

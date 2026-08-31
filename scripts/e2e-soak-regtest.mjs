@@ -77,8 +77,8 @@ if (
   throw new Error('forced tree renewal requires one tree per round');
 }
 const SOAK_VIEWPORT_MAX = 64;
-// Total issued supplies: the on-tree reserve plus the supply vault's
-// undistributed balance, both created at genesis.
+// All fixed LOG and XP supply is issued into the 420 tree-local reserves at
+// genesis.
 const INDEXED_LOG_SUPPLY = 21_000_000;
 const INDEXED_XP_SUPPLY = 21_000_000;
 let expectedLogSupply = 0;
@@ -243,7 +243,7 @@ function assertTreeRenewal(beforeTree, afterTree, label) {
     `${label}: balances or identity changed`,
   );
   const expectedHealth = beforeTree.health === 0 && beforeTree.logReserveRemaining > 0
-    ? 5
+    ? 10
     : beforeTree.health;
   assert.equal(afterTree.health, expectedHealth, `${label}: health changed unexpectedly`);
   assert.equal(afterTree.lastAttemptTxid ?? null, null, `${label}: retained a chop transaction`);
@@ -805,7 +805,7 @@ try {
       await configureChaos(chaosKind, 1);
       console.log(`soak round ${round}: successful emulator response will be masked`);
     }
-    const results = await mapLimit(players, RACE_CONCURRENCY, (player, index) => {
+    let results = await mapLimit(players, RACE_CONCURRENCY, (player, index) => {
       const playerTree = views[index].state.trees.find(
         (tree) => tree.treeId === assignedTreeIds[index],
       );
@@ -859,6 +859,23 @@ try {
         `soak round ${round}: chaos recovered ${recovery.initialPending} pending chop(s) `
           + `with ${recovery.resumeCalls} resume call(s)`,
       );
+      if (chaosKind === 'fail-before') {
+        const postRecovery = await refreshUntilConverged(players, `round ${round} post-recovery`);
+        views = postRecovery.views;
+        convergenceRetries += postRecovery.retries;
+        const recoveredTree = views[0].state.trees.find(
+          (tree) => tree.treeId === targetTrees[0].treeId,
+        );
+        if (recoveredTree.treeOutpoint === targetTrees[0].treeOutpoint) {
+          results = await mapLimit(players, RACE_CONCURRENCY, (player, index) => {
+            const playerTree = views[index].state.trees.find(
+              (tree) => tree.treeId === assignedTreeIds[index],
+            );
+            return player.race(views[index].state, playerTree);
+          });
+          console.log(`soak round ${round}: rebuilt stale block-bound attempts`);
+        }
+      }
     }
     if (
       FORCE_POST_CHOP_RENEWAL_ROUND === round

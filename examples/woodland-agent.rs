@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
                         + u32::from(tree.state.y.abs_diff(position.y))
                 });
                 let Some(nearest) = trees.first() else {
-                    println!("no active trees; waiting for renewal or restock");
+                    println!("no active trees; waiting for renewal or regrowth");
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     continue;
                 };

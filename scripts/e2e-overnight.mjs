@@ -106,8 +106,8 @@ const PROFILE_CONFIGS = Object.freeze({
       WOODLAND_SOAK_RELOAD_COUNT: '4',
     },
   },
-  restock: {
-    runner: 'restock',
+  regrowth: {
+    runner: 'regrowth',
     environment: {},
   },
 });
@@ -120,11 +120,11 @@ const RELEASE_PLAN = Object.freeze([
   'fanout',
   'reload',
   'renewal',
-  'restock',
+  'regrowth',
 ]);
 const EXPECTED_WORLD = Object.freeze({
-  schemaVersion: 1,
-  protocolVersion: 1,
+  schemaVersion: 2,
+  protocolVersion: 2,
   network: 'regtest',
   gameId: 'woodland.sh',
   playerLevelCurve: 'woodland-xp-v1',
@@ -136,10 +136,10 @@ const EXPECTED_WORLD = Object.freeze({
   luckWindowBasisPoints: 10_000,
   initialLuckCredit: 8_000,
   dustSats: 330,
-  activeLogsPerTree: 5,
-  logReservePerTree: 1_000,
-  xpPerTree: 1_000,
-  treeCount: 2_100,
+  activeLogsPerTree: 10,
+  logReservePerTree: 50_000,
+  xpPerTree: 50_000,
+  treeCount: 420,
 });
 const PLAN = (process.env.WOODLAND_OVERNIGHT_PLAN || RELEASE_PLAN.join(','))
   .split(',')
@@ -292,8 +292,8 @@ async function cycleArtifactErrors(profileConfig, paths, reports) {
       );
     }
   }
-  if (profileConfig.runner === 'restock' && !reports.restock) {
-    errors.push('restock report is missing');
+  if (profileConfig.runner === 'regrowth' && !reports.regrowth) {
+    errors.push('regrowth report is missing');
   }
   return errors;
 }
@@ -303,13 +303,13 @@ async function runCycle(cycle, profile) {
   const cycleDir = path.join(outputRoot, cycleName);
   const logPath = path.join(cycleDir, 'cycle.log');
   const soakReport = path.join(cycleDir, 'soak-report.json');
-  const restockReport = path.join(cycleDir, 'restock-report.json');
+  const regrowthReport = path.join(cycleDir, 'regrowth-report.json');
   const junitReport = path.join(cycleDir, 'e2e-junit.xml');
   const paths = {
     cycleDir,
     log: logPath,
     soak: soakReport,
-    restock: restockReport,
+    regrowth: regrowthReport,
     junit: junitReport,
     world: path.join(cycleDir, 'world.json'),
   };
@@ -337,7 +337,7 @@ async function runCycle(cycle, profile) {
       WOODLAND_E2E_ARTIFACT_DIR: cycleDir,
       WOODLAND_E2E_JUNIT: junitReport,
       WOODLAND_SOAK_REPORT: soakReport,
-      WOODLAND_RESTOCK_REPORT: restockReport,
+      WOODLAND_REGROWTH_REPORT: regrowthReport,
       ...baseSoakEnvironment,
       ...profileConfig.environment,
     },
@@ -356,12 +356,12 @@ async function runCycle(cycle, profile) {
   });
   activeChild = null;
   await new Promise((resolve) => log.end(resolve));
-  const [manifest, soak, restock] = await Promise.all([
+  const [manifest, soak, regrowth] = await Promise.all([
     readJson(paths.world),
     readJson(paths.soak),
-    readJson(paths.restock),
+    readJson(paths.regrowth),
   ]);
-  const reports = { manifest, soak, restock };
+  const reports = { manifest, soak, regrowth };
   const artifactErrors = outcome.code === 0
     ? await cycleArtifactErrors(profileConfig, paths, reports)
     : [];
@@ -385,7 +385,7 @@ async function runCycle(cycle, profile) {
       junit: path.relative(ROOT, paths.junit),
       worldManifest: path.relative(ROOT, paths.world),
       soakReport: soak ? path.relative(ROOT, paths.soak) : null,
-      restockReport: restock ? path.relative(ROOT, paths.restock) : null,
+      regrowthReport: regrowth ? path.relative(ROOT, paths.regrowth) : null,
     },
   };
 }

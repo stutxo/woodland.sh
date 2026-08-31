@@ -206,23 +206,54 @@ async function assertSubmissionRecovery(player, view, treeId) {
     const done = arguments[arguments.length - 1];
     globalThis.__WOODLAND_E2E_SUBMISSION_RECOVERY(arguments[0])
       .then((state) => done({ state }))
-      .catch((error) => done({ error: String(error) }));
+      .catch(async (failure) => {
+        try {
+          const state = await globalThis.__WOODLAND_E2E_REFRESH();
+          done({ failure: String(failure), state });
+        } catch (refreshFailure) {
+          done({ failure: String(failure), refreshFailure: String(refreshFailure) });
+        }
+      });
   `, [treeId]);
-  assert.equal(result.error, undefined, result.error);
+  assert.equal(result.refreshFailure, undefined, result.refreshFailure);
   assert.equal(result.state.pendingChopTxid ?? null, null);
-  assert.notEqual(result.state.playerStateOutpoint, view.state.playerStateOutpoint);
-  assert.notEqual(
-    result.state.trees.find((tree) => tree.treeId === treeId).treeOutpoint,
-    beforeTree.treeOutpoint,
+  if (!result.failure) {
+    assert.notEqual(result.state.playerStateOutpoint, view.state.playerStateOutpoint);
+    assert.notEqual(
+      result.state.trees.find((tree) => tree.treeId === treeId).treeOutpoint,
+      beforeTree.treeOutpoint,
+    );
+    return result.state;
+  }
+
+  assert.match(
+    result.failure,
+    /chop conflicted while recovering from submission failure/,
+    result.failure,
   );
-  return result.state;
+  assert.equal(result.state.playerStateOutpoint, view.state.playerStateOutpoint);
+  const refreshedTree = result.state.trees.find((tree) => tree.treeId === treeId);
+  assert.equal(refreshedTree.treeOutpoint, beforeTree.treeOutpoint);
+  const retry = await player.chopExpected(result.state, refreshedTree);
+  assert.equal(retry.ok, true, retry.message);
+  const recovered = await waitFor(
+    `fresh swing after stale pending recovery (${player.label})`,
+    player.inspect,
+    (next) => !next.busy
+      && next.state?.pendingChopTxid == null
+      && next.state.playerStateOutpoint !== view.state.playerStateOutpoint
+      && next.state.trees.find((tree) => tree.treeId === treeId)?.treeOutpoint
+        !== beforeTree.treeOutpoint,
+    180_000,
+  );
+  return recovered.state;
 }
 
 async function main() {
   const driverUrls = DRIVER_CONFIGS.map(({ port }) => `http://127.0.0.1:${port}`);
   await Promise.all([
     waitForHttp('http://127.0.0.1:7070/v1/info', 5_000),
-    waitForHttp('http://127.0.0.1:7073/v1/info', 5_000),
+    waitForHttp('http://127.0.0.1:7074/v1/info', 5_000),
     waitForHttp(`${SERVER_URL}/health.json`, 5_000),
     ...(EXTERNAL_WEB_URL ? [] : [assertPortAvailable(WEB_PORT, 'web server')]),
     ...DRIVER_CONFIGS.flatMap(({ port, websocketPort }, index) => [
@@ -276,11 +307,11 @@ async function main() {
     const initialShared = assertSharedWorld(initial, 'initial shared world');
     assert.equal(initialShared.fullTreeValueSats, 330);
     assert.ok(
-      initialShared.trees.every((tree) => tree.health >= 0 && tree.health <= 5),
+      initialShared.trees.every((tree) => tree.health >= 0 && tree.health <= 10),
       'shared world contains invalid tree health',
     );
     assert.ok(
-      initialShared.trees.filter((tree) => tree.health === 5).length >= 2,
+      initialShared.trees.filter((tree) => tree.health === 10).length >= 2,
       'shared world has fewer than two full trees',
     );
     for (const view of initial) {
@@ -464,7 +495,7 @@ async function main() {
     const sharedBeforeChops = assertSharedWorld(activated, 'pre-chop shared world');
     const occupied = new Set(sharedBeforeChops.trees.map((tree) => `${tree.x}:${tree.y}`));
     const selectableTrees = sharedBeforeChops.trees.filter((tree) => (
-      tree.health === 5
+      tree.health === 10
       && tree.y + 1 < sharedBeforeChops.mapHeight
       && !occupied.has(`${tree.x}:${tree.y + 1}`)
     ));
@@ -495,7 +526,7 @@ async function main() {
       (value) => !value.busy
         && value.state?.playerActive
         && value.adjacentTree?.treeId === selectedTrees[index].treeId
-        && value.adjacentTree.health === 5
+        && value.adjacentTree.health === 10
         && value.player?.x === selectedTrees[index].x
         && value.player?.y === selectedTrees[index].y + 1,
     )));
@@ -535,7 +566,7 @@ async function main() {
       (value) => !value.busy
         && value.state?.playerActive
         && value.adjacentTree?.treeId === selectedTrees[index].treeId
-        && value.adjacentTree.health === 5,
+        && value.adjacentTree.health === 10,
     )));
     for (const view of chopInputs) {
       treesBeforeChops.set(view.adjacentTree.treeId, view.adjacentTree);
@@ -576,7 +607,7 @@ async function main() {
           initialChopResults[index] = { ok: true, state: input.state };
           return;
         }
-        assert.equal(input.adjacentTree.health, 5);
+        assert.equal(input.adjacentTree.health, 10);
         stateOutpointsBeforeChops[index] = input.state.playerStateOutpoint;
         initialChopResults[index] = await player.chopExpected(
           input.state,
@@ -612,7 +643,7 @@ async function main() {
       assert.notEqual(view.state.playerStateOutpoint, stateOutpointsBeforeChops[index]);
       assert.equal(
         view.state.trees.find((tree) => tree.treeId === selectedTrees[index].treeId).health,
-        5 - reward,
+        10 - reward,
       );
     }
     const disjointRewards = ownChops.map((view) => Number(view.state.lastAttempt.success));
@@ -625,7 +656,7 @@ async function main() {
     const raceTree = raceShared.trees.find((tree) => (
       tree.x <= synchronizedViewportMaxX
       && tree.y <= synchronizedViewportMaxY
-      && tree.health === 5
+      && tree.health === 10
       && !selectedTrees.some((selected) => selected.treeId === tree.treeId)
     ));
     assert.ok(raceTree, 'no common healthy tree is available for a race');
@@ -669,7 +700,7 @@ async function main() {
     const racedTree = racedShared.trees.find((tree) => tree.treeId === raceTree.treeId);
     assert.equal(
       racedTree.health,
-      5 - Number(racePredictions[winner]),
+      10 - Number(racePredictions[winner]),
       'same-tree race must apply only the winning player outcome',
     );
     for (const [index, view] of raced.entries()) {
@@ -703,7 +734,7 @@ async function main() {
       const shared = assertSharedWorld(chopped, 'smoke post-chop shared world');
       for (const [index, selected] of selectedTrees.entries()) {
         const tree = shared.trees.find((candidate) => candidate.treeId === selected.treeId);
-        assert.equal(tree.health, 5 - disjointRewards[index]);
+        assert.equal(tree.health, 10 - disjointRewards[index]);
         assert.ok(tree.lastAttemptTxid);
       }
       await assertLeaderboardMatches(chopped, 'verified smoke leaderboard');
@@ -726,7 +757,7 @@ async function main() {
       let view = ownChops[index];
       let attempts = 1;
       while (
-        view.state.trees.find((tree) => tree.treeId === selectedTrees[index].treeId).health === 5
+        view.state.trees.find((tree) => tree.treeId === selectedTrees[index].treeId).health === 10
       ) {
         attempts += 1;
         assert.ok(attempts <= 11, `${player.label} exceeded the luck-protection bound`);
@@ -773,7 +804,7 @@ async function main() {
         && value.state.logDropBasisPoints === manifest.baseLogDropBasisPoints
         && value.state.playerLogs === 1 + raceRewards[index]
         && selectedTrees.every((selected) => (
-          value.state.trees.find((tree) => tree.treeId === selected.treeId)?.health === 4
+          value.state.trees.find((tree) => tree.treeId === selected.treeId)?.health === 9
         )),
     );
     assertPlayersActive(chopped, 'post-chop state');
@@ -788,8 +819,8 @@ async function main() {
     for (const tree of sharedAfterChops.trees) {
       const before = treesBeforeChops.get(tree.treeId);
       if (selectedIds.has(tree.treeId)) {
-        assert.equal(before.health, 5);
-        assert.equal(tree.health, 4);
+        assert.equal(before.health, 10);
+        assert.equal(tree.health, 9);
         assert.equal(before.valueSats, 330);
         assert.equal(tree.valueSats, 330);
         assert.notEqual(tree.treeOutpoint, before.treeOutpoint);

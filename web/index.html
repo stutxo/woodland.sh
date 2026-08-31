@@ -315,7 +315,7 @@ new player + new tree + extension + anchor</pre>
         </ul>
         <p>The browser and woodland server present and index the game. They do not decide whether a gameplay transaction is valid.</p>
 
-        <h2>The three gameplay contracts</h2>
+        <h2>The two gameplay contracts</h2>
         <div class="about-contracts">
           <section class="about-contract">
             <h3>Player</h3>
@@ -324,13 +324,8 @@ new player + new tree + extension + anchor</pre>
           </section>
           <section class="about-contract">
             <h3>Tree</h3>
-            <p>Each of the 2,100 trees occupies a separate VTXO using one shared contract template. It holds 330 sats, one TREE marker, coordinates, health, and its remaining LOG and XP.</p>
-            <p>Its paths allow chopping, batch renewal with stump refill, and atomic retirement and restocking when its reserve is empty.</p>
-          </section>
-          <section class="about-contract">
-            <h3>Supply vault</h3>
-            <p>One covenant VTXO holds the undistributed LOG and XP reserve. It is not a general-purpose wallet.</p>
-            <p>Its only paths are an exact self-renewal or an atomic restock that gives one depleted tree exactly 1,000 LOG and 1,000 XP while preserving the remaining vault balance.</p>
+            <p>Each of exactly 420 trees occupies a separate VTXO using one shared contract template. It holds 330 sats, one TREE marker, coordinates, health, stump height, and its remaining local LOG and XP.</p>
+            <p>Every tree starts with 50,000 LOG, 50,000 XP, and ten health. Its only state paths are chopping and permissionless renewal or regrowth; there is no shared supply vault.</p>
           </section>
         </div>
 
@@ -340,10 +335,10 @@ new player + new tree + extension + anchor</pre>
 miss:    assets and health unchanged · player roll/luck advances</pre>
         <p>This reciprocal check prevents crediting a player without debiting a tree, forging XP, changing identity, or redirecting assets.</p>
 
-        <h2>Renewal, permission, and trust</h2>
-        <p>Arkade VTXOs have finite batch lifetimes. Renewal consumes a state VTXO and recreates it in a fresh batch without changing its state. A tree stump is the one exception: renewal resets zero health to five while preserving its identity and inventory.</p>
-        <p>“Permissionless” does not mean signature-free or unrestricted. It means any caller may submit the covenant path without a player or woodland-held authorization key. The Arkade operator and script-tweaked emulator still approve only the transaction shape allowed by that path.</p>
-        <p>Arkade Script is evaluated by the configured emulator, not Bitcoin consensus. Bitcoin Taproot still enforces every required signer, so bypassing a covenant requires the emulator and every other signer on the selected path.</p>
+        <h2>Renewal, regrowth, permission, and trust</h2>
+        <p>Arkade VTXOs have finite batch lifetimes. Renewal consumes a state VTXO and recreates it in a fresh batch without changing its state. A funded stump may instead reset from zero to ten health only after two observed Bitcoin tip advances. Anyone can submit that regrowth; neither a player key nor a woodland-held lifecycle key is required.</p>
+        <p>The canonical Bitcoin-height witness is serialized in the transaction’s introspector extension, so transaction signatures commit it. The woodland emulator gate checks that witness against its Bitcoin Core tip before forwarding the transaction to the stock Arkade emulator. This emulates the relative block delay that Arkade Script cannot read directly.</p>
+        <p>“Permissionless” does not mean signature-free or unrestricted. The Arkade operator and script-tweaked emulator still approve only the transaction shape allowed by the selected path. Bitcoin Taproot enforces the complete signer closure; the trusted gate supplies the external Bitcoin-height observation.</p>
 
         <details class="covenant-details">
           <summary>More technical details: the covenant scripts (not required to play)</summary>
@@ -351,7 +346,7 @@ miss:    assets and health unchanged · player roll/luck advances</pre>
             <p class="covenant-note"><strong>Technical caveat.</strong> This section describes protocol implementation, transaction shapes, and signer rules. It is intended for reviewers and curious players; none of it is required to play woodland.sh.</p>
 
             <h2>Script inventory</h2>
-            <p>The game uses eight distinct Arkade covenant programs mounted as nine usable Taproot leaves. Player renewal is one program mounted twice with different signer sets.</p>
+            <p>The game uses five distinct Arkade covenant programs mounted as six usable Taproot leaves. Player renewal is one program mounted twice with different signer sets.</p>
             <div class="covenant-table-scroll">
               <table class="covenant-table">
                 <thead>
@@ -359,8 +354,7 @@ miss:    assets and health unchanged · player roll/luck advances</pre>
                 </thead>
                 <tbody>
                   <tr><td>Player</td><td>Chop, renewal, LOG withdrawal</td><td>Chop, owner renewal, watchtower renewal, withdrawal</td></tr>
-                  <tr><td>Tree</td><td>Chop, renewal, retire/restock</td><td>Three corresponding leaves</td></tr>
-                  <tr><td>Vault</td><td>Restock, renewal</td><td>Two corresponding leaves</td></tr>
+                  <tr><td>Tree</td><td>Chop, renewal/regrowth</td><td>Two corresponding leaves</td></tr>
                 </tbody>
               </table>
             </div>
@@ -373,7 +367,7 @@ miss:    assets and health unchanged · player roll/luck advances</pre>
 └─ introspector: emulator key tweaked by the covenant hash
 
 tweaked emulator = emulator + H("ArkScriptHash", covenant)·G</pre>
-            <p>The emulator evaluates the Arkade Script. Bitcoin Taproot enforces the complete signer closure, including the covenant-specific tweaked emulator key. The player leaves add the owner or rollover signer; tree and vault leaves require the Arkade operator and emulator pair.</p>
+            <p>The emulator evaluates the Arkade Script. Bitcoin Taproot enforces the complete signer closure, including the covenant-specific tweaked emulator key. Player leaves add the owner or rollover signer; tree leaves require the Arkade operator and emulator pair.</p>
 
             <h2>How to read the programs</h2>
             <p>The scripts are stack programs made from arithmetic checks and Arkade transaction-introspection opcodes. Most rules end in <code>OP_EQUALVERIFY</code>: a failed comparison immediately rejects the spend.</p>
@@ -438,54 +432,24 @@ player XP out          = player XP in + G</pre>
             </section>
 
             <section class="covenant-script">
-              <h3>5. Tree renewal — <code>tree_renewal_covenant_script</code></h3>
-              <p>Tree renewal preserves the exact P2TR, sat value, tree identity, TREE marker, and LOG/XP balances while moving the state into a fresh Arkade batch.</p>
-              <pre class="about-flow" aria-label="Tree stump renewal rule">if input health is 0 and LOG remains:
-    output health must be 5
-else:
-    output health must equal input health</pre>
-              <p>The LOG-presence check distinguishes a refillable stump from a fully depleted tree. A depleted tree has no LOG group, remains at zero health, and proceeds to retire/restock instead.</p>
-            </section>
-
-            <section class="covenant-script">
-              <h3>6. Tree retire/restock — <code>tree_retire_covenant_script</code></h3>
-              <p>The dead-tree input must contain exactly one TREE marker and no LOG or XP. It is spent with the supply vault and replaced at the same P2TR, coordinate, identity, and 330-sat value.</p>
-              <pre class="about-flow" aria-label="Fresh tree requirements">fresh health = 5
-fresh TREE   = 1
-fresh LOG    = 1,000
-fresh XP     = 1,000
-
-TREE originates from the dead tree
-LOG and XP originate from the vault</pre>
-              <p>This half proves the replacement tree is correct. The reciprocal vault program proves the reserve change is correct.</p>
-            </section>
-
-            <h2>Vault covenant programs</h2>
-            <section class="covenant-script">
-              <h3>7. Vault restock — <code>vault_restock_covenant_script</code></h3>
-              <p>The vault must be input one and hold exactly LOG and XP. The fresh-tree output is pinned to the shared tree P2TR and 330 sats; the vault-change output must preserve the exact vault P2TR and sat value.</p>
-              <pre class="about-flow" aria-label="Vault restock equations">vault LOG in - vault LOG out = 1,000
-vault XP in  - vault XP out  = 1,000</pre>
-              <p>Asset assignments prove that the TREE marker comes from the dead tree while LOG and XP come from the vault. Both the tree and vault leaves must approve the same atomic transaction.</p>
-            </section>
-
-            <section class="covenant-script">
-              <h3>8. Vault renewal — <code>vault_renewal_covenant_script</code></h3>
-              <p>The simplest covenant is an exact version-2 intent self-send:</p>
-              <pre class="about-flow" aria-label="Vault renewal checks">same vault P2TR
-same sat value
-same LOG presence and amount
-same XP presence and amount
-no assets in the extension output</pre>
-              <p>The vault has no mutable state packets. Its complete state is its P2TR, sat value, and remaining asset balances.</p>
+              <h3>5. Tree renewal and regrowth — <code>tree_renewal_covenant_script</code></h3>
+              <p>Tree renewal preserves the exact P2TR, sat value, tree identity, TREE marker, and LOG/XP balances while moving the state into a fresh Arkade batch. Every transition carries a canonical Bitcoin-height witness committed inside the transaction’s introspector extension.</p>
+              <pre class="about-flow" aria-label="Tree stump regrowth rule">active tree:
+    preserve health and stump height 0
+funded stump at height H:
+    require attested height ≥ H + 2
+    output health = 10 and stump height = 0
+terminal stump with no LOG:
+    preserve health 0; regrowth is unavailable</pre>
+              <p>The final successful chop stamps its attested height into the stump state. The emulator gate verifies the current Bitcoin Core height before forwarding to the signer; the covenant verifies the same height, the two-tip delay, and exact local-reserve preservation.</p>
             </section>
 
             <h2>Canonical numeric encoding</h2>
-            <p>XP, health, and luck credit use fixed-width numeric packets. Each program checks the byte length, converts with <code>BIN2NUM</code>, converts back with <code>NUM2BIN</code>, compares the exact bytes, and rejects negative values. This prevents alternate encodings such as negative zero from representing the same apparent number with different committed bytes.</p>
+            <p>XP, health, stump height, and luck credit use fixed-width numeric packets. Each program checks the byte length, converts with <code>BIN2NUM</code>, converts back with <code>NUM2BIN</code>, compares the exact bytes, and rejects negative values. This prevents alternate encodings such as negative zero from representing the same apparent number with different committed bytes.</p>
 
             <h2>Activation and manifest checks</h2>
             <p>Activation is not a separate covenant leaf: it spends an ordinary wallet VTXO and creates the first player state. On the first recursive spend, every player leaf recognizes the direct-activation shape and requires the identity-derived roll, PLAYER_ID group zero, and initial luck credit 8,000.</p>
-            <p>The world manifest carries raw tree and vault script commitments. Clients rebuild those contracts from the pinned asset IDs, signer keys, network, dust, and reserve constants, then require every P2TR and Arkade Script byte to match the manifest before accepting the world.</p>
+            <p>The world manifest carries raw tree script commitments. Clients rebuild the contract from the pinned asset IDs, signer keys, network, dust, and reserve constants, then require every P2TR and Arkade Script byte to match the manifest before accepting the world.</p>
           </div>
         </details>
       </div>

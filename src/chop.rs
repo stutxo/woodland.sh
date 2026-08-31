@@ -540,6 +540,7 @@ pub fn prepare_chop(
     world: &ChopWorld,
     player_state: &PlayerChopState,
     tree: &TreeChopState,
+    block_height: u32,
     mutation: ChopMutation,
 ) -> Result<PreparedChop> {
     let player_logs_before = player_state
@@ -564,7 +565,7 @@ pub fn prepare_chop(
     let tree_xp_balance_before =
         require_nonzero_asset(tree.record, world.xp_asset, "tree has no XP")?;
     if tree.health.value() == 0 {
-        return Err(anyhow!("tree is a stump awaiting renewal"));
+        return Err(anyhow!("cannot chop a stump"));
     }
     require_asset_amount(tree.record, world.tree_asset, 1, "tree marker")?;
     if tree.record.amount_sats != world.dust_sats {
@@ -701,6 +702,7 @@ pub fn prepare_chop(
         world.contract,
         [player_state.previous_tx, tree.previous_tx],
         next_state,
+        block_height,
     )?;
     mutation.mutate_extensions(
         &mut chop.ark_tx,

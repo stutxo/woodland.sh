@@ -1,6 +1,6 @@
-# woodland.sh Protocol v1 Client Guide
+# woodland.sh Protocol v2 Client Guide
 
-This guide describes interoperability with schema 1 worlds. The reference
+This guide describes interoperability with schema 2 worlds. The reference
 browser is executable documentation; its animation and storage choices are not
 protocol requirements.
 
@@ -9,15 +9,15 @@ protocol requirements.
 Load the canonical manifest and require:
 
 ```text
-schemaVersion = 1
-protocolVersion = 1
+schemaVersion = 2
+protocolVersion = 2
 gameId = woodland.sh
 dustSats = 330
 mapWidth = 425
 mapHeight = 425
-activeLogsPerTree = 5
-logReservePerTree = 1000
-xpPerTree = 1000
+activeLogsPerTree = 10
+logReservePerTree = 50000
+xpPerTree = 50000
 playerLevelCurve = woodland-xp-v1
 maxPlayerLevel = 99
 baseLogDropBasisPoints = 2000
@@ -28,10 +28,12 @@ luckWindowBasisPoints = 10000
 initialLuckCredit = 8000
 ```
 
-The manifest pins direct `arkadeServiceUrl` and `emulatorUrl` values plus the
-operator, emulator, and rollover keys. Fetch both `/v1/info` resources directly
-and verify network, signer, exit delay, version policy, 330-sat support,
-extension support, and zero current/scheduled offchain fees.
+The manifest pins direct `arkadeServiceUrl` and block-aware `emulatorUrl`
+values plus the operator, emulator, and rollover keys. Fetch both `/v1/info`
+resources directly and verify network, signer, exit delay, version policy,
+330-sat support, extension support, and zero current/scheduled offchain fees.
+Fetch `<emulatorUrl>/v1/block-tip` and require a positive Bitcoin height and
+canonical block hash.
 
 Recompute the three asset IDs from the genesis txid:
 
@@ -41,15 +43,14 @@ Recompute the three asset IDs from the genesis txid:
 2 XP
 ```
 
-Fetch indexed metadata and require `game=woodland.sh`, `protocol=1`, the exact
-asset label, no control asset, and supply exactly 2,100, 21,000,000, and
+Fetch indexed metadata and require `game=woodland.sh`, `protocol=2`, the exact
+asset label, no control asset, and supply exactly 420, 21,000,000, and
 21,000,000. Recompute the tree contract and compare every committed script in
 the manifest.
 
 The manifest must contain the reconstructed `treeScript`,
-`treeChopArkadeScript`, `treeRenewalArkadeScript`,
-`treeRetireArkadeScript`, `vaultScript`, `vaultRestockArkadeScript`, and
-`vaultRenewalArkadeScript` exactly. Missing and unknown fields fail closed.
+`treeChopArkadeScript`, and `treeRenewalArkadeScript` exactly. Missing and
+unknown fields fail closed.
 
 ## Discover Trees
 
@@ -60,15 +61,14 @@ with the creating transaction's immutable identity packet; never infer identity
 from result order. For each declared tree, require exactly one lineage carrying:
 
 - one TREE;
-- zero through 1,000 LOG;
+- zero through 50,000 LOG;
 - the same amount of XP as LOG;
 - fixed 330 sats;
-- valid identity and health packets.
+- canonical identity, health, and stump-height packets.
 
-A tree with zero LOG is depleted and awaits restock. Follow the supply vault
-lineage from its manifest-pinned deployment outpoint the same way: the live
-vault VTXO carries the undistributed LOG and XP, and every restock moves
-exactly one tree reserve (1,000 of each) out of it.
+Active trees have health one through ten and stump height zero. A health-zero
+tree has a positive final-chop height. A funded stump is regrowable at that
+height plus two; a zero-reserve stump is terminal. There is no vault lineage.
 
 ## Activate Without a Woodland Service
 
@@ -79,7 +79,7 @@ assigned to player output zero and metadata:
 
 ```text
 game=woodland.sh
-protocol=1
+protocol=2
 asset=PLAYER_ID
 owner=<owner_xonly>
 ```
@@ -178,9 +178,13 @@ XP:   player X + tree F -> player X+G + tree F-G
 ```
 
 Attach preserved player/tree packets, the next player roll and luck credit,
-next health, next XP, and both Arkade Script entries. Sign player state and its
-checkpoint with the owner key. Submit to the emulator, verify byte-identical
-unsigned transactions and the exact signature matrix, then finalize through Arkade.
+next health, next XP, and both Arkade Script entries. Fetch the gate's current
+Bitcoin tip; minimally encode its height with marker `WOODLAND_BLOCK_V1` in the
+tree script witness, which is committed inside the transaction's introspector
+extension. Stamp that height into stump state only when output health becomes
+zero. Sign player state and its checkpoint with the owner key. Submit through
+the emulator gate, verify byte-identical unsigned transactions and the exact
+signature matrix, then finalize through Arkade.
 
 Automation should supply explicit expected tree outpoint, player-state outpoint,
 and drop bit. Reject locally if any changed after refresh.
@@ -194,7 +198,7 @@ rejected. Query the expected outputs first; when they are absent and both inputs
 remain current, retry only the exact persisted PSBT. The reference client does
 this after a bounded reconcile poll that gives the original submission time to land, and then on a background cadence; resubmitting against a still in-flight original can trip the service's concurrent-spend protection.
 
-The reference key is `woodland.sh:web:v1:pending:<arkade-url>:<genesis-txid>`.
+The reference key is `woodland.sh:web:v2:pending:<arkade-url>:<genesis-txid>`.
 
 ## Direct Owner Renewal
 
@@ -211,6 +215,15 @@ renewed output must preserve state exactly and have a later indexed expiry.
 The optional rollover leaf permits a separate watchtower to perform the same
 self-send without receiving the player secret.
 
+## Permissionless Tree Regrowth
+
+Refresh the selected tree and gate tip. For a funded health-zero tree stamped
+at `H`, reject locally until the current height is at least `H + 2`. Build the
+tree renewal intent as an exact self-send: preserve TREE, LOG, XP, identity,
+script, and sats; set health to ten and stump height to zero; carry the same
+canonical block witness used by chop. No player state, player-key authorization,
+or woodland service authorization participates.
+
 ## Headless Rust Client
 
 Agents and tooling can drive the same protocol without a browser through
@@ -225,16 +238,16 @@ let player = client.sync_player().await?;
 let trees = client.trees(&[]).await?; // every lineage head, logs/health decoded
 let outcome = client.chop(tree_id).await?;
 client.withdraw_log(500, None).await?; // LOG only; XP is soulbound
-client.restock(tree_id).await?;        // replace a depleted tree from the vault
+client.regrow(tree_id).await?;         // permissionless after two Bitcoin tips
 let outpoint = client.renew_player().await?;
 ```
 
 `connect` validates the manifest against the live services and pins the batch
 flow to its forfeit identity. `withdraw_log` moves LOG to any Arkade address
 (the player's own plain wallet by default), funded by a wallet dust input; the
-covenant rejects anything that touches XP. `restock` atomically retires one
-depleted tree against the supply vault and recreates it at the same
-coordinate; any caller may invoke it. `chop` builds, signs, emulator-executes,
+covenant rejects anything that touches XP. `regrow` recreates an eligible
+funded stump with health ten while preserving its exact local reserve; any
+caller may invoke it. `chop` builds, signs, emulator-executes,
 and verifies the exact accepted transition; a lost submission response is
 reconciled against the settled lineage before any error is returned, so
 callers resync rather than blind-resubmit. `trees` resolves declared trees to
@@ -262,6 +275,7 @@ refresh()
 chop(treeId)
 resumePendingChop()
 renewPlayer()
+regrow(treeId)
 withdrawLog(amount)
 ```
 

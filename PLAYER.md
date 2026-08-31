@@ -1,4 +1,4 @@
-# woodland.sh Player Protocol v1
+# woodland.sh Player Protocol v2
 
 ## Purpose
 
@@ -22,7 +22,7 @@ exact `D`-sat VTXO. Activation is an owner-signed offchain transaction that both
 issues a marker and creates the personalized player state. It attaches:
 
 - one uncontrolled, one-unit `PLAYER_ID` at fresh asset group zero;
-- metadata `game=woodland.sh`, `protocol=1`, `asset=PLAYER_ID`, and the owner;
+- metadata `game=woodland.sh`, `protocol=2`, `asset=PLAYER_ID`, and the owner;
 - identity derived from `SHA256("woodland.sh/PlayerIdentity/v1" || owner || genesis_txid)`;
 - spawn position `(3,17)`;
 - roll `SHA256("woodland.sh/player-roll/v1" || identity_packet)`;
@@ -65,7 +65,7 @@ aggregate XP remains fixed and asset-backed.
 
 The next reward belongs to the player lineage. A swing advances
 `Rnext = SHA256(Rprevious)` and maps the successor to a little-endian bucket
-modulo 10,000. Selecting or restocking another tree cannot change that bucket.
+modulo 10,000. Selecting, renewing, or regrowing another tree cannot change that bucket.
 
 For input-XP rate `p`, input credit `C`, `Q = C+p`, and reward bit `G`:
 
@@ -188,10 +188,10 @@ Every renewal preserves byte-for-byte:
 The reference frontend uses:
 
 ```text
-woodland.sh:web:v1:key:<site-origin>
-woodland.sh:web:v1:profile:<site-origin>:<genesis-txid>
-woodland.sh:web:v1:position:<site-origin>
-woodland.sh:web:v1:pending:<arkade-url>:<genesis-txid>
+woodland.sh:web:v2:key:<site-origin>
+woodland.sh:web:v2:profile:<site-origin>:<genesis-txid>
+woodland.sh:web:v2:position:<site-origin>
+woodland.sh:web:v2:pending:<arkade-url>:<genesis-txid>
 ```
 
 The profile pins the current genesis transaction and exact PLAYER_ID AssetId.
@@ -210,12 +210,12 @@ against its saved wallet address and reinstates the exact PLAYER_ID profile.
 ## Limits
 
 The player count is unlimited, but season resources are not: the world
-contains exactly 21,000,000 LOG and 21,000,000 XP, of which 2,100,000 each
-sit on trees at genesis and the rest in the supply vault. Harvested LOG
-leaves player state through the owner-authorized withdrawal leaf; XP never
-leaves. PLAYER_ID is per-season: future seasons issue fresh markers under the
-same global TREE/LOG/XP asset IDs, so a player's identity persists across
-seasons through its owner key.
+contains exactly 21,000,000 LOG and 21,000,000 XP, all issued into 420
+tree-local reserves of 50,000 each. Harvested LOG leaves player state through
+the owner-authorized withdrawal leaf; XP never leaves.
+PLAYER_ID and player identity are world-specific. A new deployment has a fresh
+genesis and fresh TREE/LOG/XP AssetIds; an owner may reuse a key, but the
+genesis-bound identity and marker change.
 
 A covenant sees the current transaction, not arbitrary ancestry from before a
 marker entered player state. An owner can issue a marker to an unconstrained

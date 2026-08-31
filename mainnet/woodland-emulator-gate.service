@@ -1,0 +1,33 @@
+[Unit]
+Description=woodland.sh Bitcoin-height emulator gate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=woodland-gate
+Group=woodland-gate
+WorkingDirectory=/opt/woodland
+EnvironmentFile=/etc/woodland/emulator-gate.env
+ExecStart=/opt/woodland/woodland-emulator-gate
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
