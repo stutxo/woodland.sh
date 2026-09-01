@@ -21,7 +21,7 @@ One genesis transaction creates three uncontrolled, fixed-supply assets:
 | --- | --- | ---: | --- |
 | 0 | TREE | 420 | one per tree |
 | 1 | LOG | 21,000,000 | 50,000 in each tree-local reserve |
-| 2 | XP | 21,000,000 | 50,000 in each tree-local reserve |
+| 2 | XP asset units | 21,000,000 | 50,000 in each tree-local reserve |
 
 Genesis metadata commits `game=woodland.sh`, `protocol=3`,
 `ruleset=woodland.sh/forest/v3`, the asset name, and the exact deployer and
@@ -32,15 +32,20 @@ With Arkade dust `D = 330 sats`:
 
 ```text
 player state: D sats + 1 PLAYER_ID + player roll + luck credit
-              + optional LOG + optional XP
-initial tree: 1 TREE + 50,000 LOG + 50,000 XP + health 10
+              + optional LOG + optional XP asset units
+initial tree: 1 TREE + 50,000 LOG + 50,000 XP asset units + health 10
               + fixed D (330 sats)
 ```
 
 XP has one canonical representation: the soulbound XP asset balance held by
-the recursive player state. A successful swing transfers one LOG and one XP
-from the selected tree into player state. A miss transfers nothing. Total LOG
-and XP remain 21,000,000 across trees and players.
+recursive player state. A successful swing transfers one LOG and one XP asset
+unit from the selected tree into player state; that unit deterministically
+represents 25 user-facing Woodcutting XP. A miss transfers nothing. Total LOG
+and XP asset supply remain 21,000,000 each, representing 525,000,000
+Woodcutting XP for the season.
+
+The first three LOGs produce 75 Woodcutting XP; the fourth reaches 100 and
+therefore level 2. Level 10 begins at the forty-seventh earned XP asset unit.
 
 Base LOG chance is 20%, rising by two percentage points at levels 10, 20, 30,
 40, and 50 of the reachable `woodland-xp-v1` curve
@@ -80,9 +85,10 @@ signatures. The shared tree tapleaf requires operator and tweaked emulator.
 
 ## Stumps and One-Batch Regrowth
 
-Each tree owns its entire 50,000 LOG and 50,000 XP reserve. There is no shared
-supply vault and no restock path. Ten successful drops reduce health from ten
-to zero while moving exactly ten LOG and ten XP into player state.
+Each tree owns its entire 50,000 LOG and 50,000-unit XP asset reserve, which
+represents 1,250,000 Woodcutting XP. There is no shared supply vault and no
+restock path. Ten successful drops reduce health from ten to zero while moving
+exactly ten LOG and ten XP asset units — 250 Woodcutting XP — into player state.
 
 A funded stump regrows to health ten in one fresh tree-renewal batch. Its TREE
 marker, coordinate, script, sats, and remaining local LOG/XP reserve are

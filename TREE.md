@@ -15,12 +15,13 @@ One transaction creates three fixed-supply Asset V1 groups:
 ```text
 group 0: 420 TREE
 group 1: 21,000,000 LOG
-group 2: 21,000,000 XP
+group 2: 21,000,000 XP asset units
 ```
 
 All groups are uncontrolled. Deterministic deployment places one TREE, 50,000
-LOG, 50,000 XP, and 330 sats into each of exactly 420 shared tree contracts.
-That allocates the complete LOG and XP supplies locally; no supply vault,
+LOG, 50,000 XP asset units, and 330 sats into each of exactly 420 shared tree
+contracts. Each XP unit represents 25 Woodcutting XP, so one tree backs
+1,250,000 Woodcutting XP. The complete supplies are local; no supply vault,
 restock transaction, or player reserve exists. World bootstrap requires
 138,600 sats for the tree outputs.
 
@@ -48,19 +49,22 @@ outputs: player, tree, merged extension, anchor
 groups:  PLAYER_ID, TREE, LOG, XP
 ```
 
-For input player XP `X`, the LOG threshold is 2,000 basis points plus 200 at
-each canonical level boundary 10, 20, 30, 40, and 50 of the
-`woodland-xp-v1` curve (1,154 / 4,470 / 13,363 / 37,224 / 101,333 XP),
-capped at 3,000. The player roll and bounded luck credit produce reward bit `G`.
+For input player XP asset balance `X`, the LOG threshold is 2,000 basis points
+plus 200 at canonical Woodcutting levels 10, 20, 30, 40, and 50 of the
+`woodland-xp-v1` curve (1,154 / 4,470 / 13,363 / 37,224 / 101,333 Woodcutting
+XP). Because one asset unit represents 25 XP, the covenant compares `X` against
+47 / 179 / 535 / 1,489 / 4,054, capped at 3,000 basis points. The player roll
+and bounded luck credit produce reward bit `G`.
 
 The tree covenant enforces atomically:
 
 ```text
-player LOG:       M -> M+G
-player XP asset:  X -> X+G
-tree LOG:         N -> N-G
-tree XP:          F -> F-G
-tree health:      H -> H-G
+player LOG:          M -> M+G
+player XP asset:     X -> X+G
+Woodcutting XP:    25X -> 25(X+G)
+tree LOG:            N -> N-G
+tree XP asset:       F -> F-G
+tree health:         H -> H-G
 ```
 
 It also requires the canonical two-input/four-output shape, ordered uncontrolled
@@ -75,8 +79,8 @@ packet, block witness, or timer participates.
 ## One-Batch Regrowth
 
 A mature tree has health ten. Ten successful drops produce a funded stump while
-removing exactly ten LOG and ten XP from its local reserve. In one fresh Ark
-batch, the renewal covenant permits:
+removing exactly ten LOG and ten XP asset units — 250 Woodcutting XP — from its
+local reserve. In one fresh Ark batch, the renewal covenant permits:
 
 ```text
 funded input health = 0

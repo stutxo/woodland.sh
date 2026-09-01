@@ -14,6 +14,7 @@ const base = {
   protocolVersion: 3,
   gameId: 'woodland.sh',
   rulesetId: 'woodland.sh/forest/v3',
+  woodcuttingXpPerLog: 25,
   deployerSigner: '11'.repeat(32),
   manifestSignature: '22'.repeat(64),
   network: 'signet',
@@ -103,6 +104,15 @@ try {
   const wrong = run(wrongProtocol, path.join(temporary, 'wrong'));
   assert.notEqual(wrong.status, 0);
   assert.match(wrong.stderr, /requires a signed woodland\.sh protocol v3 schema 3 manifest/);
+
+  const wrongXpScale = path.join(temporary, 'wrong-xp-scale.json');
+  await writeFile(wrongXpScale, JSON.stringify({ ...base, woodcuttingXpPerLog: 1 }));
+  const wrongScale = run(wrongXpScale, path.join(temporary, 'wrong-xp-scale'));
+  assert.notEqual(wrongScale.status, 0);
+  assert.match(
+    wrongScale.stderr,
+    /requires a signed woodland\.sh protocol v3 schema 3 manifest/,
+  );
 
   console.log('GitHub Pages artifact tests passed');
 } finally {

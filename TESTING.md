@@ -86,14 +86,15 @@ A clean deployment verifies:
 - canonical BIP340 manifest authentication under the declared deployer;
 - one genesis txid with TREE group 0, LOG group 1, and XP group 2;
 - supplies 420, 21,000,000, and 21,000,000;
+- signed `woodcuttingXpPerLog = 25`;
 - metadata `game=woodland.sh`, `protocol=3`, exact ruleset and label, and exact
   deployer and rollover signers;
 - exact `treeScript`, `treeChopArkadeScript`, `treeRegrowthArkadeScript`, and
   `treeMaintenanceArkadeScript` commitments;
 - no retired-tree or vault fields;
 - no control asset;
-- exactly 420 tree VTXOs with one TREE, 50,000 LOG, 50,000 XP, health ten, and
-  330 sats;
+- exactly 420 tree VTXOs with one TREE, 50,000 LOG, 50,000 XP asset units,
+  health ten, and 330 sats;
 - total world funding 138,600 sats;
 - no shared vault, player reserve, or allocator signer.
 
@@ -115,10 +116,12 @@ The browser stage verifies:
 - fee-policy tests require a clean asset-free funding VTXO, maximum
   current/scheduled fee selection, exact same-contract change, and unchanged
   recursive state;
-- player state holds harvested LOG and earned XP;
-- the player-held XP asset is the sole progression value;
-- LOG and XP remain conserved across trees and players after every transition;
-- `seasonXpRemaining` reports on-tree XP (21,000,000 at genesis);
+- player state holds harvested LOG and earned soulbound XP asset units;
+- user-facing Woodcutting XP is exactly `25 ×` the held XP asset balance;
+- levels 2 and 3 appear after four and seven successful LOGs;
+- LOG and XP assets remain conserved across trees and players after every
+  transition;
+- `seasonXpRemaining` reports on-tree Woodcutting XP (525,000,000 at genesis);
 - an owner LOG withdrawal through the `withdrawLog` API moves LOG out while
   XP, PLAYER_ID, sats, roll, and luck credit remain, and an over-balance
   withdrawal is rejected client-side;
@@ -161,7 +164,8 @@ The dedicated profile uses the canonical world without reserve overrides:
 ```
 
 One Firefox player harvests exactly ten successful drops from a pristine tree,
-producing health zero and 49,990 local LOG/XP. A second Firefox browser remains
+reaching 250 Woodcutting XP and level 3 while producing health zero, 49,990
+local LOG, and 49,990 local XP asset units. A second Firefox browser remains
 inactive and carries only a clean ordinary-wallet VTXO for arkd intent fees. It
 clicks the stump and completes one permissionless renewal batch, proving that
 active player state and player-key covenant authorization are unnecessary. The

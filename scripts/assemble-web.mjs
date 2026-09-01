@@ -18,6 +18,7 @@ if (
   || manifest.protocolVersion !== 3
   || manifest.gameId !== 'woodland.sh'
   || manifest.rulesetId !== 'woodland.sh/forest/v3'
+  || manifest.woodcuttingXpPerLog !== 25
   || !/^[0-9a-f]{64}$/.test(manifest.deployerSigner || '')
   || !/^[0-9a-f]{128}$/.test(manifest.manifestSignature || '')
 ) {

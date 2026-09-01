@@ -19,6 +19,7 @@ mapHeight = 425
 activeLogsPerTree = 10
 logReservePerTree = 50000
 xpPerTree = 50000
+woodcuttingXpPerLog = 25
 playerLevelCurve = woodland-xp-v1
 maxPlayerLevel = 99
 baseLogDropBasisPoints = 2000
@@ -105,7 +106,8 @@ initial credit before allowing chop, renewal, or withdrawal.
 
 A canonical player state has exactly 330 sats, exactly one profile-selected
 PLAYER_ID, player roll and bounded luck-credit packets, and optional LOG and XP
-asset balances. The XP asset balance is the sole progression value.
+asset balances. The XP asset balance is the sole progression backing; clients
+display `25 × balance` Woodcutting XP and derive level from that value.
 
 
 Protocol v3 has exactly four gameplay state packet types:

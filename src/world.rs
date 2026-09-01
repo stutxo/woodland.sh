@@ -158,6 +158,8 @@ pub struct WorldManifest {
     pub active_logs_per_tree: u64,
     pub log_reserve_per_tree: u64,
     pub xp_per_tree: u64,
+    /// User-facing Woodcutting XP represented by each soulbound XP asset unit.
+    pub woodcutting_xp_per_log: u64,
     pub player_level_curve: String,
     pub max_player_level: u64,
     pub base_log_drop_basis_points: u64,
@@ -248,6 +250,7 @@ impl WorldManifest {
             active_logs_per_tree: ACTIVE_LOGS_PER_TREE,
             log_reserve_per_tree: LOG_RESERVE_PER_TREE,
             xp_per_tree: XP_PER_TREE,
+            woodcutting_xp_per_log: crate::player::WOODCUTTING_XP_PER_LOG,
             player_level_curve: crate::player::PLAYER_LEVEL_CURVE.to_string(),
             max_player_level: crate::player::MAX_PLAYER_LEVEL,
             base_log_drop_basis_points: crate::player::BASE_LOG_DROP_BASIS_POINTS,
@@ -429,6 +432,7 @@ impl WorldManifest {
             || self.active_logs_per_tree != tree::LOGS_PER_TREE
             || self.log_reserve_per_tree != LOG_RESERVE_PER_TREE
             || self.xp_per_tree != XP_PER_TREE
+            || self.woodcutting_xp_per_log != crate::player::WOODCUTTING_XP_PER_LOG
             || self.player_level_curve != crate::player::PLAYER_LEVEL_CURVE
             || self.max_player_level != crate::player::MAX_PLAYER_LEVEL
             || self.base_log_drop_basis_points != crate::player::BASE_LOG_DROP_BASIS_POINTS
@@ -830,6 +834,7 @@ mod tests {
         assert!(json.contains("\"manifestSignature\""));
         assert!(json.contains("\"xpAsset\""));
         assert!(json.contains("\"xpPerTree\""));
+        assert!(json.contains("\"woodcuttingXpPerLog\""));
         let parsed = WorldManifest::from_json(&json).unwrap();
         let world = parsed.validate(&secp, &params, &emulator).unwrap();
         assert_eq!(world.trees.len(), TREE_COUNT);
@@ -841,6 +846,10 @@ mod tests {
         assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
         assert_eq!(parsed.player_level_curve, crate::player::PLAYER_LEVEL_CURVE);
         assert_eq!(parsed.max_player_level, crate::player::MAX_PLAYER_LEVEL);
+        assert_eq!(
+            parsed.woodcutting_xp_per_log,
+            crate::player::WOODCUTTING_XP_PER_LOG
+        );
         assert_eq!(
             parsed.level_log_drop_xp_thresholds,
             crate::player::LEVEL_LOG_DROP_XP_THRESHOLDS
@@ -961,6 +970,7 @@ mod tests {
             |manifest: &mut WorldManifest| manifest.max_player_level += 1,
             |manifest: &mut WorldManifest| manifest.log_reserve_per_tree += 1,
             |manifest: &mut WorldManifest| manifest.xp_per_tree += 1,
+            |manifest: &mut WorldManifest| manifest.woodcutting_xp_per_log += 1,
         ] {
             let mut changed = manifest.clone();
             mutate(&mut changed);

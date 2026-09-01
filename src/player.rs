@@ -65,12 +65,14 @@ pub fn server_action_message(
     Message::from_digest(sha256::Hash::hash(preimage.as_bytes()).to_byte_array())
 }
 
-/// XP is the soulbound XP asset balance held by recursive player state.
-/// Level and drop chance are derived from that single conserved value.
+/// XP is the soulbound XP asset balance held by recursive player state. Each
+/// earned unit represents one LOG and 25 Woodcutting XP; level and drop chance
+/// are derived from that single conserved balance.
 pub const PLAYER_LEVEL_CURVE: &str = "woodland-xp-v1";
+pub const WOODCUTTING_XP_PER_LOG: u64 = 25;
 pub const MAX_PLAYER_LEVEL: u64 = 99;
 
-/// Canonical protocol XP thresholds for levels 1 through 99.
+/// Canonical Woodcutting XP thresholds for levels 1 through 99.
 /// Level remains derived state; these values are not stored in the covenant.
 pub const XP_FOR_LEVEL: [u64; MAX_PLAYER_LEVEL as usize] = [
     0, 83, 174, 276, 388, 512, 650, 801, 969, 1_154, 1_358, 1_584, 1_833, 2_107, 2_411, 2_746,
@@ -88,18 +90,39 @@ pub const XP_FOR_LEVEL: [u64; MAX_PLAYER_LEVEL as usize] = [
 pub const CHOP_ROLL_BASIS_POINTS: u64 = 10_000;
 pub const BASE_LOG_DROP_BASIS_POINTS: u64 = 2_000;
 pub const LEVEL_LOG_DROP_BONUS_BASIS_POINTS: u64 = 200;
+/// User-facing Woodcutting XP at levels 10, 20, 30, 40, and 50.
 pub const LEVEL_LOG_DROP_XP_THRESHOLDS: [u64; 5] = [1_154, 4_470, 13_363, 37_224, 101_333];
+/// The corresponding soulbound XP asset balances inspected by the covenant.
+pub const LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS: [u64; 5] = [
+    xp_balance_for_woodcutting_xp(LEVEL_LOG_DROP_XP_THRESHOLDS[0]),
+    xp_balance_for_woodcutting_xp(LEVEL_LOG_DROP_XP_THRESHOLDS[1]),
+    xp_balance_for_woodcutting_xp(LEVEL_LOG_DROP_XP_THRESHOLDS[2]),
+    xp_balance_for_woodcutting_xp(LEVEL_LOG_DROP_XP_THRESHOLDS[3]),
+    xp_balance_for_woodcutting_xp(LEVEL_LOG_DROP_XP_THRESHOLDS[4]),
+];
 pub const MAX_LEVEL_LOG_DROP_BASIS_POINTS: u64 = 3_000;
 pub const LUCK_WINDOW_BASIS_POINTS: u64 = 10_000;
 pub const MAX_LUCK_CREDIT: u64 = LUCK_WINDOW_BASIS_POINTS * 2;
 pub const INITIAL_LUCK_CREDIT: u64 = LUCK_WINDOW_BASIS_POINTS - BASE_LOG_DROP_BASIS_POINTS;
 const PLAYER_ROLL_DOMAIN: &[u8] = b"woodland.sh/player-roll/v2";
 
-pub const fn log_drop_basis_points(player_xp: u64) -> u64 {
+/// Convert the canonical soulbound balance into user-facing Woodcutting XP.
+/// Saturation is unreachable for the signed fixed-supply world.
+pub const fn woodcutting_xp(player_xp_balance: u64) -> u64 {
+    player_xp_balance.saturating_mul(WOODCUTTING_XP_PER_LOG)
+}
+
+/// Smallest soulbound XP balance that reaches a Woodcutting XP threshold.
+pub const fn xp_balance_for_woodcutting_xp(woodcutting_xp: u64) -> u64 {
+    woodcutting_xp.div_ceil(WOODCUTTING_XP_PER_LOG)
+}
+
+/// Drop chance derives directly from the soulbound XP asset balance.
+pub const fn log_drop_basis_points(player_xp_balance: u64) -> u64 {
     let mut basis_points = BASE_LOG_DROP_BASIS_POINTS;
     let mut index = 0;
-    while index < LEVEL_LOG_DROP_XP_THRESHOLDS.len() {
-        if player_xp >= LEVEL_LOG_DROP_XP_THRESHOLDS[index] {
+    while index < LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS.len() {
+        if player_xp_balance >= LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS[index] {
             basis_points += LEVEL_LOG_DROP_BONUS_BASIS_POINTS;
         }
         index += 1;
@@ -219,9 +242,9 @@ impl PlayerLuck {
         })
     }
 
-    pub fn advance(self, player_xp: u64) -> (Self, bool) {
+    pub fn advance(self, player_xp_balance: u64) -> (Self, bool) {
         let next_roll = self.roll.next();
-        let drop_basis_points = log_drop_basis_points(player_xp);
+        let drop_basis_points = log_drop_basis_points(player_xp_balance);
         let raw_credit = self.credit.value() + drop_basis_points;
         let candidate = next_roll.bucket() < drop_basis_points;
         let success = if raw_credit > MAX_LUCK_CREDIT {
@@ -243,10 +266,11 @@ impl PlayerLuck {
     }
 }
 
-/// Level is derived, never committed as a second mutable state value. XP can
-/// continue increasing at level 99 without changing the displayed level.
-pub fn level_from_xp(xp: u64) -> u64 {
-    XP_FOR_LEVEL.partition_point(|threshold| *threshold <= xp) as u64
+/// Level is derived from user-facing Woodcutting XP, never committed as a
+/// second mutable state value. XP can continue increasing at level 99 without
+/// changing the displayed level.
+pub fn level_from_xp(woodcutting_xp: u64) -> u64 {
+    XP_FOR_LEVEL.partition_point(|threshold| *threshold <= woodcutting_xp) as u64
 }
 
 pub fn xp_for_level(level: u64) -> Option<u64> {
@@ -304,7 +328,7 @@ impl PlayerChopTransition {
                 .ok_or_else(|| anyhow!("player XP asset overflow"))?
         {
             return Err(anyhow!(
-                "player XP progression must equal its soulbound XP asset balance"
+                "player XP asset balance must advance by exactly the reward bit"
             ));
         }
         if self.state_logs_after
@@ -1240,7 +1264,7 @@ fn push_log_drop_basis_points(
             .push_opcode(OP_ADD)
             .push_int(BASE_LOG_DROP_BASIS_POINTS as i64);
     let mut builder = builder;
-    for threshold in LEVEL_LOG_DROP_XP_THRESHOLDS {
+    for threshold in LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS {
         builder = builder
             .push_opcode(bitcoin::opcodes::all::OP_OVER)
             .push_int(threshold as i64)
@@ -1512,13 +1536,18 @@ mod tests {
 
     #[test]
     fn luck_credit_bounds_long_runs_above_and_below_expectation() {
-        for (index, xp) in [0, 1_154, 4_470, 13_363, 37_224, 101_333]
-            .into_iter()
-            .enumerate()
-        {
+        let xp_balances = [
+            0,
+            LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS[0],
+            LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS[1],
+            LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS[2],
+            LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS[3],
+            LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS[4],
+        ];
+        for (index, xp_balance) in xp_balances.into_iter().enumerate() {
             let mut luck = PlayerLuck::initial(&player_script(index as u8 + 1)).unwrap();
             let initial_credit = luck.credit.value();
-            let rate = log_drop_basis_points(xp);
+            let rate = log_drop_basis_points(xp_balance);
             let mut successes = 0_u64;
             let mut miss_run = 0_u64;
             let mut success_run = 0_u64;
@@ -1526,7 +1555,7 @@ mod tests {
             let mut max_success_run = 0_u64;
             for _ in 0..100_000 {
                 let previous_credit = luck.credit.value();
-                let (next, success) = luck.advance(xp);
+                let (next, success) = luck.advance(xp_balance);
                 assert!(next.credit.value() <= MAX_LUCK_CREDIT);
                 assert_eq!(
                     next.credit.value() + u64::from(success) * CHOP_ROLL_BASIS_POINTS,
@@ -1548,10 +1577,13 @@ mod tests {
                 successes * CHOP_ROLL_BASIS_POINTS + luck.credit.value(),
                 initial_credit + 100_000 * rate
             );
-            assert!(max_miss_run <= 10, "XP {xp}: miss run {max_miss_run}");
+            assert!(
+                max_miss_run <= 10,
+                "XP asset balance {xp_balance}: miss run {max_miss_run}"
+            );
             assert!(
                 max_success_run <= 2,
-                "XP {xp}: success run {max_success_run}"
+                "XP asset balance {xp_balance}: success run {max_success_run}"
             );
         }
     }
@@ -1686,7 +1718,12 @@ mod tests {
     }
 
     #[test]
-    fn level_boundaries_are_exact() {
+    fn woodcutting_xp_scale_and_level_boundaries_are_exact() {
+        assert_eq!(woodcutting_xp(0), 0);
+        assert_eq!(woodcutting_xp(1), 25);
+        assert_eq!(woodcutting_xp(3), 75);
+        assert_eq!(woodcutting_xp(4), 100);
+        assert_eq!(woodcutting_xp(u64::MAX), u64::MAX);
         for (xp, level) in [
             (0, 1),
             (82, 1),
@@ -1701,28 +1738,38 @@ mod tests {
             (13_034_431, 99),
             (u64::MAX, 99),
         ] {
-            assert_eq!(level_from_xp(xp), level, "XP {xp}");
+            assert_eq!(level_from_xp(xp), level, "Woodcutting XP {xp}");
         }
+        assert_eq!(level_from_xp(woodcutting_xp(3)), 1);
+        assert_eq!(level_from_xp(woodcutting_xp(4)), 2);
         assert_eq!(xp_for_level(1), Some(0));
         assert_eq!(xp_for_level(50), Some(101_333));
         assert_eq!(xp_for_level(99), Some(13_034_431));
         assert_eq!(xp_for_level(0), None);
         assert_eq!(xp_for_level(100), None);
-        for (xp, basis_points) in [
+        assert_eq!(
+            LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS,
+            [47, 179, 535, 1_489, 4_054]
+        );
+        for (xp_balance, basis_points) in [
             (0, 2_000),
-            (1_153, 2_000),
-            (1_154, 2_200),
-            (4_469, 2_200),
-            (4_470, 2_400),
-            (13_362, 2_400),
-            (13_363, 2_600),
-            (37_223, 2_600),
-            (37_224, 2_800),
-            (101_332, 2_800),
-            (101_333, 3_000),
+            (46, 2_000),
+            (47, 2_200),
+            (178, 2_200),
+            (179, 2_400),
+            (534, 2_400),
+            (535, 2_600),
+            (1_488, 2_600),
+            (1_489, 2_800),
+            (4_053, 2_800),
+            (4_054, 3_000),
             (u64::MAX, 3_000),
         ] {
-            assert_eq!(log_drop_basis_points(xp), basis_points, "XP {xp}");
+            assert_eq!(
+                log_drop_basis_points(xp_balance),
+                basis_points,
+                "XP asset balance {xp_balance}"
+            );
         }
     }
 

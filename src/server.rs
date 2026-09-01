@@ -552,12 +552,13 @@ impl Verifier {
         let _state = player::player_state_from_tx(&previous_tx)?
             .ok_or_else(|| anyhow!("player creating transaction has no state packets"))?;
         let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
+        let woodcutting_xp = player::woodcutting_xp(xp_balance);
         let now = now_unix();
         Ok(Some(LeaderboardPlayer {
             owner: owner.to_string(),
             player_asset: player_asset.to_string(),
-            xp: xp_balance,
-            level: player::level_from_xp(xp_balance),
+            xp: woodcutting_xp,
+            level: player::level_from_xp(woodcutting_xp),
             logs: record.asset_amount(self.world.log_asset).unwrap_or(0),
             state_outpoint: record.outpoint.to_string(),
             expires_at: record.expires_at,
@@ -1457,13 +1458,14 @@ mod tests {
     use bitcoin::Txid;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn player(asset: &str, xp: u64, active: bool, registered_at: i64) -> LeaderboardPlayer {
+    fn player(asset: &str, xp_balance: u64, active: bool, registered_at: i64) -> LeaderboardPlayer {
+        let woodcutting_xp = player::woodcutting_xp(xp_balance);
         LeaderboardPlayer {
             owner: "00".repeat(32),
             player_asset: asset.to_owned(),
-            xp,
-            level: player::level_from_xp(xp),
-            logs: xp,
+            xp: woodcutting_xp,
+            level: player::level_from_xp(woodcutting_xp),
+            logs: xp_balance,
             state_outpoint: format!("{}:0", "00".repeat(32)),
             expires_at: Some(100),
             rollover_margin_seconds: 600,
@@ -1481,6 +1483,10 @@ mod tests {
             player("a", 1, true, 1),
             player("d", 2, true, 3),
         ];
+        assert_eq!(players[0].xp, 125);
+        assert_eq!(players[0].level, 2);
+        assert_eq!(players[1].xp, 25);
+        assert_eq!(players[1].level, 1);
         players.sort_by(|left, right| {
             right
                 .active

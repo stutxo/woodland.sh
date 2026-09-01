@@ -64,15 +64,15 @@ Season rewards remain fixed:
 
 ```text
 21,000,000 LOG
-21,000,000 XP
+21,000,000 XP asset units = 525,000,000 Woodcutting XP
 ```
 
 Exactly 420 trees hold 50,000 of each asset at genesis, allocating both complete
-21,000,000-unit supplies. Each tree can fund 5,000 ten-LOG health cycles; no
-tree can draw from another tree. XP moves into player state rather than
-disappearing, and it is soulbound — supply conservation also authenticates XP
-because no covenant path transfers it. Unlimited players do not imply
-unlimited rewards.
+21,000,000-unit supplies. Each XP asset unit represents 25 Woodcutting XP. Each
+tree can fund 5,000 ten-LOG health cycles; no tree can draw from another tree.
+XP moves into player state rather than disappearing, and it is soulbound —
+supply conservation also authenticates progression because no covenant path
+transfers XP. Unlimited players do not imply unlimited rewards.
 
 ## Transaction Cost
 

@@ -970,11 +970,11 @@ function render() {
   playerSession.textContent = sessionText;
 
   levelNumber.textContent = String(state.playerLevel);
-  xpNumber.textContent = `${state.playerXp} XP`;
+  xpNumber.textContent = `${state.playerXp} Woodcutting XP`;
   xpNext.textContent = state.playerNextLevelXp == null
     ? 'Maximum level'
-    : `${Math.max(0, state.playerNextLevelXp - state.playerXp)} XP to level ${state.playerLevel + 1}`;
-  xpBacking.textContent = `${state.seasonXpRemaining} season XP remaining`;
+    : `${Math.max(0, state.playerNextLevelXp - state.playerXp)} Woodcutting XP to level ${state.playerLevel + 1}`;
+  xpBacking.textContent = `${state.seasonXpRemaining} season Woodcutting XP remaining`;
   logChance.textContent = `${state.logDropBasisPoints / 100}%`;
   forestHealth.textContent = `${totalLogs} LOG reserve / ${standingTrees} standing`;
   const logCount = state.playerLogs || 0;
@@ -1015,7 +1015,7 @@ function render() {
       ? (tree.depleted ? 'exhausted stump' : 'funded stump; click to regrow')
       : `${tree.health} active`;
     element('tree-reserve').textContent = `${tree.logReserveRemaining} LOG`;
-    element('tree-xp').textContent = `${tree.xpRemaining} XP`;
+    element('tree-xp').textContent = `${tree.xpRemaining} Woodcutting XP`;
     element('player-asset').textContent = state.playerAsset || 'not issued';
     element('tree-asset').textContent = state.treeAsset;
     element('log-asset').textContent = state.logAsset;
@@ -1366,7 +1366,7 @@ function attemptChop() {
     () => {
       if (lastChopRun?.success) {
         const suffix = lastChopRun.swings === 1 ? 'swing' : 'swings';
-        return `You get a LOG and 1 XP after ${lastChopRun.swings} ${suffix}.`;
+        return `You get a LOG and ${state.woodcuttingXpPerLog} Woodcutting XP after ${lastChopRun.swings} ${suffix}.`;
       }
       if (lastChopRun?.cancelled) {
         return `Stopped after ${lastChopRun.swings} accepted swing${lastChopRun.swings === 1 ? '' : 's'}.`;
@@ -1460,7 +1460,7 @@ async function boot() {
       y: tree.y,
       health: manifest.activeLogsPerTree,
       logReserveRemaining: manifest.logReservePerTree,
-      xpRemaining: manifest.xpPerTree,
+      xpRemaining: manifest.xpPerTree * manifest.woodcuttingXpPerLog,
       valueSats: manifest.dustSats,
       treeOutpoint: `${deploymentTxid}:0`,
       deploymentTxid,

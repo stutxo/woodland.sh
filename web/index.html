@@ -205,7 +205,7 @@
               <strong id="level-number">1</strong>
             </div>
             <div class="stat">
-              <span>XP</span>
+              <span>Woodcutting XP</span>
               <strong id="xp-number">0 XP</strong>
               <div id="xp-next" class="muted">83 XP to level 2</div>
             </div>
@@ -242,7 +242,7 @@
       </div>
       <div class="leaderboard-scroll">
         <table>
-          <thead><tr><th class="rank">#</th><th>Player</th><th class="score">XP</th><th class="score">Level</th><th>Status</th></tr></thead>
+          <thead><tr><th class="rank">#</th><th>Player</th><th class="score">Woodcutting XP</th><th class="score">Level</th><th>Status</th></tr></thead>
           <tbody id="leaderboard-rows"><tr><td colspan="5">No verified players yet.</td></tr></tbody>
         </table>
       </div>
@@ -282,10 +282,10 @@
         <div><dt>Tree</dt><dd id="tree-id"></dd></div>
         <div><dt>Health</dt><dd id="tree-health"></dd></div>
         <div><dt>Tree LOG reserve</dt><dd id="tree-reserve"></dd></div>
-        <div><dt>Tree XP reserve</dt><dd id="tree-xp"></dd></div>
+        <div><dt>Tree Woodcutting XP</dt><dd id="tree-xp"></dd></div>
         <div><dt>Forest</dt><dd id="forest-health"></dd></div>
         <div><dt>Tree state</dt><dd id="tree-state"></dd></div>
-        <div><dt>Season XP</dt><dd id="xp-backing"></dd></div>
+        <div><dt>Season Woodcutting XP</dt><dd id="xp-backing"></dd></div>
         <div><dt>Emulator</dt><dd id="emulator"></dd></div>
         <div><dt>PLAYER_ID</dt><dd id="player-asset"></dd></div>
         <div><dt>TREE asset</dt><dd id="tree-asset"></dd></div>
@@ -320,18 +320,19 @@ new player + new tree + extension + anchor</pre>
           <section class="about-contract">
             <h3>Player</h3>
             <p>One owner-specific VTXO per player. It holds 330 sats, one PLAYER_ID, a recursive roll, bounded luck credit, harvested LOG, and soulbound XP.</p>
-            <p>Its paths allow chopping, exact renewal by the owner or delegated watchtower, and owner-authorized LOG withdrawal. The XP asset is the sole progression value and has no withdrawal path.</p>
+            <p>Its paths allow chopping, exact renewal by the owner or delegated watchtower, and owner-authorized LOG withdrawal. The XP asset is the sole progression backing, each earned unit represents 25 Woodcutting XP, and it has no withdrawal path.</p>
           </section>
           <section class="about-contract">
             <h3>Tree</h3>
             <p>Each of exactly 420 trees occupies a separate VTXO using one shared contract template. It holds 330 sats, one TREE marker, coordinates, health, and its remaining local LOG and XP.</p>
-            <p>Every tree starts with 50,000 LOG, 50,000 XP, and ten health. Its state paths are chopping, permissionless funded-stump regrowth, and rollover-authorized exact maintenance; there is no shared supply vault.</p>
+            <p>Every tree starts with 50,000 LOG, 50,000 XP asset units representing 1,250,000 Woodcutting XP, and ten health. Its state paths are chopping, permissionless funded-stump regrowth, and rollover-authorized exact maintenance; there is no shared supply vault.</p>
           </section>
         </div>
 
         <h2>Why a swing uses two contracts</h2>
         <p>A swing spends the player and selected tree together. The player covenant verifies owner approval, roll, luck, PLAYER_ID, and soulbound XP. The tree covenant independently verifies its inventory and the reward movement. Both must approve the same transaction.</p>
-        <pre class="about-flow" aria-label="Successful and missed swing state changes">success: player LOG/XP +1 · tree LOG/XP -1 · tree health -1
+        <pre class="about-flow" aria-label="Successful and missed swing state changes">success: player LOG +1 · player Woodcutting XP +25
+         tree LOG/XP assets -1 · tree health -1
 miss:    assets and health unchanged · player roll/luck advances</pre>
         <p>This reciprocal check prevents crediting a player without debiting a tree, forging progression, or redirecting assets.</p>
 
@@ -427,6 +428,7 @@ tree LOG in            = tree LOG out + G
 player LOG out         = player LOG in + G
 tree XP in             = tree XP out + G
 player XP out          = player XP in + G</pre>
+              <p>Each successful <code>G</code> transfers one soulbound XP asset unit, which deterministically represents 25 user-facing Woodcutting XP.</p>
               <p>It also requires positive input health and one conserved TREE marker. A miss has <code>G = 0</code>: assets and health stay fixed while roll and luck still advance.</p>
             </section>
 
@@ -444,7 +446,7 @@ active or terminal maintenance:
             </section>
 
             <h2>Canonical packet encoding</h2>
-            <p>Health and luck credit use fixed-width numeric packets. Each program checks byte length and canonical signed-magnitude encoding, rejecting alternate forms such as negative zero. Player progression is not a numeric packet: it is exactly the soulbound XP asset balance. The player roll is a fixed 32-byte packet.</p>
+            <p>Health and luck credit use fixed-width numeric packets. Each program checks byte length and canonical signed-magnitude encoding, rejecting alternate forms such as negative zero. Player progression is derived only from the soulbound XP asset balance at 25 Woodcutting XP per earned unit. The player roll is a fixed 32-byte packet.</p>
 
             <h2>Activation and manifest checks</h2>
             <p>Activation is not a separate covenant leaf: it spends an ordinary wallet VTXO and creates the first player state. On the first recursive spend, every player leaf recognizes the direct-activation shape and requires the P2TR-witness-program-derived roll, PLAYER_ID group zero, and initial luck credit 8,000.</p>

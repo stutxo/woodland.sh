@@ -144,6 +144,7 @@ struct AppSnapshot {
     activation_blocked_reason: Option<String>,
     player_active: bool,
     player_xp: u64,
+    woodcutting_xp_per_log: u64,
     player_level: u64,
     player_next_level_xp: Option<u64>,
     player_luck_credit: Option<u64>,
@@ -706,11 +707,12 @@ impl WoodlandApp {
 
     fn snapshot(&self) -> AppSnapshot {
         let now = crate::arkade::now_unix();
-        let player_xp = self
+        let player_xp_balance = self
             .player_state
             .as_ref()
             .and_then(|player| player.record.asset_amount(self.world.xp_asset))
             .unwrap_or(0);
+        let player_xp = player::woodcutting_xp(player_xp_balance);
         let wallet_sats = self
             .wallet_records
             .iter()
@@ -740,7 +742,7 @@ impl WoodlandApp {
         let next_luck = self
             .player_state
             .as_ref()
-            .map(|player| player.state.luck.advance(player_xp));
+            .map(|player| player.state.luck.advance(player_xp_balance));
         let trees = self
             .trees
             .iter()
@@ -760,7 +762,7 @@ impl WoodlandApp {
                     y: tree.state.y,
                     health: tree.health.value(),
                     log_reserve_remaining: logs,
-                    xp_remaining: xp_balance,
+                    xp_remaining: player::woodcutting_xp(xp_balance),
                     value_sats: tree.record.amount_sats,
                     tree_outpoint: tree.record.outpoint.to_string(),
                     deployment_txid: tree.deployment_txid.to_string(),
@@ -810,18 +812,22 @@ impl WoodlandApp {
             activation_blocked_reason,
             player_active: self.player_state.is_some(),
             player_xp,
+            woodcutting_xp_per_log: self.world.manifest.woodcutting_xp_per_log,
             player_level,
             player_next_level_xp: player::xp_for_level(player_level.saturating_add(1)),
             player_luck_credit: self
                 .player_state
                 .as_ref()
                 .map(|player| player.state.luck.credit.value()),
-            season_xp_remaining: self.trees.iter().fold(0_u64, |total, tree| {
-                total.saturating_add(tree.record.asset_amount(self.world.xp_asset).unwrap_or(0))
-            }),
+            season_xp_remaining: player::woodcutting_xp(self.trees.iter().fold(
+                0_u64,
+                |total, tree| {
+                    total.saturating_add(tree.record.asset_amount(self.world.xp_asset).unwrap_or(0))
+                },
+            )),
             player_state_expires_in_seconds,
             player_rollover_margin_seconds,
-            log_drop_basis_points: player::log_drop_basis_points(player_xp),
+            log_drop_basis_points: player::log_drop_basis_points(player_xp_balance),
             player_logs: self
                 .player_state
                 .as_ref()

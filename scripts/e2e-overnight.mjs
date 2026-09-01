@@ -129,6 +129,7 @@ const EXPECTED_WORLD = Object.freeze({
   gameId: 'woodland.sh',
   rulesetId: 'woodland.sh/forest/v3',
   playerLevelCurve: 'woodland-xp-v1',
+  woodcuttingXpPerLog: 25,
   maxPlayerLevel: 99,
   baseLogDropBasisPoints: 2_000,
   levelLogDropBonusBasisPoints: 200,
@@ -238,6 +239,7 @@ function manifestSummary(manifest) {
     rulesetId: manifest.rulesetId,
     genesisTxid: manifest.genesisTxid,
     playerLevelCurve: manifest.playerLevelCurve,
+    woodcuttingXpPerLog: manifest.woodcuttingXpPerLog,
     maxPlayerLevel: manifest.maxPlayerLevel,
     rates: {
       baseLogDropBasisPoints: manifest.baseLogDropBasisPoints,

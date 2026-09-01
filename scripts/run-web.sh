@@ -54,6 +54,6 @@ SERVER_PID=$!
 
 printf '\nwoodland.sh: http://127.0.0.1:%s/\n' "$PORT"
 printf 'Static app, leaderboard, presence, chat, and delegation share this origin.\n'
-printf 'Every LOG drop gives 1 XP. LOG chance rises from 20%% to 30%% at woodland levels 10, 20, 30, 40, and 50.\n'
+printf 'Every LOG drop gives 25 Woodcutting XP. LOG chance rises from 20%% to 30%% at woodland levels 10, 20, 30, 40, and 50.\n'
 printf "Funded stumps regrow in one fresh Ark batch; exhausted trees stay depleted.\n\n"
 wait -n "$WATCHER_PID" "$SERVER_PID"

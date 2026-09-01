@@ -183,6 +183,7 @@ async function main() {
   assert.match(manifest.deployerSigner, /^[0-9a-f]{64}$/);
   assert.match(manifest.manifestSignature, /^[0-9a-f]{128}$/);
   assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');
+  assert.equal(manifest.woodcuttingXpPerLog, 25);
   assert.equal(manifest.maxPlayerLevel, 99);
   assert.equal(manifest.baseLogDropBasisPoints, 2_000);
   assert.equal(manifest.levelLogDropBonusBasisPoints, 200);

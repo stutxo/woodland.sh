@@ -28,6 +28,30 @@ const TARGET_HITS = FULL_E2E ? 5 : 1;
 const ARKD = 'http://127.0.0.1:7070';
 const REQUIRE_RENEWAL_FEE = process.env.WOODLAND_E2E_REQUIRE_RENEWAL_FEE === '1';
 
+function xpForLevel(level) {
+  let points = 0;
+  for (let current = 1; current < level; current += 1) {
+    points += Math.floor(current + 300 * (2 ** (current / 7)));
+  }
+  return Math.floor(points / 4);
+}
+
+function levelFromXp(xp) {
+  let level = 1;
+  while (level < 99 && xp >= xpForLevel(level + 1)) level += 1;
+  return level;
+}
+
+function assertProgression(state, label) {
+  const level = levelFromXp(state.playerXp);
+  assert.equal(state.playerLevel, level, `${label}: level`);
+  assert.equal(
+    state.playerNextLevelXp,
+    level === 99 ? null : xpForLevel(level + 1),
+    `${label}: next-level XP`,
+  );
+}
+
 async function request(method, pathName, body) {
   return webdriverRequest(DRIVER_URL, method, pathName, body);
 }
@@ -140,7 +164,7 @@ async function main() {
     const manifest = await manifestResponse.json();
     const treeCount = manifest.trees.length;
     const totalLogs = manifest.logReservePerTree * treeCount;
-    const totalXp = manifest.xpPerTree * treeCount;
+    const totalXp = manifest.xpPerTree * manifest.woodcuttingXpPerLog * treeCount;
     const chance = `${manifest.baseLogDropBasisPoints / 100}%`;
     const session = await request('POST', '/session', {
       capabilities: {
@@ -415,13 +439,13 @@ async function main() {
           && value.autoChop.success
           && value.autoChop.swings >= 1
           && value.state?.playerLogs === before.state.playerLogs + 1
-          && value.state.playerXp === before.state.playerXp + 1,
+          && value.state.playerXp === before.state.playerXp + manifest.woodcuttingXpPerLog,
         180_000,
       );
       const suffix = after.autoChop.swings === 1 ? 'swing' : 'swings';
       assert.equal(
         after.status,
-        `You get a LOG and 1 XP after ${after.autoChop.swings} ${suffix}.`,
+        `You get a LOG and ${manifest.woodcuttingXpPerLog} Woodcutting XP after ${after.autoChop.swings} ${suffix}.`,
       );
       assert.ok(
         after.autoChop.swings <= 11,
@@ -583,11 +607,14 @@ async function main() {
     assert.equal(new Set(initial.state.trees.map((tree) => `${tree.x}:${tree.y}`)).size, treeCount);
     assert.equal(new Set(initial.state.trees.map((tree) => tree.treeOutpoint)).size, treeCount);
     assert.ok(initial.state.trees.every((tree) => tree.logReserveRemaining === 50_000));
-    assert.ok(initial.state.trees.every((tree) => tree.xpRemaining === 50_000));
+    assert.ok(initial.state.trees.every(
+      (tree) => tree.xpRemaining === manifest.xpPerTree * manifest.woodcuttingXpPerLog,
+    ));
     assert.ok(initial.state.trees.every((tree) => tree.depleted === false));
     assert.equal(initial.state.playerLogs, 0);
     assert.equal(initial.state.fundingRequiredSats, initial.state.dustSats);
     assert.equal(initial.state.playerXp, 0);
+    assert.equal(initial.state.woodcuttingXpPerLog, 25);
     assert.equal(initial.state.playerLevel, 1);
     assert.equal(initial.state.playerNextLevelXp, 83);
     assert.equal(initial.state.seasonXpRemaining, totalXp);
@@ -614,6 +641,7 @@ async function main() {
     assert.match(manifest.deployerSigner, /^[0-9a-f]{64}$/);
     assert.match(manifest.manifestSignature, /^[0-9a-f]{128}$/);
     assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');
+    assert.equal(manifest.woodcuttingXpPerLog, 25);
     assert.equal(manifest.baseLogDropBasisPoints, 2_000);
     assert.equal(manifest.levelLogDropBonusBasisPoints, 200);
     assert.deepEqual(
@@ -743,7 +771,7 @@ async function main() {
     assert.equal(deployed.bagStats, 0);
     assert.equal(deployed.statsRightOfBag, true);
     assert.match(deployed.statsText, /Level 1/);
-    assert.match(deployed.statsText, /0 XP/);
+    assert.match(deployed.statsText, /0 Woodcutting XP/);
     assert.match(deployed.statsText, new RegExp(`LOG drop chance ${chance}`));
     assertLogSupply(deployed.state, totalLogs, 'activated player');
     assertXpAccounting(deployed.state, totalXp, 'activated player');
@@ -1001,13 +1029,15 @@ async function main() {
       );
       assert.equal(
         current.xpRemaining,
-        beforeTree.xpRemaining - Number(success),
+        beforeTree.xpRemaining - Number(success) * manifest.woodcuttingXpPerLog,
       );
       assert.equal(chopped.state.playerLogs, hits);
-      assert.equal(chopped.state.playerXp, before.playerXp + Number(success));
-      assert.equal(chopped.state.playerXp, hits);
-      assert.equal(chopped.state.playerLevel, 1);
-      assert.equal(chopped.state.playerNextLevelXp, 83);
+      assert.equal(
+        chopped.state.playerXp,
+        before.playerXp + Number(success) * manifest.woodcuttingXpPerLog,
+      );
+      assert.equal(chopped.state.playerXp, hits * manifest.woodcuttingXpPerLog);
+      assertProgression(chopped.state, `swing ${attempts}`);
       assert.equal(chopped.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
       assert.equal(chopped.state.lastAttempt.treeId, firstTree.treeId);
       assert.equal(chopped.state.playerStateOutpoint === before.playerStateOutpoint, false);
@@ -1043,7 +1073,7 @@ async function main() {
       chopped.state.walletSats,
     );
     if (!FULL_E2E) {
-      assert.equal(chopped.state.playerXp, 1);
+      assert.equal(chopped.state.playerXp, manifest.woodcuttingXpPerLog);
       assert.equal(chopped.state.playerLogs, 1);
       assert.equal(
         chopped.state.trees.find((tree) => tree.treeId === firstTree.treeId).health,
@@ -1071,14 +1101,17 @@ async function main() {
     assert.equal(chopped.stumpGlyphs, 0);
     assert.equal(chopped.bagLogs, String(TARGET_HITS));
     assert.equal(chopped.logSlotLabel, `${TARGET_HITS} LOG in inventory`);
-    const partialXp = hits;
+    const partialXp = chopped.state.playerXp;
     const partialLogs = chopped.state.playerLogs;
     const partialTree = chopped.state.trees.find(
       (tree) => tree.treeId === firstTree.treeId,
     );
     assert.equal(partialTree.health, 10 - TARGET_HITS);
     assert.equal(partialTree.logReserveRemaining, 50_000 - TARGET_HITS);
-    assert.equal(partialTree.xpRemaining, 50_000 - TARGET_HITS);
+    assert.equal(
+      partialTree.xpRemaining,
+      (50_000 - TARGET_HITS) * manifest.woodcuttingXpPerLog,
+    );
     assert.equal(partialTree.depleted, false);
     assertLogSupply(chopped.state, totalLogs, 'partial first-tree harvest');
     assertXpAccounting(chopped.state, totalXp, 'partial first-tree harvest');
@@ -1146,9 +1179,8 @@ async function main() {
       10 - TARGET_HITS,
     );
     assert.equal(chopped.state.playerLogs, partialLogs + 1);
-    assert.equal(chopped.state.playerXp, partialXp + 1);
-    assert.equal(chopped.state.playerLevel, 1);
-    assert.equal(chopped.state.playerNextLevelXp, 83);
+    assert.equal(chopped.state.playerXp, partialXp + manifest.woodcuttingXpPerLog);
+    assertProgression(chopped.state, 'continuous chop');
     assert.equal(chopped.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
     for (const tree of chopped.state.trees.filter((tree) => tree.treeId !== secondTree.treeId)) {
       assert.equal(tree.treeOutpoint, beforeSecondOutpoints.get(tree.treeId));
@@ -1188,9 +1220,10 @@ async function main() {
       (value) => value.ready
         && value.state?.trees?.length === treeCount
         && value.state.playerActive
-        && value.state.playerXp === partialXp + 1
-        && value.state.playerLevel === 1
-        && value.state.playerNextLevelXp === 83
+        && value.state.playerXp === partialXp + manifest.woodcuttingXpPerLog
+        && value.state.playerLevel === levelFromXp(partialXp + manifest.woodcuttingXpPerLog)
+        && value.state.playerNextLevelXp
+          === xpForLevel(levelFromXp(partialXp + manifest.woodcuttingXpPerLog) + 1)
         && value.state.logDropBasisPoints === manifest.baseLogDropBasisPoints
         && value.state.playerLogs === partialLogs + 1
         && value.state.trees.find((tree) => tree.treeId === firstTree.treeId)?.health

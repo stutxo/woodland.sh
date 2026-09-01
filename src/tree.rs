@@ -596,7 +596,7 @@ pub fn tree_covenant_script(
         .push_opcode(OP_ADD)
         .push_opcode(OP_EQUALVERIFY);
 
-    // XP is conserved and moved into player state as its sole progression value.
+    // XP is conserved and moved into player state as its sole progression backing.
     let builder = push_input_asset_lookup(builder, TREE_INPUT_INDEX, xp_asset)
         .push_int(1)
         .push_opcode(OP_EQUALVERIFY)
@@ -1388,24 +1388,28 @@ mod tests {
             crate::player::LEVEL_LOG_DROP_XP_THRESHOLDS,
             [10, 20, 30, 40, 50].map(|level| crate::player::xp_for_level(level).unwrap())
         );
-        for (xp, basis_points) in [
+        assert_eq!(
+            crate::player::LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS,
+            [47, 179, 535, 1_489, 4_054]
+        );
+        for (xp_balance, basis_points) in [
             (0, 2_000),
-            (1_153, 2_000),
-            (1_154, 2_200),
-            (4_469, 2_200),
-            (4_470, 2_400),
-            (13_362, 2_400),
-            (13_363, 2_600),
-            (37_223, 2_600),
-            (37_224, 2_800),
-            (101_332, 2_800),
-            (101_333, 3_000),
+            (46, 2_000),
+            (47, 2_200),
+            (178, 2_200),
+            (179, 2_400),
+            (534, 2_400),
+            (535, 2_600),
+            (1_488, 2_600),
+            (1_489, 2_800),
+            (4_053, 2_800),
+            (4_054, 3_000),
             (u64::MAX, 3_000),
         ] {
             assert_eq!(
-                crate::player::log_drop_basis_points(xp),
+                crate::player::log_drop_basis_points(xp_balance),
                 basis_points,
-                "XP {xp}"
+                "XP asset balance {xp_balance}"
             );
         }
     }

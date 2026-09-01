@@ -44,17 +44,20 @@ the recursive player state. There is no numeric XP packet, duplicate counter,
 or alternate encoding to forge:
 
 ```text
-player progression X  =  player state owns X XP
+Woodcutting XP  =  25 × player XP asset balance
 ```
 
 XP has no control asset and cannot be reissued. Every successful chop moves one
-XP from the selected tree to player state; every miss moves none.
+XP asset unit from the selected tree to player state and therefore awards 25
+Woodcutting XP; every miss moves none.
 
 Level is derived, never stored. The reachable canonical curve is
-`woodland-xp-v1`: level 2 at 83 XP, with chance boundaries at levels 10, 20,
-30, 40, and 50 (1,154 / 4,470 / 13,363 / 37,224 / 101,333 XP). Base LOG
-chance is 20% and rises two percentage points per boundary to a 30% cap while
-aggregate XP remains fixed and asset-backed.
+`woodland-xp-v1`: level 2 at 83 XP, reached by the fourth successful LOG. Chance
+boundaries remain levels 10, 20, 30, 40, and 50
+(1,154 / 4,470 / 13,363 / 37,224 / 101,333 Woodcutting XP), reached at XP
+asset balances 47 / 179 / 535 / 1,489 / 4,054. Base LOG chance is 20% and rises
+two percentage points per boundary to a 30% cap while aggregate XP asset supply
+remains fixed.
 
 ## Player-Bound Luck
 
@@ -107,17 +110,18 @@ wallet dust input, never by player sats.
 A canonical swing has:
 
 ```text
-input 0:  player state, 1 PLAYER_ID, X XP, M LOG
-input 1:  tree, one TREE, F XP, N LOG, health H > 0
+input 0:  player state, 1 PLAYER_ID, X XP units, M LOG
+input 1:  tree, one TREE, F XP units, N LOG, health H > 0
 
-output 0: same player state, 1 PLAYER_ID, X+G XP, M+G LOG
-output 1: same tree, F-G XP, N-G LOG, health H-G
+output 0: same player state, 1 PLAYER_ID, X+G XP units, M+G LOG
+output 1: same tree, F-G XP units, N-G LOG, health H-G
 output 2: zero-value merged Ark extension
 output 3: canonical zero-value anchor
 ```
 
 `G` is the deterministic reward bit derived from player roll, luck credit, and
-input XP. The four Asset V1 groups are ordered `PLAYER_ID`, `TREE`, `LOG`, `XP`.
+the input XP asset balance. A success adds 25 user-facing Woodcutting XP. The
+four Asset V1 groups are ordered `PLAYER_ID`, `TREE`, `LOG`, `XP`.
 Group zero is exactly one metadata-free, uncontrolled unit assigned from input
 zero to output zero. Zero LOG/XP assignments are omitted while those world
 groups remain present because the tree has positive inventory before a swing.
@@ -207,9 +211,10 @@ against its saved wallet address and reinstates the exact PLAYER_ID profile.
 ## Limits
 
 The player count is unlimited, but season resources are not: the world
-contains exactly 21,000,000 LOG and 21,000,000 XP, all issued into 420
-tree-local reserves of 50,000 each. Harvested LOG leaves player state through
-the owner-authorized withdrawal leaf; XP never leaves.
+contains exactly 21,000,000 LOG and 21,000,000 XP asset units, all issued into
+420 tree-local reserves of 50,000 each. Those XP units represent 525,000,000
+Woodcutting XP. Harvested LOG leaves player state through the owner-authorized
+withdrawal leaf; XP never leaves.
 PLAYER_ID is world-specific. A new deployment has a fresh genesis and fresh
 TREE/LOG/XP AssetIds; an owner may reuse a key, but the transaction-derived
 marker changes.

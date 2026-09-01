@@ -2,7 +2,7 @@
 
 Click a tree and the browser walks beside it, then submits swings until a LOG
 falls. A successful swing also moves one unit of the soulbound XP asset into
-player state.
+player state, awarding 25 user-facing Woodcutting XP.
 
 ## The Frontend Is Not the Game
 
@@ -18,11 +18,12 @@ Protocol v3 creates:
 ```text
 420 TREE
 21,000,000 LOG
-21,000,000 XP
+21,000,000 XP asset units
 ```
 
-Each initial tree owns one TREE, 50,000 LOG, 50,000 XP, health ten, and 330
-sats. No shared vault or shared reserve exists. There is no player-ticket
+Each initial tree owns one TREE, 50,000 LOG, 50,000 XP asset units representing
+1,250,000 Woodcutting XP, health ten, and 330 sats. No shared vault or shared
+reserve exists. There is no player-ticket
 reserve and no allocator service. PLAYER_ID is not a world reserve: each
 activation issues its own one-unit, uncontrolled marker.
 
@@ -58,12 +59,14 @@ metadata-free, uncontrolled unit moving from player input zero to output zero.
 
 ## XP Cannot Be Invented
 
-XP has no numeric packet or second counter: player-held XP is the sole
-progression value. XP is fixed supply with no control asset. Every successful
-swing moves one unit from tree to player; misses move none. Thus:
+XP has no numeric packet or second counter: player-held XP assets are the sole
+progression backing. XP is fixed supply with no control asset. Every successful
+swing moves one unit from tree to player and awards 25 Woodcutting XP; misses
+move none. Thus:
 
 ```text
-sum(tree XP) + sum(player XP) = 21,000,000
+sum(tree XP assets) + sum(player XP assets) = 21,000,000
+Woodcutting XP = 25 × player XP asset balance
 ```
 
 LOG obeys the same conservation equation.
@@ -80,9 +83,10 @@ Reward entropy belongs to the player, not a tree. Activation sets
 publishes `Rnext = SHA256(Rprevious)` and interprets the 32-byte successor as a
 little-endian integer modulo 10,000.
 
-Input XP selects `p`: 2,000 basis points at level 1, plus 200 at levels 10, 20,
-30, 40, and 50, capped at 3,000. Let `C` be luck credit, initially 8,000, and
-`Q = C + p`. The canonical reward bit is:
+The input XP asset balance, scaled by 25 Woodcutting XP per earned unit, selects
+`p`: 2,000 basis points at level 1, plus 200 at levels 10, 20, 30, 40, and 50,
+capped at 3,000. Let `C` be luck credit, initially 8,000, and `Q = C + p`. The
+canonical reward bit is:
 
 ```text
 G = 0                    when Q < 10,000

@@ -656,7 +656,10 @@ try {
   }
   const manifest = await manifestResponse.json();
   expectedLogSupply = manifest.logReservePerTree * manifest.trees.length;
-  expectedXpSupply = manifest.xpPerTree * manifest.trees.length;
+  assert.equal(manifest.woodcuttingXpPerLog, 25);
+  expectedXpSupply = manifest.xpPerTree
+    * manifest.woodcuttingXpPerLog
+    * manifest.trees.length;
   const arkadeHost = new URL(manifest.arkadeServiceUrl).hostname;
   const localFunding = ['127.0.0.1', 'localhost'].includes(arkadeHost);
   if (!localFunding && !FUND_COMMAND) {

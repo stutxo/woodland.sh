@@ -110,7 +110,10 @@ async fn main() -> Result<()> {
             Ok(outcome) => {
                 if outcome.success {
                     logs += 1;
-                    println!("LOG {logs}/{SEASON_BUDGET_LOGS} from tree #{tree_id}");
+                    let xp = logs.saturating_mul(client.manifest().woodcutting_xp_per_log);
+                    println!(
+                        "LOG {logs}/{SEASON_BUDGET_LOGS} from tree #{tree_id} ({xp} Woodcutting XP)"
+                    );
                 } else {
                     println!("miss on tree #{tree_id}");
                 }
@@ -129,6 +132,7 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(SWING_DELAY_MS)).await;
     }
-    println!("season budget reached: {logs} LOG == {logs} XP");
+    let xp = logs.saturating_mul(client.manifest().woodcutting_xp_per_log);
+    println!("season budget reached: {logs} LOG and {xp} Woodcutting XP");
     Ok(())
 }

@@ -21,18 +21,21 @@ groups:
 ```text
 group 0:       420 TREE
 group 1: 21,000,000 LOG
-group 2: 21,000,000 XP
+group 2: 21,000,000 XP asset units
 ```
 
-Each tree receives one TREE, 50,000 LOG, 50,000 XP, health ten, and 330 sats.
-That distributes both complete supplies across exactly 420 tree-local reserves.
+Each tree receives one TREE, 50,000 LOG, 50,000 XP asset units, health ten, and
+330 sats. Every earned XP unit represents 25 Woodcutting XP, so each tree backs
+1,250,000 Woodcutting XP. Both complete asset supplies are distributed across
+exactly 420 tree-local reserves.
 Bootstrap funding is 138,600 sats. There is no vault, control asset,
 PLAYER_TICKET, allocator reserve, invitation, or player registry.
 
 A browser wallet receives one exact 330-sat VTXO and, in one transaction,
 issues a unique uncontrolled PLAYER_ID into recursive player state with its
 canonical roll and initial 8,000 luck credit. Harvested LOG and the soulbound
-XP asset remain in that state; held XP is the sole progression value.
+XP asset remain in that state; user-facing Woodcutting XP is exactly 25 times
+the held XP asset balance.
 
 ## Commands
 

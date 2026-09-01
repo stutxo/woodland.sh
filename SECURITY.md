@@ -50,8 +50,8 @@ Security-sensitive areas include:
 - TREE, LOG, XP, or PLAYER_ID inflation, substitution, assignment, control,
   metadata, or conservation failures.
 - Soulbound-XP bypasses: any path that moves XP out of player state, derives
-  progression from anything but its XP asset balance, or smuggles XP through
-  the withdrawal or renewal leaves.
+  progression from anything but `25 ×` its XP asset balance, changes the signed
+  `woodcuttingXpPerLog` scale, or smuggles XP through withdrawal or renewal.
 - Tree-local reserve or regrowth failures: minted or redirected LOG/XP,
   changed immutable state or sats, an active tree incorrectly resetting health,
   a funded stump failing to regrow in one batch, or a terminal stump becoming

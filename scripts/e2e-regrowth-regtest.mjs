@@ -200,6 +200,7 @@ try {
   assert.equal(manifest.schemaVersion, 3, 'world manifest must be schema 3');
   assert.equal(manifest.protocolVersion, 3, 'world manifest must declare protocol v3');
   assert.equal(manifest.rulesetId, 'woodland.sh/forest/v3');
+  assert.equal(manifest.woodcuttingXpPerLog, 25);
   assert.match(manifest.deployerSigner, /^[0-9a-f]{64}$/);
   assert.match(manifest.manifestSignature, /^[0-9a-f]{128}$/);
   assert.ok(manifest.treeRegrowthArkadeScript);
@@ -293,7 +294,7 @@ try {
   const candidates = chopperState.trees
     .filter((tree) => tree.health === ACTIVE_LOGS_PER_TREE
       && tree.logReserveRemaining === LOG_RESERVE_PER_TREE
-      && tree.xpRemaining === LOG_RESERVE_PER_TREE)
+      && tree.xpRemaining === LOG_RESERVE_PER_TREE * manifest.woodcuttingXpPerLog)
     .sort((left, right) => left.treeId - right.treeId);
   assert.ok(candidates.length > 0, 'no pristine tree is available inside the viewport');
   let target = candidates.find((tree) => tree.treeId === 417) || candidates[0];
@@ -329,14 +330,21 @@ try {
     } else {
       assert.ok(dropped === 0 || dropped === 1, `round ${rounds}: invalid natural drop`);
     }
-    assert.equal(target.xpRemaining, before.xpRemaining - dropped, `round ${rounds}: XP mismatch`);
+    assert.equal(
+      target.xpRemaining,
+      before.xpRemaining - dropped * manifest.woodcuttingXpPerLog,
+      `round ${rounds}: XP mismatch`,
+    );
     assert.equal(target.health, before.health - dropped, `round ${rounds}: health mismatch`);
     drops += dropped;
   }
 
   assert.equal(drops, ACTIVE_LOGS_PER_TREE, 'one full health cycle must yield ten LOG');
   assert.equal(target.logReserveRemaining, LOG_RESERVE_PER_TREE - ACTIVE_LOGS_PER_TREE);
-  assert.equal(target.xpRemaining, LOG_RESERVE_PER_TREE - ACTIVE_LOGS_PER_TREE);
+  assert.equal(
+    target.xpRemaining,
+    (LOG_RESERVE_PER_TREE - ACTIVE_LOGS_PER_TREE) * manifest.woodcuttingXpPerLog,
+  );
   assert.equal(target.depleted, false, 'funded stump must not be terminal');
   const stumpOutpoint = target.treeOutpoint;
   const [, preRegrowth] = await refreshBoth(chopper, regrower, 'pre-regrowth');
@@ -383,7 +391,12 @@ try {
     ACTIVE_LOGS_PER_TREE,
     'chopper must own exactly the ten local LOG removed from the tree',
   );
-  assert.equal(finalChopper.playerXp, ACTIVE_LOGS_PER_TREE);
+  assert.equal(
+    finalChopper.playerXp,
+    ACTIVE_LOGS_PER_TREE * manifest.woodcuttingXpPerLog,
+  );
+  assert.equal(finalChopper.playerLevel, 3);
+  assert.equal(finalChopper.playerNextLevelXp, 276);
 
   const stumpRecord = await waitForIndexedRecord(arkadeBase, stumpOutpoint, true);
   const regrownRecord = await waitForIndexedRecord(arkadeBase, regrown.treeOutpoint, false);

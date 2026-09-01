@@ -283,6 +283,7 @@ async function main() {
     const manifestResponse = await fetch(`${WEB_URL}/world.json`);
     assert.equal(manifestResponse.ok, true, 'world manifest is unavailable');
     const manifest = await manifestResponse.json();
+    assert.equal(manifest.woodcuttingXpPerLog, 25);
     const players = [];
     for (const [index, driverUrl] of driverUrls.entries()) {
       players.push(await createPlayer(driverUrl, `player ${index + 1}`, sessions));
@@ -317,6 +318,7 @@ async function main() {
     for (const view of initial) {
       assert.equal(view.state.playerLogs, 0);
       assert.equal(view.state.playerXp, 0);
+      assert.equal(view.state.woodcuttingXpPerLog, manifest.woodcuttingXpPerLog);
       assert.equal(view.state.playerLevel, 1);
       assert.equal(view.state.playerNextLevelXp, 83);
       assert.equal(view.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
@@ -634,7 +636,7 @@ async function main() {
     )));
     for (const [index, view] of ownChops.entries()) {
       const reward = Number(view.state.lastAttempt.success);
-      assert.equal(view.state.playerXp, reward);
+      assert.equal(view.state.playerXp, reward * manifest.woodcuttingXpPerLog);
       assert.equal(view.state.playerLevel, 1);
       assert.equal(view.state.playerNextLevelXp, 83);
       assert.equal(view.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
@@ -705,7 +707,10 @@ async function main() {
     );
     for (const [index, view] of raced.entries()) {
       const reward = index === winner ? Number(racePredictions[index]) : 0;
-      assert.equal(view.state.playerXp, raceScoresBefore[index].xp + reward);
+      assert.equal(
+        view.state.playerXp,
+        raceScoresBefore[index].xp + reward * manifest.woodcuttingXpPerLog,
+      );
       assert.equal(view.state.playerLogs, raceScoresBefore[index].logs + reward);
       assert.equal(
         view.state.playerStateOutpoint !== racePlayerStateInputs[index],
@@ -724,7 +729,8 @@ async function main() {
         players,
         'smoke concurrent chop synchronization',
         (value, index) => value.state?.playerActive
-          && value.state.playerXp === disjointRewards[index] + raceRewards[index]
+          && value.state.playerXp
+            === (disjointRewards[index] + raceRewards[index]) * manifest.woodcuttingXpPerLog
           && value.state.playerLogs === disjointRewards[index] + raceRewards[index]
           && selectedTrees.every((selected) => (
             value.state.trees.find((tree) => tree.treeId === selected.treeId)?.treeOutpoint
@@ -783,7 +789,10 @@ async function main() {
     }));
     for (const [index, view] of ownChops.entries()) {
       const expectedRewards = 1 + raceRewards[index];
-      assert.equal(view.state.playerXp, expectedRewards);
+      assert.equal(
+        view.state.playerXp,
+        expectedRewards * manifest.woodcuttingXpPerLog,
+      );
       assert.equal(view.state.playerLevel, 1);
       assert.equal(view.state.playerNextLevelXp, 83);
       assert.equal(view.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
@@ -798,7 +807,8 @@ async function main() {
       players,
       'concurrent chop synchronization',
       (value, index) => value.state?.playerActive
-        && value.state.playerXp === 1 + raceRewards[index]
+        && value.state.playerXp
+          === (1 + raceRewards[index]) * manifest.woodcuttingXpPerLog
         && value.state.playerLevel === 1
         && value.state.playerNextLevelXp === 83
         && value.state.logDropBasisPoints === manifest.baseLogDropBasisPoints
