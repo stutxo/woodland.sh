@@ -46,13 +46,10 @@ pub mod server;
 #[cfg(all(feature = "woodland-app", not(target_arch = "wasm32")))]
 mod watchtower;
 
-#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
-pub mod emulator_gate;
-
 pub use keys::Keys;
 
 #[cfg(all(feature = "woodland-app", not(target_arch = "wasm32")))]
 pub(crate) const REGTEST_SERVER: &str = "http://127.0.0.1:7070";
 
 #[cfg(all(feature = "woodland-app", not(target_arch = "wasm32")))]
-pub(crate) const REGTEST_EMULATOR: &str = "http://127.0.0.1:7074";
+pub(crate) const REGTEST_EMULATOR: &str = "http://127.0.0.1:7073";

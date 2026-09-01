@@ -28,12 +28,10 @@ luckWindowBasisPoints = 10000
 initialLuckCredit = 8000
 ```
 
-The manifest pins direct `arkadeServiceUrl` and block-aware `emulatorUrl`
-values plus the operator, emulator, and rollover keys. Fetch both `/v1/info`
-resources directly and verify network, signer, exit delay, version policy,
-330-sat support, extension support, and zero current/scheduled offchain fees.
-Fetch `<emulatorUrl>/v1/block-tip` and require a positive Bitcoin height and
-canonical block hash.
+The manifest pins direct `arkadeServiceUrl` and stock `emulatorUrl` values plus
+the operator, emulator, and rollover keys. Fetch both `/v1/info` resources
+directly and verify network, signer, exit delay, version policy, 330-sat
+support, extension support, and zero current/scheduled offchain fees.
 
 Recompute the three asset IDs from the genesis txid:
 
@@ -64,11 +62,11 @@ from result order. For each declared tree, require exactly one lineage carrying:
 - zero through 50,000 LOG;
 - the same amount of XP as LOG;
 - fixed 330 sats;
-- canonical identity, health, and stump-height packets.
+- canonical identity and health packets.
 
-Active trees have health one through ten and stump height zero. A health-zero
-tree has a positive final-chop height. A funded stump is regrowable at that
-height plus two; a zero-reserve stump is terminal. There is no vault lineage.
+Active trees have health one through ten. A health-zero tree with local LOG is
+a funded stump; one renewal batch regrows it. A zero-reserve stump is terminal.
+There is no vault lineage.
 
 ## Activate Without a Woodland Service
 
@@ -178,13 +176,10 @@ XP:   player X + tree F -> player X+G + tree F-G
 ```
 
 Attach preserved player/tree packets, the next player roll and luck credit,
-next health, next XP, and both Arkade Script entries. Fetch the gate's current
-Bitcoin tip; minimally encode its height with marker `WOODLAND_BLOCK_V1` in the
-tree script witness, which is committed inside the transaction's introspector
-extension. Stamp that height into stump state only when output health becomes
-zero. Sign player state and its checkpoint with the owner key. Submit through
-the emulator gate, verify byte-identical unsigned transactions and the exact
-signature matrix, then finalize through Arkade.
+next health, next XP, and both Arkade Script entries. Sign player state and its
+checkpoint with the owner key. Submit directly to the stock emulator, verify
+byte-identical unsigned transactions and the exact signature matrix, then
+finalize through Arkade.
 
 Automation should supply explicit expected tree outpoint, player-state outpoint,
 and drop bit. Reject locally if any changed after refresh.
@@ -217,12 +212,10 @@ self-send without receiving the player secret.
 
 ## Permissionless Tree Regrowth
 
-Refresh the selected tree and gate tip. For a funded health-zero tree stamped
-at `H`, reject locally until the current height is at least `H + 2`. Build the
-tree renewal intent as an exact self-send: preserve TREE, LOG, XP, identity,
-script, and sats; set health to ten and stump height to zero; carry the same
-canonical block witness used by chop. No player state, player-key authorization,
-or woodland service authorization participates.
+Refresh the selected tree. For a funded health-zero tree, build one version-2
+tree renewal intent: preserve TREE, LOG, XP, identity, script, and sats exactly,
+and set health to ten. No player state, player-key authorization, timer,
+block-height witness, or woodland service authorization participates.
 
 ## Headless Rust Client
 
@@ -238,7 +231,7 @@ let player = client.sync_player().await?;
 let trees = client.trees(&[]).await?; // every lineage head, logs/health decoded
 let outcome = client.chop(tree_id).await?;
 client.withdraw_log(500, None).await?; // LOG only; XP is soulbound
-client.regrow(tree_id).await?;         // permissionless after two Bitcoin tips
+client.regrow(tree_id).await?;         // permissionless one-batch regrowth
 let outpoint = client.renew_player().await?;
 ```
 

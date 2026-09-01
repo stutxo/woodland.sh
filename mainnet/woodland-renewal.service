@@ -1,8 +1,8 @@
 # Renewal watcher unit. Separate from woodland-server because the watcher is
 # mandatory while the social server is optional: an expired tree is swept by
-# the Arkade service and cannot be recovered. Tree renewal and eligible
-# two-tip regrowth are permissionless {operator, emulator} covenant self-sends;
-# this service receives no private key.
+# the Arkade service and cannot be recovered. Tree renewal and one-batch stump
+# regrowth are permissionless {operator, emulator} covenant self-sends; this
+# service receives no private key.
 [Unit]
 Description=woodland.sh mainnet renewal watcher
 After=network-online.target

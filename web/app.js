@@ -745,7 +745,7 @@ function updateMapHint(adjacent) {
   else if (adjacent?.health === 0) {
     mapHint.textContent = adjacent.depleted
       ? `Tree #${adjacent.treeId} has exhausted its local reserve.`
-      : `Tree #${adjacent.treeId} can regrow at Bitcoin height ${adjacent.regrowAtHeight}; click it to try.`;
+      : `Tree #${adjacent.treeId} can regrow in one fresh batch; click it to renew.`;
   }
   else if (!state.playerActive) mapHint.textContent = 'Fund and activate the player.';
   else if (!state.fundingReady) mapHint.textContent = 'Player state is reconciling.';
@@ -1012,7 +1012,7 @@ function render() {
   if (tree) {
     element('tree-id').textContent = `#${tree.treeId} at (${tree.x}, ${tree.y})`;
     element('tree-health').textContent = tree.health === 0
-      ? (tree.depleted ? 'exhausted stump' : `stump; regrow at height ${tree.regrowAtHeight}`)
+      ? (tree.depleted ? 'exhausted stump' : 'funded stump; click to regrow')
       : `${tree.health} active`;
     element('tree-reserve').textContent = `${tree.logReserveRemaining} LOG`;
     element('tree-xp').textContent = `${tree.xpRemaining} XP`;
@@ -1459,8 +1459,6 @@ async function boot() {
       x: tree.x,
       y: tree.y,
       health: manifest.activeLogsPerTree,
-      stumpHeight: 0,
-      regrowAtHeight: null,
       logReserveRemaining: manifest.logReservePerTree,
       xpRemaining: manifest.xpPerTree,
       valueSats: manifest.dustSats,
@@ -1574,6 +1572,17 @@ async function boot() {
     globalThis.__WOODLAND_E2E_CHOP_MUTATION = async (mutation, treeId) => {
       await withApp(() => app.testChopMutation(treeId, mutation));
       return withApp(() => app.refresh());
+    };
+    globalThis.__WOODLAND_E2E_CHOP_NATURAL = async (treeId) => {
+      try {
+        adoptState(await withApp(() => app.chop(Number(treeId))));
+        render();
+        return { ok: true, state, natural: true };
+      } catch (error) {
+        adoptState(await withApp(() => app.refresh()));
+        render();
+        return { ok: false, message: String(error), state, natural: true };
+      }
     };
     globalThis.__WOODLAND_E2E_CHOP_EXPECTED = async (...args) => {
       try {

@@ -28,7 +28,7 @@ rollover:    m/1464815428'/1'/0'/1'
 
 Role `0'` derives the deployer child from the deployment root. Role `1'` derives
 the rollover child from the independent operations root. Tree renewal and
-two-tip regrowth are permissionless covenant leaves, so no additional
+one-batch regrowth are permissionless covenant leaves, so no additional
 project-held lifecycle key exists.
 
 The paths and `public.json` are public. The mnemonic and derived secret files are
@@ -116,11 +116,10 @@ it spent. The Woodland contention soak reproduced permanent TREE, LOG, and XP
 supply inflation on the older pinned build. Verify this fix independently in
 the provider's exact version before funding.
 
-`WOODLAND_EMULATOR_URL` must be the public HTTPS woodland gate, not a stock
-emulator endpoint. Run the pinned stock emulator on loopback behind that gate
-and give the gate loopback access to a fully validated Bitcoin Core node. The
-gate proxies `/v1/info` unchanged, so the independently verified emulator signer
-and version pins still refer to the stock emulator.
+`WOODLAND_EMULATOR_URL` must be the public HTTPS endpoint of the independently
+verified stock Arkade Script emulator. Its `/v1/info` signer and version must
+match the explicit deployment pins. Do not place an unpinned proxy or alternate
+signer between clients and that endpoint.
 
 Follow the deployment sequence in the repository `README.md`:
 
@@ -130,8 +129,8 @@ Follow the deployment sequence in the repository `README.md`:
    reported amount (138,600 sats at 330-sat dust);
 4. run `woodland-operator ensure` until complete;
 5. require `woodland-operator status` to report `ready`;
-6. verify exactly 420 tree VTXOs, each with 50,000 LOG/XP, health ten, stump
-   height zero, and fixed total asset supplies;
+6. verify exactly 420 tree VTXOs, each with 50,000 LOG/XP, health ten, and fixed
+   total asset supplies;
 7. back up and commit the public manifest.
 
 After verification, remove `WOODLAND_DEPLOYER_SECRET` from online systems. If
@@ -141,54 +140,28 @@ host when delegated player renewal is enabled; otherwise keep it offline. It has
 no ongoing use on the deployment machine or tree watcher. Keep the operations
 root offline permanently.
 
-## Emulator gate host
+## Stock emulator host
 
-The gate, stock emulator, and Bitcoin Core RPC form one security boundary. Run
-the stock emulator at `127.0.0.1:7073`, Bitcoin Core RPC at
-`127.0.0.1:8332`, and the gate at `127.0.0.1:7074`. Firewall both private
-ports; never publish the stock emulator or RPC endpoint.
+Run the pinned stock emulator on `127.0.0.1:7073`. Terminate TLS in a reverse
+proxy and expose that emulator directly from `WOODLAND_EMULATOR_URL`. Preserve
+request bodies, permit the emulator's largest supported transaction, and
+rate-limit POST routes by source IP.
 
-Build and install the gate:
+The browser calls this origin directly. Configure the reverse proxy with the
+exact frontend origin for CORS; do not use wildcard CORS for credentialed or
+administrative routes. CORS is not an authentication or denial-of-service
+boundary. A separate Pages frontend therefore needs its own exact allowed
+origin.
 
-```bash
-cargo build --release --locked --features server --bin woodland-emulator-gate
-sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin woodland-gate
-```
-
-```text
-/opt/woodland/woodland-emulator-gate                 root:root           0555
-/etc/woodland/emulator-gate.env                      root:woodland-gate  0640
-/etc/systemd/system/woodland-emulator-gate.service   root:root           0644
-```
-
-Populate `emulator-gate.env` from `emulator-gate.env.example`. Use a dedicated
-Bitcoin Core `rpcauth` credential and the one canonical HTTPS frontend origin.
-The RPC credential grants access to a security-sensitive Core endpoint; do not
-place it in the world manifest, reverse-proxy configuration, service command
-line, or logs.
-
-Terminate TLS in a reverse proxy and expose the gate origin from
-`WOODLAND_EMULATOR_URL`. Forward only to `127.0.0.1:7074`, preserve request
-bodies, permit at least the gate's 32 MiB body limit, and rate-limit POST routes
-by source IP. The gate's exact CORS origin must match the deployed frontend.
-CORS is not an authentication or denial-of-service boundary. A separate Pages
-frontend therefore requires its own configured origin rather than a wildcard.
-
-Enable and verify:
+Verify:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now woodland-emulator-gate.service
-sudo journalctl -u woodland-emulator-gate.service -f
-curl --fail https://emulator-gate.example/health.json
-curl --fail https://emulator-gate.example/v1/block-tip
+curl --fail https://emulator.example/v1/info
 ```
 
-Require `ready: true`; compare the returned height and hash to the local
-`bitcoin-cli getblockchaininfo`, and require `/v1/info` to match the independently
-recorded stock-emulator signer and version. Monitor gate restarts, Core RPC
-latency, `/health.json`, `/v1/block-tip`, and rejected attestation counts at the
-reverse proxy. A dishonest or bypassed gate can waive the two-tip delay.
+Require the independently recorded stock-emulator signer and version. Monitor
+emulator restarts, `/v1/info` latency, signing failures, and reverse-proxy
+rejections.
 
 ## Renewal watcher host
 
@@ -212,9 +185,8 @@ Use:
 Populate `mainnet.env` from `operations.env.example`; do not copy in either
 generated child secret or either root. The tree watcher receives no private key.
 Tree renewal and regrowth are permissionless `{operator, emulator}` covenant
-self-sends. Active renewal preserves all tree state. A funded zero-health stump
-regrows to health ten only after the emulator gate observes two Bitcoin tip
-advances since the final chop; a zero-reserve stump remains terminal.
+self-sends. Active renewal preserves health. One fresh batch regrows a funded
+zero-health stump to health ten; a zero-reserve stump remains terminal.
 
 Enable the watcher:
 
@@ -230,16 +202,16 @@ Require the log line:
 woodland.sh renewal watcher ready
 ```
 
-Active-tree renewal triggers when remaining lifetime drops below half the
-observed batch lifetime, clamped to a maximum of 12 hours. Eligible funded
-stumps are selected as soon as the gate reports `stumpHeight + 2`. Trees
-deployed in the same session expire close together, so expect correlated
-renewal waves; the watcher renews up to eight trees concurrently and reports a
-`missingExpiry` count whenever the indexer omits a live tree's expiry. Any
-nonzero count, renewal failure, or persistent gate-tip failure warrants
-immediate attention: an expired tree is swept by the Arkade service and cannot
-be recovered. A forced rollover bypasses earliness and safety-margin checks but
-never expiry, local-reserve invariants, or the two-tip regrowth requirement.
+Non-funded tree lineages renew when remaining lifetime drops below half the
+observed batch lifetime, clamped to a maximum of 12 hours. Funded stumps are
+selected immediately and regrow in that one renewal batch. Trees deployed in
+the same session expire close together, so expect correlated renewal waves; the
+watcher renews up to eight trees concurrently and reports a `missingExpiry`
+count whenever the indexer omits a live tree's expiry. Any nonzero count,
+renewal failure, or persistent emulator failure warrants immediate attention:
+an expired tree is swept by the Arkade service and cannot be recovered. A forced
+rollover bypasses earliness and safety-margin checks but never expiry or
+local-reserve invariants.
 
 Registration failures and abandoned pre-forfeit joins are cleaned up by a
 signed ownership proof before the watcher retries, including queued intents
@@ -253,8 +225,7 @@ sudo WOODLAND_FORCE_ROLLOVER=1 /opt/woodland/woodland-operator renew /etc/woodla
 
 Run one active watcher. Additional operators should remain passive standbys;
 concurrent watchers can race the same tree outpoints. Monitor process uptime,
-reconnect errors, Arkade `/v1/info`, gate `/health.json` and `/v1/block-tip`,
-Bitcoin tip lag, and tree renewal failures.
+reconnect errors, Arkade and emulator `/v1/info`, and tree renewal failures.
 
 ## Optional game-server host
 
@@ -332,8 +303,8 @@ curl --fail https://replace-with-server-api.example/health.json
 ```
 
 Monitor `ready`, `lastRefreshAt`, `lastError`, `onlinePlayers`,
-`delegationAvailable`, process restarts, registry size, Arkade/emulator-gate
-latency, and disk writes. Signed registration and delegation persist in
+`delegationAvailable`, process restarts, registry size, Arkade/emulator latency,
+and disk writes. Signed registration and delegation persist in
 `/var/lib/woodland-server/players.json`; presence expires after 60 seconds and
 the newest 200 chat messages remain in memory only. Registration has no
 self-service deletion API. Honor removal requests by stopping the service,
@@ -350,5 +321,5 @@ origin. Leaving it unset removes the social UI and API origin from the Pages
 artifact. Push `main`; the gated Pages workflow builds and deploys the static
 site only after CI and regtest pass.
 
-Set `WOODLAND_EMULATOR_GATE_ORIGIN` to the Pages origin before publishing; the
-gate intentionally supports one exact browser origin, not wildcard CORS.
+Configure the public emulator reverse proxy to allow the exact Pages origin
+before publishing; do not enable wildcard CORS.

@@ -324,7 +324,7 @@ new player + new tree + extension + anchor</pre>
           </section>
           <section class="about-contract">
             <h3>Tree</h3>
-            <p>Each of exactly 420 trees occupies a separate VTXO using one shared contract template. It holds 330 sats, one TREE marker, coordinates, health, stump height, and its remaining local LOG and XP.</p>
+            <p>Each of exactly 420 trees occupies a separate VTXO using one shared contract template. It holds 330 sats, one TREE marker, coordinates, health, and its remaining local LOG and XP.</p>
             <p>Every tree starts with 50,000 LOG, 50,000 XP, and ten health. Its only state paths are chopping and permissionless renewal or regrowth; there is no shared supply vault.</p>
           </section>
         </div>
@@ -336,9 +336,8 @@ miss:    assets and health unchanged · player roll/luck advances</pre>
         <p>This reciprocal check prevents crediting a player without debiting a tree, forging XP, changing identity, or redirecting assets.</p>
 
         <h2>Renewal, regrowth, permission, and trust</h2>
-        <p>Arkade VTXOs have finite batch lifetimes. Renewal consumes a state VTXO and recreates it in a fresh batch without changing its state. A funded stump may instead reset from zero to ten health only after two observed Bitcoin tip advances. Anyone can submit that regrowth; neither a player key nor a woodland-held lifecycle key is required.</p>
-        <p>The canonical Bitcoin-height witness is serialized in the transaction’s introspector extension, so transaction signatures commit it. The woodland emulator gate checks that witness against its Bitcoin Core tip before forwarding the transaction to the stock Arkade emulator. This emulates the relative block delay that Arkade Script cannot read directly.</p>
-        <p>“Permissionless” does not mean signature-free or unrestricted. The Arkade operator and script-tweaked emulator still approve only the transaction shape allowed by the selected path. Bitcoin Taproot enforces the complete signer closure; the trusted gate supplies the external Bitcoin-height observation.</p>
+        <p>Arkade VTXOs have finite batch lifetimes. Renewal consumes a state VTXO and recreates it in one fresh batch. An active tree preserves its health; a funded stump resets from zero to ten health in that same renewal. Anyone can submit tree renewal or regrowth; neither a player key nor a woodland-held lifecycle key is required.</p>
+        <p>“Permissionless” does not mean signature-free or unrestricted. The Arkade operator and script-tweaked stock emulator still approve only the exact self-send allowed by the renewal covenant. Bitcoin Taproot enforces the complete signer closure.</p>
 
         <details class="covenant-details">
           <summary>More technical details: the covenant scripts (not required to play)</summary>
@@ -433,19 +432,18 @@ player XP out          = player XP in + G</pre>
 
             <section class="covenant-script">
               <h3>5. Tree renewal and regrowth — <code>tree_renewal_covenant_script</code></h3>
-              <p>Tree renewal preserves the exact P2TR, sat value, tree identity, TREE marker, and LOG/XP balances while moving the state into a fresh Arkade batch. Every transition carries a canonical Bitcoin-height witness committed inside the transaction’s introspector extension.</p>
+              <p>Tree renewal preserves the exact P2TR, sat value, tree identity, TREE marker, and LOG/XP balances while moving the state into one fresh Arkade batch.</p>
               <pre class="about-flow" aria-label="Tree stump regrowth rule">active tree:
-    preserve health and stump height 0
-funded stump at height H:
-    require attested height ≥ H + 2
-    output health = 10 and stump height = 0
+    preserve health
+funded stump:
+    output health = 10
 terminal stump with no LOG:
     preserve health 0; regrowth is unavailable</pre>
-              <p>The final successful chop stamps its attested height into the stump state. The emulator gate verifies the current Bitcoin Core height before forwarding to the signer; the covenant verifies the same height, the two-tip delay, and exact local-reserve preservation.</p>
+              <p>No timer, height witness, or project-held lifecycle key gates this transition. The covenant derives the only allowed health change from the stump’s own conserved LOG reserve.</p>
             </section>
 
             <h2>Canonical numeric encoding</h2>
-            <p>XP, health, stump height, and luck credit use fixed-width numeric packets. Each program checks the byte length, converts with <code>BIN2NUM</code>, converts back with <code>NUM2BIN</code>, compares the exact bytes, and rejects negative values. This prevents alternate encodings such as negative zero from representing the same apparent number with different committed bytes.</p>
+            <p>XP, health, and luck credit use fixed-width numeric packets. Each program checks the byte length, converts with <code>BIN2NUM</code>, converts back with <code>NUM2BIN</code>, compares the exact bytes, and rejects negative values. This prevents alternate encodings such as negative zero from representing the same apparent number with different committed bytes.</p>
 
             <h2>Activation and manifest checks</h2>
             <p>Activation is not a separate covenant leaf: it spends an ordinary wallet VTXO and creates the first player state. On the first recursive spend, every player leaf recognizes the direct-activation shape and requires the identity-derived roll, PLAYER_ID group zero, and initial luck credit 8,000.</p>

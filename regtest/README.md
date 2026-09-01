@@ -1,8 +1,8 @@
 # woodland.sh Regtest
 
 This directory provides the minimal local stack used by woodland.sh protocol v2:
-Bitcoin Core, indexers, stock arkd/arkd-wallet, Redis, the stock Arkade Script
-emulator, and the woodland Bitcoin-height gate.
+Bitcoin Core, indexers, stock arkd/arkd-wallet, Redis, and the stock Arkade
+Script emulator.
 
 ## Run
 
@@ -12,9 +12,8 @@ emulator, and the woodland Bitcoin-height gate.
 ```
 
 Open `http://127.0.0.1:8000/`. `woodland-server` serves both `dist/` and every
-`/v1/*` API on that origin. Gameplay calls local arkd on 7070 and the woodland
-gate on 7074; the stock emulator is private on loopback port 7073. A separate
-local renewal watcher runs alongside Axum.
+`/v1/*` API on that origin. Gameplay calls local arkd on 7070 and the stock
+emulator on 7073. A separate local renewal watcher runs alongside Axum.
 
 Protocol v2 uses manifest schema 2. A fresh world creates three fixed-supply
 groups:
@@ -25,10 +24,10 @@ group 1: 21,000,000 LOG
 group 2: 21,000,000 XP
 ```
 
-Each tree receives one TREE, 50,000 LOG, 50,000 XP, health ten, stump height
-zero, and 330 sats. That distributes both complete supplies across exactly 420
-tree-local reserves. Bootstrap funding is 138,600 sats. There is no vault,
-control asset, PLAYER_TICKET, allocator reserve, invitation, or player registry.
+Each tree receives one TREE, 50,000 LOG, 50,000 XP, health ten, and 330 sats.
+That distributes both complete supplies across exactly 420 tree-local reserves.
+Bootstrap funding is 138,600 sats. There is no vault, control asset,
+PLAYER_TICKET, allocator reserve, invitation, or player registry.
 
 A browser wallet receives one exact 330-sat VTXO and, in one transaction,
 issues a unique uncontrolled PLAYER_ID into recursive player state with its
@@ -64,15 +63,14 @@ c7c3184f5cd416e231023f717489a5b0550960cc
 
 The source defaults to `.cache/arkd-stock`. Startup verifies expected image tags
 and stock-emulator version before deployment. Protocol v2 requires no custom
-arkd or emulator patch; the separate gate enforces Bitcoin-height attestations.
+arkd, emulator patch, or policy proxy.
 
 ## Renewal
 
 The manifest pins one `rolloverSigner` for optional player watchtower
 authorization. Active players renew directly with their owner key. Tree renewal
-and eligible two-tip stump regrowth are permissionless covenant self-sends; the
-watcher submits active renewals near expiry and funded regrowth after the gate
-observes two Bitcoin tip advances.
+and one-batch funded-stump regrowth are permissionless covenant self-sends; the
+watcher submits active renewals near expiry and funded stumps immediately.
 
 Run one pre-game pass with:
 
@@ -104,8 +102,8 @@ manifest to a deliberate tracked deployment path, then set
 `WOODLAND_PAGES_MANIFEST` to that path. Set `WOODLAND_SERVER_URL` to enable the
 optional social, leaderboard, and renewal-delegation UI.
 
-The browser contacts the manifest-pinned public Arkade service and emulator gate
-directly. The manifest and GitHub Pages artifact contain no secrets.
+The browser contacts the manifest-pinned public Arkade service and stock
+emulator directly. The manifest and GitHub Pages artifact contain no secrets.
 
 ## Deployment Configuration
 
@@ -163,7 +161,7 @@ It stops at the first failure and writes an atomic summary plus per-cycle
 artifacts under `regtest/_build/overnight/`.
 
 For a four-hour matrix covering 24-player bursts, four simultaneous tree groups,
-browser reload recovery, renewal, and two-tip stump regrowth:
+browser reload recovery, renewal, and one-batch stump regrowth:
 
 ```bash
 ./scripts/test-aggressive.sh

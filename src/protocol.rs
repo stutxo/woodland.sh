@@ -10,7 +10,6 @@ pub const PLAYER_ROLL_PACKET_TYPE: u8 = 5;
 pub const PLAYER_XP_PACKET_TYPE: u8 = 6;
 pub const TREE_HEALTH_PACKET_TYPE: u8 = 7;
 pub const PLAYER_LUCK_CREDIT_PACKET_TYPE: u8 = 8;
-pub const TREE_STUMP_HEIGHT_PACKET_TYPE: u8 = 9;
 
 pub const PLAYER_STATE_INPUT_INDEX: usize = 0;
 pub const TREE_INPUT_INDEX: usize = 1;

@@ -16,7 +16,7 @@ use std::str::FromStr;
 pub(crate) const GAME_ID: &str = "woodland.sh";
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
 /// No-vault world: all fixed-supply assets live on 420 recursive trees and
-/// stumps regrow only after two emulator-attested Bitcoin tip advances.
+/// funded stumps regrow in one permissionless renewal batch.
 pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub(crate) const PROTOCOL_DUST_SATS: u64 = 330;
 pub(crate) const ACTIVE_LOGS_PER_TREE: u64 = 10;
@@ -652,7 +652,7 @@ mod tests {
             &params,
             &emulator_params,
             "http://127.0.0.1:7070",
-            "http://127.0.0.1:7074",
+            "http://127.0.0.1:7073",
             rollover,
             tree_asset,
             log_asset,
@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(world.trees[0].state, tree_states()[0]);
         assert_eq!(world.xp_asset.to_string(), parsed.xp_asset);
         assert_eq!(parsed.arkade_service_url, "http://127.0.0.1:7070");
-        assert_eq!(parsed.emulator_url, "http://127.0.0.1:7074");
+        assert_eq!(parsed.emulator_url, "http://127.0.0.1:7073");
         assert_eq!(parsed.game_id, GAME_ID);
         assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
         assert_eq!(parsed.player_level_curve, crate::player::PLAYER_LEVEL_CURVE);

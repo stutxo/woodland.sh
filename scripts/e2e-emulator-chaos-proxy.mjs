@@ -3,7 +3,7 @@ import http from 'node:http';
 
 const HOST = process.env.WOODLAND_CHAOS_PROXY_HOST || '127.0.0.1';
 const PORT = Number(process.env.WOODLAND_CHAOS_PROXY_PORT || 7075);
-const UPSTREAM = new URL(process.env.WOODLAND_CHAOS_UPSTREAM_URL || 'http://127.0.0.1:7074');
+const UPSTREAM = new URL(process.env.WOODLAND_CHAOS_UPSTREAM_URL || 'http://127.0.0.1:7073');
 const MAX_CONTROL_BODY_BYTES = 16 * 1024;
 const UPSTREAM_TIMEOUT_MS = 180_000;
 const TX_PATH = '/v1/tx';

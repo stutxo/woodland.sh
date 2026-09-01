@@ -69,7 +69,6 @@ struct World {
 struct LiveTree {
     state: TreeState,
     health: TreeHealth,
-    stump_height: tree::TreeStumpHeight,
     deployment_txid: Txid,
     record: VtxoRecord,
     previous_tx: Option<Transaction>,
@@ -215,8 +214,6 @@ struct TreeView {
     x: u16,
     y: u16,
     health: u64,
-    stump_height: u64,
-    regrow_at_height: Option<u64>,
     log_reserve_remaining: u64,
     xp_remaining: u64,
     value_sats: u64,
@@ -231,7 +228,7 @@ struct TreeView {
     next_drop: bool,
     expires_in_seconds: Option<i64>,
     /// True when the tree's local LOG/XP reserve is permanently exhausted.
-    /// A funded stump is instead permissionlessly regrowable after two tips.
+    /// A funded stump is instead permissionlessly regrowable in one batch.
     depleted: bool,
 }
 
@@ -291,11 +288,6 @@ impl WoodlandApp {
         }
         let emulator = EmulatorRest::new(emulator);
         let emulator_params = emulator.get_info().await.map_err(js_err)?;
-        emulator
-            .get_block_tip()
-            .await
-            .context("verify trusted block-aware emulator gate")
-            .map_err(js_err)?;
         let keys = match secret_key.filter(|value| !value.trim().is_empty()) {
             Some(secret) => Keys::from_hex(secret.trim()).map_err(js_err)?,
             None => Keys::generate().map_err(js_err)?,
@@ -593,7 +585,7 @@ impl WoodlandApp {
         self.refresh().await
     }
 
-    /// Permissionlessly regrow a funded stump after two attested Bitcoin tips.
+    /// Permissionlessly regrow a funded stump in one fresh Ark batch.
     pub async fn regrow(&mut self, tree_id: u32) -> Result<JsValue, JsValue> {
         self.regrow_tree_inner(tree_id).await.map_err(js_err)?;
         self.refresh().await
@@ -772,9 +764,6 @@ impl WoodlandApp {
                     x: tree.state.x,
                     y: tree.state.y,
                     health: tree.health.value(),
-                    stump_height: tree.stump_height.value(),
-                    regrow_at_height: (tree.health.value() == 0 && logs > 0)
-                        .then(|| tree.stump_height.value() + tree::REGROWTH_BLOCKS),
                     log_reserve_remaining: logs,
                     xp_remaining: xp_balance,
                     value_sats: tree.record.amount_sats,
@@ -786,8 +775,8 @@ impl WoodlandApp {
                     #[cfg(feature = "regtest-e2e")]
                     next_drop,
                     expires_in_seconds: tree.record.expires_in(now),
-                    // A funded stump is regrowable by anyone after two
-                    // Bitcoin tip advances. Zero local reserve is terminal.
+                    // One permissionless batch regrows a funded stump.
+                    // Zero local reserve is terminal.
                     depleted: logs == 0,
                 }
             })
@@ -984,7 +973,6 @@ impl WoodlandApp {
                 discovered.push(LiveTree {
                     state: declared.state,
                     health: tree::TreeHealth::new(self.world.manifest.active_logs_per_tree)?,
-                    stump_height: tree::TreeStumpHeight::new(0)?,
                     deployment_txid: declared.deployment_txid,
                     record,
                     previous_tx: None,
@@ -1020,8 +1008,6 @@ impl WoodlandApp {
                 .ok_or_else(|| anyhow!("current tree transaction has no state packet"))?;
             let health = tree::tree_health_from_tx(&previous_tx)?
                 .ok_or_else(|| anyhow!("current tree transaction has no health packet"))?;
-            let stump_height = tree::tree_stump_height_from_tx(&previous_tx)?
-                .ok_or_else(|| anyhow!("current tree transaction has no stump height packet"))?;
             let declared = declared_by_state
                 .get(&state)
                 .copied()
@@ -1030,13 +1016,11 @@ impl WoodlandApp {
             let transition = tree::classify_transition(&previous_tx, is_deployment)?;
             let expected_vout = transition.output_index();
             if record.outpoint.vout != expected_vout
-                || (is_deployment
-                    && (health.value() != self.world.manifest.active_logs_per_tree
-                        || stump_height.value() != 0))
+                || (is_deployment && health.value() != self.world.manifest.active_logs_per_tree)
             {
                 return Err(anyhow!("current tree record has an invalid lineage"));
             }
-            validate_tree_local_state(&record, &self.world, health, stump_height)?;
+            validate_tree_local_state(&record, &self.world, health)?;
             if let Some(competing) = seen_states.insert(state, record.outpoint) {
                 return Err(transient_index_snapshot(format!(
                     "tree {} exposes competing spendable lineages {competing} and {}",
@@ -1046,7 +1030,6 @@ impl WoodlandApp {
             discovered.push(LiveTree {
                 state,
                 health,
-                stump_height,
                 deployment_txid: declared.deployment_txid,
                 last_attempt_txid: (transition == tree::TreeTransition::Chop)
                     .then_some(record.outpoint.txid),
@@ -1146,7 +1129,7 @@ impl WoodlandApp {
                     current.deployment_txid,
                 )?;
             }
-            validate_tree_local_state(&record, &self.world, current.health, current.stump_height)?;
+            validate_tree_local_state(&record, &self.world, current.health)?;
             self.trees[tree_index].record = record;
             return Ok(());
         }
@@ -1163,17 +1146,14 @@ impl WoodlandApp {
         }
         let health = tree::tree_health_from_tx(&previous_tx)?
             .ok_or_else(|| anyhow!("selected tree transaction has no health packet"))?;
-        let stump_height = tree::tree_stump_height_from_tx(&previous_tx)?
-            .ok_or_else(|| anyhow!("selected tree transaction has no stump height packet"))?;
         let transition = tree::classify_transition(&previous_tx, false)?;
         if record.outpoint.vout != transition.output_index() {
             return Err(anyhow!("selected tree successor has an invalid output"));
         }
-        validate_tree_local_state(&record, &self.world, health, stump_height)?;
+        validate_tree_local_state(&record, &self.world, health)?;
         self.trees[tree_index] = LiveTree {
             state,
             health,
-            stump_height,
             deployment_txid: current.deployment_txid,
             last_attempt_txid: (transition == tree::TreeTransition::Chop)
                 .then_some(record.outpoint.txid),
@@ -1713,11 +1693,6 @@ impl WoodlandApp {
             .previous_tx
             .as_ref()
             .ok_or_else(|| anyhow!("tree stump has no indexed creating transaction"))?;
-        let block_tip = self
-            .emulator
-            .get_block_tip()
-            .await
-            .context("read attested Bitcoin tip before regrowth")?;
         let prepared = crate::renewal::prepare_tree(
             &tree.record,
             previous_tx,
@@ -1726,7 +1701,6 @@ impl WoodlandApp {
             self.world.log_asset,
             self.world.xp_asset,
             self.params.dust_sats,
-            block_tip.height,
             0,
         )?;
         let services = crate::batch::BatchServices::connect(
@@ -1758,7 +1732,6 @@ impl WoodlandApp {
             .ok_or_else(|| anyhow!("regrown tree disappeared from the world"))?;
         if regrown.record.outpoint != outcome.outpoint
             || regrown.health.value() != tree::LOGS_PER_TREE
-            || regrown.stump_height.value() != 0
         {
             return Err(anyhow!("regrown tree state is invalid"));
         }
@@ -1861,11 +1834,6 @@ impl WoodlandApp {
                 ));
             }
         }
-        let block_tip = self
-            .emulator
-            .get_block_tip()
-            .await
-            .context("read attested Bitcoin tip before chop")?;
         let prepared = crate::chop::prepare_chop(
             &self.keys,
             &self.info,
@@ -1892,7 +1860,6 @@ impl WoodlandApp {
                     .expect("selected tree transaction was loaded"),
                 health: tree.health,
             },
-            block_tip.height,
             mutation,
         )?;
         let success = prepared.success;
@@ -2008,18 +1975,10 @@ impl WoodlandApp {
         .validate()?;
         let accepted_health = tree::tree_health_from_tx(&chop_tx)?
             .ok_or_else(|| anyhow!("accepted chop omitted tree health"))?;
-        let accepted_stump_height = tree::tree_stump_height_from_tx(&chop_tx)?
-            .ok_or_else(|| anyhow!("accepted chop omitted tree stump height"))?;
-        validate_tree_local_state(
-            &tree_record,
-            &self.world,
-            accepted_health,
-            accepted_stump_height,
-        )?;
+        validate_tree_local_state(&tree_record, &self.world, accepted_health)?;
         self.trees[tree_index] = LiveTree {
             state: tree.state,
             health: accepted_health,
-            stump_height: accepted_stump_height,
             deployment_txid: tree.deployment_txid,
             record: tree_record,
             previous_tx: Some(chop_tx.clone()),
@@ -2073,12 +2032,7 @@ fn validate_initial_tree_record(
     )
 }
 
-fn validate_tree_local_state(
-    record: &VtxoRecord,
-    world: &World,
-    health: TreeHealth,
-    stump_height: tree::TreeStumpHeight,
-) -> Result<()> {
+fn validate_tree_local_state(record: &VtxoRecord, world: &World, health: TreeHealth) -> Result<()> {
     if record.script != world.contract.vtxo.script_pubkey()
         || record.amount_sats != world.manifest.dust_sats
         || record.asset_amount(world.tree_asset).unwrap_or(0) != 1
@@ -2094,11 +2048,8 @@ fn validate_tree_local_state(
         || xp > world.manifest.xp_per_tree
         || logs != xp
         || health.value() > logs
-        || ((health.value() == 0) != (stump_height.value() > 0))
     {
-        return Err(anyhow!(
-            "tree record has invalid local reserve or stump state"
-        ));
+        return Err(anyhow!("tree record has invalid local reserves"));
     }
     Ok(())
 }

@@ -11,7 +11,7 @@ use crate::protocol::{
     PLAYER_STATE_OUTPUT_INDEX, RENEWAL_EXTENSION_OUTPUT_INDEX, RENEWAL_INPUT_COUNT,
     RENEWAL_OUTPUT_COUNT, RENEWAL_STATE_INPUT_INDEX, RENEWAL_STATE_OUTPUT_INDEX,
     TREE_ASSET_GROUP_INDEX, TREE_HEALTH_PACKET_TYPE, TREE_INPUT_INDEX, TREE_OUTPUT_INDEX,
-    TREE_STATE_PACKET_TYPE, TREE_STUMP_HEIGHT_PACKET_TYPE, XP_ASSET_GROUP_INDEX,
+    TREE_STATE_PACKET_TYPE, XP_ASSET_GROUP_INDEX,
 };
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
@@ -19,8 +19,8 @@ use ark_script::{op, ArkadeLeaf, ArkadeTapscript, ArkadeVtxoInput, ArkadeVtxoScr
 use bitcoin::hashes::Hash;
 use bitcoin::opcodes::all::{
     OP_2DROP, OP_ADD, OP_BOOLAND, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUAL, OP_EQUALVERIFY,
-    OP_FROMALTSTACK, OP_GREATERTHAN, OP_GREATERTHANOREQUAL, OP_IF, OP_NIP, OP_NUMEQUAL, OP_OVER,
-    OP_ROT, OP_SIZE, OP_SWAP, OP_TOALTSTACK, OP_VERIFY,
+    OP_FROMALTSTACK, OP_GREATERTHAN, OP_IF, OP_NIP, OP_NUMEQUAL, OP_OVER, OP_ROT, OP_SIZE,
+    OP_TOALTSTACK, OP_VERIFY,
 };
 use bitcoin::script::witness_version::WitnessVersion;
 use bitcoin::script::{Builder, PushBytesBuf};
@@ -28,8 +28,6 @@ use bitcoin::secp256k1::{Secp256k1, Verification};
 use bitcoin::{Network, Psbt, ScriptBuf, Sequence, Transaction, XOnlyPublicKey};
 
 pub const LOGS_PER_TREE: u64 = 10;
-pub const REGROWTH_BLOCKS: u64 = 2;
-pub const BLOCK_ATTESTATION_MARKER: &[u8; 17] = b"WOODLAND_BLOCK_V1";
 
 /// A tree carries exactly one dust of backing. LOG/XP are ledger entries with
 /// no sats collateral, and the covenant pins this value through every
@@ -152,36 +150,6 @@ impl TreeHealth {
         ))
     }
 }
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct TreeStumpHeight(u64);
-
-impl TreeStumpHeight {
-    pub fn new(value: u64) -> Result<Self> {
-        if value > u64::from(u32::MAX) {
-            return Err(anyhow!("tree stump height exceeds u32"));
-        }
-        Ok(Self(value))
-    }
-
-    pub const fn value(self) -> u64 {
-        self.0
-    }
-
-    pub fn encode(self) -> [u8; 9] {
-        let mut encoded = [0_u8; 9];
-        encoded[..8].copy_from_slice(&self.0.to_le_bytes());
-        encoded
-    }
-
-    pub fn decode(encoded: &[u8]) -> Result<Self> {
-        if encoded.len() != 9 || encoded[8] != 0 {
-            return Err(anyhow!("invalid tree stump height packet"));
-        }
-        Self::new(u64::from_le_bytes(
-            encoded[..8].try_into().expect("fixed tree stump height"),
-        ))
-    }
-}
 
 fn push_numeric_tree_packet_value(
     builder: Builder,
@@ -220,25 +188,9 @@ fn push_health_packet_value(builder: Builder, input_index: Option<usize>) -> Bui
     push_numeric_tree_packet_value(builder, TREE_HEALTH_PACKET_TYPE, input_index)
 }
 
-fn push_stump_height_packet_value(builder: Builder, input_index: Option<usize>) -> Builder {
-    push_numeric_tree_packet_value(builder, TREE_STUMP_HEIGHT_PACKET_TYPE, input_index)
-}
-
 fn push_tree_health_amounts(builder: Builder, input_index: usize) -> Builder {
     let builder = push_health_packet_value(builder, Some(input_index));
     push_health_packet_value(builder, None)
-}
-fn push_block_attestation(builder: Builder) -> Builder {
-    builder
-        .push_slice(
-            PushBytesBuf::try_from(BLOCK_ATTESTATION_MARKER.to_vec())
-                .expect("block attestation marker is a fixed-size push"),
-        )
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_DUP)
-        .push_int(0)
-        .push_opcode(OP_GREATERTHAN)
-        .push_opcode(OP_VERIFY)
 }
 
 /// Host-side mirror of the asset invariants enforced by the Arkade Script.
@@ -365,7 +317,7 @@ pub struct TreeContract {
     pub renewal_arkade_script: ScriptBuf,
 }
 
-/// Build the shared two-leaf tree contract: block-attested swings and
+/// Build the shared two-leaf tree contract: covenant-enforced swings and
 /// permissionless exact-self-send renewal/regrowth.
 ///
 /// Every usable tapleaf is operator + covenant-tweaked emulator. No
@@ -502,8 +454,7 @@ pub fn tree_covenant_script(
     let tree_value = script_int(tree_value_sats(dust_sats), "tree value")?;
     let anchor_program =
         witness_v1_program(&ark_core::anchor_output().script_pubkey, "Arkade anchor")?;
-    let builder = push_block_attestation(Builder::new())
-        .push_opcode(OP_TOALTSTACK)
+    let builder = Builder::new()
         .push_opcode(op::PUSHCURRENTINPUTINDEX)
         .push_int(TREE_INPUT_INDEX as i64)
         .push_opcode(OP_EQUALVERIFY)
@@ -618,32 +569,6 @@ pub fn tree_covenant_script(
         .push_opcode(OP_TOALTSTACK)
         .push_opcode(OP_ADD)
         .push_opcode(OP_EQUALVERIFY);
-    // A successful final chop stamps the canonical Bitcoin height attested by
-    // the emulator gate. Every other chop preserves the zero stump height.
-    let builder = push_health_packet_value(builder, None)
-        .push_int(0)
-        .push_opcode(OP_NUMEQUAL)
-        .push_opcode(OP_IF);
-    let builder = push_stump_height_packet_value(builder, Some(TREE_INPUT_INDEX))
-        .push_int(0)
-        .push_opcode(OP_EQUALVERIFY);
-    let builder = push_stump_height_packet_value(builder, None)
-        .push_opcode(OP_FROMALTSTACK)
-        .push_int(1)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_FROMALTSTACK)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_int(1)
-        .push_opcode(OP_TOALTSTACK)
-        .push_opcode(OP_ELSE);
-    let builder = push_stump_height_packet_value(builder, Some(TREE_INPUT_INDEX));
-    let builder = push_stump_height_packet_value(builder, None)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_FROMALTSTACK)
-        .push_opcode(OP_FROMALTSTACK)
-        .push_opcode(OP_DROP)
-        .push_opcode(OP_TOALTSTACK)
-        .push_opcode(OP_ENDIF);
     let builder = push_extension_and_anchor_shape(
         builder,
         CHOP_EXTENSION_OUTPUT_INDEX,
@@ -730,9 +655,8 @@ pub fn tree_covenant_script(
 
 /// Covenant for the tree's batch-renewal leaf. It runs on a version-2 intent
 /// proof and only permits an exact self-send: identical P2TR, value, TREE/LOG/XP
-/// assets, and identity. Active trees preserve health and stump height. A stump
-/// with reserve left regrows to full health only after two emulator-attested
-/// Bitcoin tip advances, then resets its stump height to zero.
+/// assets, and identity. Active trees preserve health. One renewal regrows a
+/// funded stump to full health; a reserve-empty stump remains terminal.
 ///
 /// Canonical intent proof shape:
 ///
@@ -753,8 +677,7 @@ pub fn tree_renewal_covenant_script(
     {
         return Err(anyhow!("TREE, LOG, and XP asset IDs must differ"));
     }
-    let builder = push_block_attestation(Builder::new()).push_opcode(OP_TOALTSTACK);
-    let builder = push_renewal_shape(builder)?;
+    let builder = push_renewal_shape(Builder::new())?;
     let builder = push_equal_input_output_scripts(
         builder,
         RENEWAL_STATE_INPUT_INDEX,
@@ -766,8 +689,8 @@ pub fn tree_renewal_covenant_script(
     .push_opcode(op::INSPECTINPUTVALUE)
     .push_opcode(OP_EQUALVERIFY);
     let builder = push_equal_state_packet(builder, TREE_STATE_PACKET_TYPE);
-    // Stumps with reserve left regrow after two attested tip advances.
-    // Everything else is a byte-for-byte lifecycle renewal.
+    // One fresh batch regrows a funded stump. Active trees and reserve-empty
+    // stumps preserve their current health.
     let builder = push_health_packet_value(builder, Some(RENEWAL_STATE_INPUT_INDEX))
         .push_opcode(OP_DUP)
         .push_int(0)
@@ -779,28 +702,10 @@ pub fn tree_renewal_covenant_script(
         .push_opcode(OP_DROP);
     let builder = push_health_packet_value(builder, None)
         .push_int(LOGS_PER_TREE as i64)
-        .push_opcode(OP_EQUALVERIFY);
-    let builder = push_stump_height_packet_value(builder, Some(RENEWAL_STATE_INPUT_INDEX))
-        .push_opcode(OP_DUP)
-        .push_int(0)
-        .push_opcode(OP_GREATERTHAN)
-        .push_opcode(OP_VERIFY)
-        .push_int(REGROWTH_BLOCKS as i64)
-        .push_opcode(OP_ADD)
-        .push_opcode(OP_FROMALTSTACK)
-        .push_opcode(OP_SWAP)
-        .push_opcode(OP_GREATERTHANOREQUAL)
-        .push_opcode(OP_VERIFY);
-    let builder = push_stump_height_packet_value(builder, None)
-        .push_int(0)
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(OP_ELSE);
-    let builder = push_health_packet_value(builder, None).push_opcode(OP_EQUALVERIFY);
-    let builder = push_stump_height_packet_value(builder, Some(RENEWAL_STATE_INPUT_INDEX));
-    let builder = push_stump_height_packet_value(builder, None)
+    let builder = push_health_packet_value(builder, None)
         .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_FROMALTSTACK)
-        .push_opcode(OP_DROP)
         .push_opcode(OP_ENDIF);
     let builder = push_renewal_asset_shell(builder)?;
     let builder = push_transfer_group_shell(builder, tree_asset);
@@ -1212,33 +1117,11 @@ pub fn attach_tree_health_packet(psbt: &mut Psbt, health: TreeHealth) -> Result<
     ark_core::extension::add_packet_to_psbt(psbt, TREE_HEALTH_PACKET_TYPE, &health.encode())
         .context("attach tree health packet")
 }
-pub fn attach_tree_stump_height_packet(psbt: &mut Psbt, height: TreeStumpHeight) -> Result<()> {
-    ark_core::extension::add_packet_to_psbt(psbt, TREE_STUMP_HEIGHT_PACKET_TYPE, &height.encode())
-        .context("attach tree stump height packet")
-}
-
-pub fn block_attestation_witness(height: u32) -> Result<bitcoin::Witness> {
-    if height == 0 {
-        return Err(anyhow!("block attestation height must be positive"));
-    }
-    let mut encoded = [0_u8; 8];
-    let len = bitcoin::script::write_scriptint(&mut encoded, i64::from(height));
-    Ok(bitcoin::Witness::from_slice(&[
-        &encoded[..len],
-        BLOCK_ATTESTATION_MARKER,
-    ]))
-}
 
 pub fn tree_health_from_tx(tx: &Transaction) -> Result<Option<TreeHealth>> {
     ark_core::extension::find_packet_payload(tx, TREE_HEALTH_PACKET_TYPE)
         .context("read tree health packet")?
         .map(TreeHealth::decode)
-        .transpose()
-}
-pub fn tree_stump_height_from_tx(tx: &Transaction) -> Result<Option<TreeStumpHeight>> {
-    ark_core::extension::find_packet_payload(tx, TREE_STUMP_HEIGHT_PACKET_TYPE)
-        .context("read tree stump height packet")?
-        .map(TreeStumpHeight::decode)
         .transpose()
 }
 
@@ -1330,17 +1213,9 @@ mod tests {
                 .to_lower_hex_string(),
             "0a0000000000000000"
         );
-        assert_eq!(
-            TreeStumpHeight::new(840_000)
-                .unwrap()
-                .encode()
-                .to_lower_hex_string(),
-            "40d10c000000000000"
-        );
         let mut negative_zero = [0_u8; 9];
         negative_zero[8] = 0x80;
         assert!(TreeHealth::decode(&negative_zero).is_err());
-        assert!(TreeStumpHeight::decode(&negative_zero).is_err());
     }
     #[test]
     fn successful_chop_moves_xp_and_log_to_player() {
@@ -1456,23 +1331,21 @@ mod tests {
     }
 
     #[test]
-    fn regrowth_requires_stump_reserve_and_two_tip_advances() {
-        let regrow = |health: u64, stump: u64, logs: u64, tip: u64| -> u64 {
-            if health == 0 && stump > 0 && logs > 0 && tip >= stump + REGROWTH_BLOCKS {
+    fn one_batch_regrows_only_funded_stumps() {
+        let regrow = |health: u64, logs: u64| -> u64 {
+            if health == 0 && logs > 0 {
                 LOGS_PER_TREE
             } else {
                 health
             }
         };
-        assert_eq!(regrow(0, 840_000, 1, 840_001), 0);
-        assert_eq!(regrow(0, 840_000, 1, 840_002), LOGS_PER_TREE);
-        assert_eq!(regrow(0, 840_000, 0, 840_002), 0);
-        assert_eq!(regrow(5, 0, 1, 840_002), 5);
+        assert_eq!(regrow(0, 1), LOGS_PER_TREE);
+        assert_eq!(regrow(0, 0), 0);
+        assert_eq!(regrow(5, 1), 5);
 
         let renewal = tree_renewal_covenant_script(asset(1, 0), asset(1, 1), asset(1, 2)).unwrap();
         let asm = ark_script::to_asm(&renewal).unwrap();
         assert!(!asm.contains("OP_INSPECTLOCKTIME"));
-        assert!(asm.contains("OP_GREATERTHANOREQUAL"));
         assert!(asm.contains("OP_IF"));
         assert!(asm.contains("OP_ELSE"));
         assert!(asm.contains("OP_ENDIF"));
@@ -1485,7 +1358,6 @@ mod tests {
         struct SimTree {
             state: TreeState,
             health: TreeHealth,
-            stump_height: u64,
             logs: u64,
             xp_balance: u64,
             regrowths: u64,
@@ -1524,7 +1396,6 @@ mod tests {
                         y: (index * 2) as u16,
                     },
                     health: TreeHealth::new(LOGS_PER_TREE).unwrap(),
-                    stump_height: 0,
                     logs: 100,
                     xp_balance: 100,
                     regrowths: 0,
@@ -1532,19 +1403,13 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut entropy = seed;
             let mut attempts = 0_u64;
-            let mut tip = 100_u64;
 
             loop {
-                tip += 1;
-                // A stump can regrow only after two observed tip advances and
-                // only while its own local reserve remains.
+                // A permissionless renewal immediately turns every funded
+                // stump into a fresh-health tree.
                 for tree in &mut trees {
-                    if tree.health.value() == 0
-                        && tree.logs > 0
-                        && tip >= tree.stump_height + REGROWTH_BLOCKS
-                    {
+                    if tree.health.value() == 0 && tree.logs > 0 {
                         tree.health = TreeHealth::new(LOGS_PER_TREE).unwrap();
-                        tree.stump_height = 0;
                         tree.regrowths += 1;
                     }
                 }
@@ -1574,7 +1439,6 @@ mod tests {
 
                 let tree = &mut trees[tree_index];
                 let player = &mut players[player_index];
-                assert_eq!(tree.stump_height, 0);
                 let previous_health = tree.health;
                 let previous_logs = tree.logs;
                 let previous_tree_xp_balance = tree.xp_balance;
@@ -1586,7 +1450,6 @@ mod tests {
                 let reward = u64::from(success);
                 let next_health =
                     TreeHealth::new(previous_health.value().checked_sub(reward).unwrap()).unwrap();
-                let next_stump_height = if next_health.value() == 0 { tip } else { 0 };
                 let next_logs = previous_logs.checked_sub(reward).unwrap();
                 let next_tree_xp_balance = previous_tree_xp_balance.checked_sub(reward).unwrap();
                 let next_xp = previous_xp.checked_add(reward).unwrap();
@@ -1657,7 +1520,6 @@ mod tests {
                 .unwrap();
 
                 tree.health = next_health;
-                tree.stump_height = next_stump_height;
                 tree.logs = next_logs;
                 tree.xp_balance = next_tree_xp_balance;
                 player.state = next_player_state;
@@ -1677,11 +1539,6 @@ mod tests {
                     tree.health.value(),
                     0,
                     "seed {seed}, tree {} health",
-                    tree.state.tree_id
-                );
-                assert!(
-                    tree.stump_height > 0,
-                    "seed {seed}, tree {} stump",
                     tree.state.tree_id
                 );
                 assert_eq!(tree.logs, 0, "seed {seed}, tree {} LOG", tree.state.tree_id);
@@ -1709,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn scripts_commit_assets_health_stumps_and_attested_height() {
+    fn scripts_commit_assets_health_and_one_batch_regrowth() {
         let tree = asset(1, 0);
         let log = asset(1, 1);
         let xp_balance = asset(1, 2);
@@ -1722,7 +1579,6 @@ mod tests {
                 .contains("OP_INSPECTLOCKTIME"));
         }
         let renewal_asm = ark_script::to_asm(&renewal).unwrap();
-        assert!(renewal_asm.contains("OP_GREATERTHANOREQUAL"));
         assert!(renewal_asm.contains("OP_IF"));
         assert!(renewal_asm.contains("OP_ELSE"));
         let chop_asm = ark_script::to_asm(&chop).unwrap();

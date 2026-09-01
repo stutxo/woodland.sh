@@ -1333,10 +1333,6 @@ pub async fn run_cli() -> Result<()> {
         .get_info()
         .await
         .context("read emulator service info")?;
-    emulator_rest
-        .get_block_tip()
-        .await
-        .context("verify trusted block-aware emulator gate")?;
     let validated: ValidatedWorld = manifest
         .validate(&Secp256k1::new(), &params, &emulator)
         .context("validate server world")?;

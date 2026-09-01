@@ -17,7 +17,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MANIFEST = path.join(ROOT, 'regtest/_build/woodland-world.json');
 const ARKD = 'http://127.0.0.1:7070';
-const EMULATOR = 'http://127.0.0.1:7074';
+const EMULATOR = 'http://127.0.0.1:7073';
 const TREE_ID = 417;
 
 function treeRenewalEnv() {

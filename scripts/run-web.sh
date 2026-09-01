@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export WOODLAND_NETWORK=regtest
 export WOODLAND_ARKADE_SERVICE_URL=http://127.0.0.1:7070
-export WOODLAND_EMULATOR_URL=http://127.0.0.1:7074
+export WOODLAND_EMULATOR_URL=http://127.0.0.1:7073
 export WOODLAND_DEPLOYER_SECRET=1111111111111111111111111111111111111111111111111111111111111111
 export WOODLAND_ROLLOVER_SECRET=4444444444444444444444444444444444444444444444444444444444444444
 export WOODLAND_WORLD_MANIFEST="$ROOT/regtest/_build/woodland-world.json"
@@ -55,5 +55,5 @@ SERVER_PID=$!
 printf '\nwoodland.sh: http://127.0.0.1:%s/\n' "$PORT"
 printf 'Static app, leaderboard, presence, chat, and delegation share this origin.\n'
 printf 'Every LOG drop gives 1 XP. LOG chance rises from 20%% to 30%% at woodland levels 10, 20, 30, 40, and 50.\n'
-printf "Funded stumps regrow after two Bitcoin tip advances; exhausted trees stay depleted.\n\n"
+printf "Funded stumps regrow in one fresh Ark batch; exhausted trees stay depleted.\n\n"
 wait -n "$WATCHER_PID" "$SERVER_PID"

@@ -253,7 +253,7 @@ async function main() {
   const driverUrls = DRIVER_CONFIGS.map(({ port }) => `http://127.0.0.1:${port}`);
   await Promise.all([
     waitForHttp('http://127.0.0.1:7070/v1/info', 5_000),
-    waitForHttp('http://127.0.0.1:7074/v1/info', 5_000),
+    waitForHttp('http://127.0.0.1:7073/v1/info', 5_000),
     waitForHttp(`${SERVER_URL}/health.json`, 5_000),
     ...(EXTERNAL_WEB_URL ? [] : [assertPortAvailable(WEB_PORT, 'web server')]),
     ...DRIVER_CONFIGS.flatMap(({ port, websocketPort }, index) => [

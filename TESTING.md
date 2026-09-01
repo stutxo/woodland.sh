@@ -8,14 +8,14 @@ woodland.sh uses three layers:
    and malformed state;
 2. production WASM and GitHub Pages artifact compilation for browser transport,
    storage, manifest, CSP, optional game-server origin, and static-route paths;
-3. destructive regtest profiles against stock arkd and the gated stock emulator.
+3. destructive regtest profiles against stock arkd and the stock emulator.
 
 ## Test Placement
 
 Unit tests live at the end of their corresponding protocol module. They retain
 access to private encoding and script helpers without expanding the public API.
-Cross-component behavior uses stock arkd, the real emulator gate, and the stock
-emulator rather than mock transport traits. Destructive mutation hooks compile only with
+Cross-component behavior uses stock arkd and the stock emulator rather than
+mock transport traits. Destructive mutation hooks compile only with
 `regtest-e2e`; the production WASM build excludes them.
 
 ## Static Checks
@@ -43,8 +43,7 @@ The regtest wrapper builds unmodified arkd commit
 offchain-spend fix. Protocol v2 uses ordinary Asset V1 validity. TREE, LOG, XP,
 and each PLAYER_ID have no control asset; a fresh issuance creates a different
 AssetId rather than reissuing an existing one. No custom arkd or emulator patch
-is part of the protocol. A woodland HTTP gate validates Bitcoin-height witnesses
-before forwarding to the loopback-only stock emulator.
+or policy proxy is part of the protocol.
 
 ## Functional Profiles
 
@@ -54,15 +53,15 @@ before forwarding to the loopback-only stock emulator.
 ./scripts/test-regtest.sh regrowth
 ```
 
-All three clean wrapper-owned containers and volumes, start Bitcoin/indexers/stock
-arkd/emulator, start the gate, deploy a fresh schema 2 world, build the web
-bundle, and serve the bundle plus `/v1/*` API from one native Axum origin.
+All three clean wrapper-owned containers and volumes, start
+Bitcoin/indexers/stock arkd/emulator, deploy a fresh schema 2 world, build the
+web bundle, and serve the bundle plus `/v1/*` API from one native Axum origin.
 Browser and renewal stages then run before teardown.
 
 Smoke proves the complete path quickly. Full exercises player-bound luck,
 bounded reward streaks, harvesting, lifecycle renewal, LOG withdrawal,
 recovery, adversarial mutations, and four-player concurrency. The dedicated
-`regrowth` profile exercises the complete two-tip stump lifecycle.
+`regrowth` profile exercises complete one-batch stump regrowth.
 Both mobile and desktop checks require the player overlay to remain exactly
 centered across every sampled frame while only the Canvas camera changes. Tests
 also require viewport-only tile rendering, zero per-tile DOM nodes, real canvas
@@ -73,7 +72,7 @@ move into different spatial regions.
 
 The same `dist/` layout can alternatively deploy to GitHub Pages. The artifact
 contains a manifest-specific CSP, `.nojekyll`, and an explicit 404. Gameplay
-still calls Arkade and the emulator gate directly.
+still calls Arkade and the stock emulator directly.
 
 CI allows 120 two-second emulator readiness attempts. A timeout prints the
 container state and the final 200 log lines before teardown, so startup failures
@@ -91,8 +90,8 @@ A clean deployment verifies:
   `treeRenewalArkadeScript` commitments;
 - no retired-tree or vault fields;
 - no control asset;
-- exactly 420 tree VTXOs with one TREE, 50,000 LOG, 50,000 XP, health ten,
-  stump height zero, and 330 sats;
+- exactly 420 tree VTXOs with one TREE, 50,000 LOG, 50,000 XP, health ten, and
+  330 sats;
 - total world funding 138,600 sats;
 - no shared vault, player reserve, or allocator signer.
 
@@ -100,7 +99,7 @@ A clean deployment verifies:
 
 The browser stage verifies:
 
-- direct CORS calls to Arkade and the emulator gate, with no Woodland proxy;
+- direct CORS calls to Arkade and the stock emulator, with no Woodland proxy;
 - one exact 330-sat deposit issues a unique PLAYER_ID and activates player state
   with canonical roll and initial luck credit entirely client-side;
 - the profile persists the exact transaction-derived AssetId;
@@ -135,16 +134,16 @@ Mutation probes require emulator rejection without indexed outpoint changes for:
 - extra output, wrong anchor, or funded extension;
 - stale expected tree, player-state, or drop preconditions.
 
-Gate and covenant tests require rejection of future, stale, non-minimal,
-duplicated, or malformed marked Bitcoin attestations, acceptance with the
-zero-locktime transaction shape rebuilt by stock arkd, and same-tip and one-tip
-stump regrowth failures without indexed outpoint changes.
+Tree-renewal tests require active health preservation, one-batch funded-stump
+reset to health ten, terminal-stump preservation at health zero, exact local
+reserve conservation, and the zero-locktime transaction shape rebuilt by stock
+arkd.
 
 Native tests additionally cover exact signature sets, previous-transaction
 binding, checkpoint mapping, mandatory-marker renewal, decoy-marker rejection,
 malformed graph chunks, nonce/signature ordering, and forfeit combination.
 
-## Two-Tip Regrowth
+## One-Batch Regrowth
 
 The dedicated profile uses the canonical world without reserve overrides:
 
@@ -153,17 +152,15 @@ The dedicated profile uses the canonical world without reserve overrides:
 ```
 
 One Firefox player harvests exactly ten successful drops from a pristine tree,
-producing health zero, 49,990 local LOG/XP, and a stump height equal to the
-gate's current Bitcoin tip. A second Firefox browser remains unfunded and
-inactive. It invokes the public `regrow` API, proving that active player state
-and player-key authorization are unnecessary.
+producing health zero and 49,990 local LOG/XP. A second Firefox browser remains
+unfunded and inactive. It clicks the stump and completes one permissionless
+renewal batch, proving that active player state and player-key authorization are
+unnecessary. The harness mines no delay blocks.
 
-The profile requires rejection at the stump tip and after one mined block,
-then mines the second block and requires successful regrowth to health ten.
 Identity, TREE, 330 sats, coordinate, script, player-bound entropy, and the
-49,990-unit local reserve remain unchanged; stump height clears to zero.
-Indexer assertions require the old stump spent, the new tree live, and fixed
-TREE/LOG/XP supplies of 420/21,000,000/21,000,000. The report lands at
+49,990-unit local reserve remain unchanged. Indexer assertions require the old
+stump spent, the new health-ten tree live, and fixed TREE/LOG/XP supplies of
+420/21,000,000/21,000,000. The report records the observed batch latency at
 `regtest/_build/regrowth-report.json`.
 
 For a prepared remote-compatible world, the funding executable receives
@@ -175,6 +172,11 @@ WOODLAND_E2E_WEB_URL=https://test.example \
 WOODLAND_REGROWTH_FUND_COMMAND=/path/to/test-wallet-funder \
 node scripts/e2e-regrowth-regtest.mjs
 ```
+
+The regtest-e2e build checks each swing against its exposed next-drop forecast.
+A production remote build exposes no forecast: the same profile uses the
+ordinary `chop` method and accepts naturally observed misses or drops. Its
+per-operation timeout defaults to two minutes, not ten.
 
 Player renewal still runs inside the main browser profile at XP zero and after
 earned XP. It uses the owner leaf, validates batch event order and graph shape,
@@ -241,7 +243,7 @@ WOODLAND_SOAK_ROUND_DELAY_MS=1000 \
 ### Emulator Outage Chaos
 
 The chaos profile runs the same one-tree contention contract through a
-loopback-only fault proxy in front of the emulator gate:
+loopback-only fault proxy in front of the stock emulator:
 
 ```bash
 ./scripts/test-regtest.sh chaos
@@ -284,7 +286,7 @@ permission. Concurrency and round delay exist to bound remote load.
 
 The overnight runner repeatedly creates a fresh world and rotates the full,
 same-tree soak, 24-player burst, persistent emulator-outage chaos, multi-tree
-fanout, browser-reload, renewal, and two-tip regrowth profiles. Every cycle
+fanout, browser-reload, renewal, and one-batch regrowth profiles. Every cycle
 exercises the `renew-world` startup gate before launching the watcher. It stops
 on the first failure and preserves that cycle's manifest, cycle/server/watcher
 logs, the last 2,000 arkd and emulator log lines, screenshots, JUnit, and
@@ -386,4 +388,4 @@ per-cycle artifacts, and signal-safe cleanup.
 Tests do not prove public service availability, denial-of-service resistance,
 chat moderation, hidden randomness, geography, unique humans, pre-covenant
 PLAYER_ID ancestry, hardened browser custody, or future
-operator/emulator/gate/rollover signer retention.
+operator/emulator/rollover signer retention.

@@ -48,8 +48,6 @@ impl PlayerSnapshot {
 pub struct TreeSnapshot {
     pub state: TreeState,
     pub health: TreeHealth,
-    /// Bitcoin height recorded by the final successful chop; zero while active.
-    pub stump_height: tree::TreeStumpHeight,
     pub record: VtxoRecord,
     /// Current LOG reserve; one successful swing moves one unit to the player.
     pub logs: u64,
@@ -97,10 +95,6 @@ impl WoodlandClient {
             .get_info()
             .await
             .context("read emulator service info")?;
-        emulator
-            .get_block_tip()
-            .await
-            .context("verify trusted block-aware emulator gate")?;
         let world = manifest
             .validate(&keys.secp, &params, &emulator_params)
             .context("validate woodland.sh world manifest")?;
@@ -288,13 +282,10 @@ impl WoodlandClient {
         }
         let health = tree::tree_health_from_tx(&previous_tx)?
             .ok_or_else(|| anyhow!("tree transaction has no health packet"))?;
-        let stump_height = tree::tree_stump_height_from_tx(&previous_tx)?
-            .ok_or_else(|| anyhow!("tree transaction has no stump height packet"))?;
         let is_deployment = record.outpoint.txid == declared.deployment_txid;
         let transition = tree::classify_transition(&previous_tx, is_deployment)?;
         if record.outpoint.vout != transition.output_index()
-            || (is_deployment
-                && (health.value() != tree::LOGS_PER_TREE || stump_height.value() != 0))
+            || (is_deployment && health.value() != tree::LOGS_PER_TREE)
         {
             return Err(anyhow!("tree record has an invalid lineage"));
         }
@@ -307,21 +298,17 @@ impl WoodlandClient {
             || xp_reserve > self.manifest.xp_per_tree
             || logs != xp_reserve
             || health.value() > logs
-            || ((health.value() == 0) != (stump_height.value() > 0))
             || !record.assets.iter().all(|asset| {
                 asset.asset_id == self.world.tree_asset
                     || asset.asset_id == self.world.log_asset
                     || asset.asset_id == self.world.xp_asset
             })
         {
-            return Err(anyhow!(
-                "tree record has an invalid local reserve or stump state"
-            ));
+            return Err(anyhow!("tree record has invalid local reserves"));
         }
         Ok(TreeSnapshot {
             state,
             health,
-            stump_height,
             record,
             logs,
             xp_reserve,
@@ -452,11 +439,6 @@ impl WoodlandClient {
         let player_asset = self
             .player_asset
             .ok_or_else(|| anyhow!("activate the player before chopping"))?;
-        let block_tip = self
-            .emulator
-            .get_block_tip()
-            .await
-            .context("read attested Bitcoin tip before chop")?;
         let prepared = crate::chop::prepare_chop(
             &self.keys,
             &self.info(),
@@ -480,7 +462,6 @@ impl WoodlandClient {
                 previous_tx: &tree.previous_tx,
                 health: tree.health,
             },
-            block_tip.height,
             ChopMutation::None,
         )?;
         let txid = prepared.ark_tx.unsigned_tx.compute_txid();
@@ -645,8 +626,8 @@ impl WoodlandClient {
         })
     }
 
-    /// Permissionlessly regrow an eligible stump through the exact-self-send
-    /// batch path. The emulator gate attests the current Bitcoin height.
+    /// Permissionlessly regrow a funded stump through one exact-self-send
+    /// batch. The fresh batch is the complete lifecycle boundary.
     pub async fn regrow(&mut self, tree_id: u32) -> Result<OutPoint> {
         let tree = self.tree(tree_id).await?;
         if tree.health.value() != 0 {
@@ -655,11 +636,6 @@ impl WoodlandClient {
         if tree.record.asset_amount(self.world.log_asset).unwrap_or(0) == 0 {
             return Err(anyhow!("tree {tree_id} has exhausted its local reserve"));
         }
-        let block_tip = self
-            .emulator
-            .get_block_tip()
-            .await
-            .context("read attested Bitcoin tip before regrowth")?;
         let prepared = renewal::prepare_tree(
             &tree.record,
             &tree.previous_tx,
@@ -668,7 +644,6 @@ impl WoodlandClient {
             self.world.log_asset,
             self.world.xp_asset,
             self.params.dust_sats,
-            block_tip.height,
             0,
         )?;
         let services = BatchServices::connect(
@@ -700,9 +675,7 @@ impl WoodlandClient {
             .ok_or_else(|| anyhow!("indexer omitted the regrown tree transaction"))?;
         let health = tree::tree_health_from_tx(&transaction)?
             .ok_or_else(|| anyhow!("regrown tree has no health packet"))?;
-        let stump_height = tree::tree_stump_height_from_tx(&transaction)?
-            .ok_or_else(|| anyhow!("regrown tree has no stump height packet"))?;
-        if health.value() != tree::LOGS_PER_TREE || stump_height.value() != 0 {
+        if health.value() != tree::LOGS_PER_TREE {
             return Err(anyhow!("regrown tree state is invalid"));
         }
         Ok(renewed.outpoint)

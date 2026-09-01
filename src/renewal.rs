@@ -1,10 +1,11 @@
 //! Batch-renewal intent construction for Forest state VTXOs.
 //!
-//! A fresh VTXO lifetime only comes from a new Ark batch. Each renewal spends
-//! one state VTXO through its dedicated renewal leaf in a version-2 intent
-//! proof whose sole purpose is an exact self-send: same P2TR, value, assets,
-//! and state packets. The emulator executes the renewal covenant and counters
-//! the proof; the batch then recreates the VTXO with a new expiry.
+//! A fresh VTXO lifetime comes from a new Ark batch. Each renewal spends one
+//! state VTXO through its dedicated renewal leaf in a version-2 intent proof
+//! whose sole purpose is a covenant-constrained self-send. Identity, P2TR,
+//! value, and assets are preserved; a funded tree stump's health alone resets
+//! to full. The emulator executes the covenant and counters the proof; the
+//! batch then recreates the VTXO with a new expiry.
 //!
 //! Shared tree renewal is permissionless and player state is gated by its
 //! owner, so only a client that constructed the exact preservation proof can
@@ -18,7 +19,6 @@ use crate::protocol::{
     PLAYER_IDENTITY_PACKET_TYPE, PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_POSITION_PACKET_TYPE,
     PLAYER_ROLL_PACKET_TYPE, PLAYER_XP_PACKET_TYPE, RENEWAL_INPUT_COUNT, RENEWAL_STATE_INPUT_INDEX,
     RENEWAL_STATE_OUTPUT_INDEX, TREE_HEALTH_PACKET_TYPE, TREE_STATE_PACKET_TYPE,
-    TREE_STUMP_HEIGHT_PACKET_TYPE,
 };
 use crate::tree::{TreeContract, TreeState};
 use anyhow::{anyhow, Context, Result};
@@ -41,7 +41,6 @@ pub struct RenewalIntent {
     outputs: Vec<intent::Output>,
     groups: Vec<AssetGroup>,
     state_packets: Vec<(u8, Vec<u8>)>,
-    block_height: Option<u32>,
     input_expires_at: i64,
     /// The renewal Arkade script; its tweaked emulator key must countersign.
     pub arkade_script: ScriptBuf,
@@ -119,7 +118,6 @@ pub fn prepare_tree(
     log_asset: AssetId,
     xp_asset: AssetId,
     dust_sats: u64,
-    block_height: u32,
     expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
     record.validate_creating_transaction(previous_tx)?;
@@ -127,8 +125,6 @@ pub fn prepare_tree(
         .ok_or_else(|| anyhow!("previous tree transaction has no state packet"))?;
     let raw_health = crate::tree::tree_health_from_tx(previous_tx)?
         .ok_or_else(|| anyhow!("previous tree transaction has no health packet"))?;
-    let raw_stump_height = crate::tree::tree_stump_height_from_tx(previous_tx)?
-        .ok_or_else(|| anyhow!("previous tree transaction has no stump height packet"))?;
     let assets = record_assets(record)?;
     let tree_count = asset_amount(&assets, tree_asset);
     let log_count = asset_amount(&assets, log_asset);
@@ -136,28 +132,15 @@ pub fn prepare_tree(
     let other_assets = assets.iter().any(|asset| {
         asset.asset_id != tree_asset && asset.asset_id != log_asset && asset.asset_id != xp_asset
     });
-    let (health, stump_height) = if raw_health.value() == 0 && log_count > 0 {
-        let eligible_height = raw_stump_height
-            .value()
-            .checked_add(crate::tree::REGROWTH_BLOCKS)
-            .ok_or_else(|| anyhow!("tree regrowth height overflow"))?;
-        if u64::from(block_height) < eligible_height {
-            return Err(anyhow!(
-                "tree regrowth requires Bitcoin height {eligible_height}; attested {block_height}"
-            ));
-        }
-        (
-            crate::tree::TreeHealth::new(crate::tree::LOGS_PER_TREE)?,
-            crate::tree::TreeStumpHeight::new(0)?,
-        )
+    let health = if raw_health.value() == 0 && log_count > 0 {
+        crate::tree::TreeHealth::new(crate::tree::LOGS_PER_TREE)?
     } else {
-        (raw_health, raw_stump_height)
+        raw_health
     };
     if tree_count != 1
         || other_assets
         || log_count != xp_count
         || raw_health.value() > log_count
-        || (raw_health.value() == 0) != (raw_stump_height.value() > 0)
         || record.amount_sats != crate::tree::tree_value_sats(dust_sats)
     {
         return Err(anyhow!("indexed tree VTXO holdings are not canonical"));
@@ -180,12 +163,7 @@ pub fn prepare_tree(
         vec![
             (TREE_STATE_PACKET_TYPE, state.encode().to_vec()),
             (TREE_HEALTH_PACKET_TYPE, health.encode().to_vec()),
-            (
-                TREE_STUMP_HEIGHT_PACKET_TYPE,
-                stump_height.encode().to_vec(),
-            ),
         ],
-        Some(block_height),
         expiry_margin_secs,
     )
 }
@@ -297,7 +275,6 @@ fn prepare_player_for_path(
             ),
             (PLAYER_XP_PACKET_TYPE, state.xp.encode().to_vec()),
         ],
-        None,
         expiry_margin_secs,
     )
 }
@@ -322,7 +299,6 @@ fn build(
     assets: Vec<Asset>,
     groups: Vec<AssetGroup>,
     state_packets: Vec<(u8, Vec<u8>)>,
-    block_height: Option<u32>,
     expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
     record.ensure_live(now_unix(), expiry_margin_secs)?;
@@ -348,12 +324,7 @@ fn build(
         assets,
     );
 
-    let extension = renewal_extension_txout(
-        groups.clone(),
-        state_packets.clone(),
-        &arkade_script,
-        block_height,
-    )?;
+    let extension = renewal_extension_txout(groups.clone(), state_packets.clone(), &arkade_script)?;
     let outputs = vec![
         intent::Output::Offchain(TxOut {
             value: Amount::from_sat(record.amount_sats),
@@ -367,7 +338,6 @@ fn build(
         outputs,
         groups,
         state_packets,
-        block_height,
         input_expires_at,
         arkade_script,
     })
@@ -457,7 +427,6 @@ pub fn bind(
         outputs,
         groups,
         state_packets,
-        block_height,
         input_expires_at,
         arkade_script,
     } = prepared;
@@ -517,7 +486,6 @@ pub fn bind(
             &groups,
             &state_packets,
             &arkade_script,
-            block_height,
             intent.proof.unsigned_tx.compute_txid(),
         )?,
     ];
@@ -637,7 +605,6 @@ fn renewal_extension_txout(
     groups: Vec<AssetGroup>,
     state_packets: Vec<(u8, Vec<u8>)>,
     arkade_script: &ScriptBuf,
-    block_height: Option<u32>,
 ) -> Result<TxOut> {
     let mut packets: Vec<(u8, Vec<u8>)> = Vec::new();
     if !groups.is_empty() {
@@ -647,10 +614,7 @@ fn renewal_extension_txout(
     let emulator_packet = EmulatorPacket::new(vec![IntrospectorEntry {
         vin: RENEWAL_STATE_INPUT_INDEX as u16,
         script: arkade_script.clone(),
-        witness: block_height
-            .map(crate::tree::block_attestation_witness)
-            .transpose()?
-            .unwrap_or_default(),
+        witness: bitcoin::Witness::default(),
     }])
     .context("build renewal emulator packet")?;
     packets.push((
@@ -677,7 +641,6 @@ fn batch_leaf_extension_txout(
     groups: &[AssetGroup],
     state_packets: &[(u8, Vec<u8>)],
     arkade_script: &ScriptBuf,
-    block_height: Option<u32>,
     intent_txid: bitcoin::Txid,
 ) -> Result<TxOut> {
     use bitcoin::hashes::Hash;
@@ -722,10 +685,7 @@ fn batch_leaf_extension_txout(
     let emulator_packet = EmulatorPacket::new(vec![IntrospectorEntry {
         vin: RENEWAL_STATE_INPUT_INDEX as u16,
         script: arkade_script.clone(),
-        witness: block_height
-            .map(crate::tree::block_attestation_witness)
-            .transpose()?
-            .unwrap_or_default(),
+        witness: bitcoin::Witness::default(),
     }])
     .context("build renewal batch-leaf emulator packet")?;
     let mut packets = Vec::new();
@@ -899,7 +859,6 @@ mod tests {
         contract: &TreeContract,
         state: TreeState,
         health: u64,
-        stump_height: u64,
         reserve: u64,
     ) -> Transaction {
         let mut psbt = Psbt::from_unsigned_tx(Transaction {
@@ -928,16 +887,11 @@ mod tests {
             crate::tree::TreeHealth::new(health).unwrap(),
         )
         .unwrap();
-        crate::tree::attach_tree_stump_height_packet(
-            &mut psbt,
-            crate::tree::TreeStumpHeight::new(stump_height).unwrap(),
-        )
-        .unwrap();
         psbt.unsigned_tx
     }
 
     fn previous_tree_tx(contract: &TreeContract, state: TreeState) -> Transaction {
-        tree_tx(contract, state, 5, 0, 5)
+        tree_tx(contract, state, 5, 5)
     }
 
     fn previous_player_tx(
@@ -1000,7 +954,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .expect("canonical tree record");
@@ -1016,7 +969,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
         .is_err());
@@ -1031,7 +983,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
         .is_err());
@@ -1046,7 +997,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
         .is_err());
@@ -1061,7 +1011,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .is_err());
@@ -1076,7 +1025,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
         .is_err());
@@ -1090,7 +1038,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             0,
         )
         .expect("forced renewal inside the margin");
@@ -1104,7 +1051,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             0,
         )
         .is_err());
@@ -1138,7 +1084,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .unwrap();
@@ -1149,13 +1094,6 @@ mod tests {
                 (
                     TREE_HEALTH_PACKET_TYPE,
                     crate::tree::TreeHealth::new(5).unwrap().encode().to_vec(),
-                ),
-                (
-                    TREE_STUMP_HEIGHT_PACKET_TYPE,
-                    crate::tree::TreeStumpHeight::new(0)
-                        .unwrap()
-                        .encode()
-                        .to_vec(),
                 ),
             ]
         );
@@ -1171,27 +1109,20 @@ mod tests {
             .collect();
         assert_eq!(
             packet_types,
-            [
-                0,
-                TREE_STATE_PACKET_TYPE,
-                TREE_HEALTH_PACKET_TYPE,
-                TREE_STUMP_HEIGHT_PACKET_TYPE,
-                1,
-            ]
+            [0, TREE_STATE_PACKET_TYPE, TREE_HEALTH_PACKET_TYPE, 1]
         );
-        assert_eq!(prepared.block_height, Some(100));
         assert_eq!(extension.value, Amount::ZERO);
     }
 
     #[test]
-    fn stump_regrowth_rejects_one_tip_and_resets_after_two() {
+    fn funded_stump_regrows_in_one_permissionless_batch() {
         let (_secp, contract) = tree_contract();
         let state = TreeState {
             tree_id: 7,
             x: 1,
             y: 2,
         };
-        let previous = tree_tx(&contract, state, 0, 100, 5);
+        let previous = tree_tx(&contract, state, 0, 5);
         let mut indexed_tree = record(
             9,
             &contract.vtxo.script_pubkey(),
@@ -1203,22 +1134,6 @@ mod tests {
             ],
         );
         indexed_tree.outpoint.txid = previous.compute_txid();
-        for height in [100, 101] {
-            let error = prepare_tree(
-                &indexed_tree,
-                &previous,
-                &contract,
-                asset(2, 0),
-                asset(2, 1),
-                asset(2, 2),
-                330,
-                height,
-                crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
-            )
-            .err()
-            .unwrap();
-            assert!(error.to_string().contains("requires Bitcoin height 102"));
-        }
 
         let prepared = prepare_tree(
             &indexed_tree,
@@ -1228,11 +1143,9 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            102,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .unwrap();
-        assert_eq!(prepared.block_height, Some(102));
         assert_eq!(
             prepared.state_packets,
             [
@@ -1240,13 +1153,6 @@ mod tests {
                 (
                     TREE_HEALTH_PACKET_TYPE,
                     crate::tree::TreeHealth::new(crate::tree::LOGS_PER_TREE)
-                        .unwrap()
-                        .encode()
-                        .to_vec(),
-                ),
-                (
-                    TREE_STUMP_HEIGHT_PACKET_TYPE,
-                    crate::tree::TreeStumpHeight::new(0)
                         .unwrap()
                         .encode()
                         .to_vec(),
@@ -1268,7 +1174,7 @@ mod tests {
             x: 1,
             y: 2,
         };
-        let previous = tree_tx(&contract, state, 0, 100, 0);
+        let previous = tree_tx(&contract, state, 0, 0);
         let mut indexed_tree = record(
             9,
             &contract.vtxo.script_pubkey(),
@@ -1284,7 +1190,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            1_000,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .unwrap();
@@ -1296,13 +1201,6 @@ mod tests {
                 (
                     TREE_HEALTH_PACKET_TYPE,
                     crate::tree::TreeHealth::new(0).unwrap().encode().to_vec(),
-                ),
-                (
-                    TREE_STUMP_HEIGHT_PACKET_TYPE,
-                    crate::tree::TreeStumpHeight::new(100)
-                        .unwrap()
-                        .encode()
-                        .to_vec(),
                 ),
             ]
         );
@@ -1336,7 +1234,6 @@ mod tests {
             asset(2, 1),
             asset(2, 2),
             330,
-            100,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .unwrap();

@@ -31,10 +31,6 @@ name = "woodland-server"
 path = "src/bin/woodland-server.rs"
 required-features = ["server"]
 
-[[bin]]
-name = "woodland-emulator-gate"
-path = "src/bin/woodland-emulator-gate.rs"
-required-features = ["server"]
 
 [features]
 default = []

@@ -53,8 +53,9 @@ Security-sensitive areas include:
   the numeric XP packet from the XP asset balance, or smuggles XP through the
   withdrawal or renewal leaves.
 - Tree-local reserve or regrowth failures: minted or redirected LOG/XP,
-  changed identity or sats, a missing/forged stump height, regrowth before two
-  Bitcoin tip advances, or a terminal stump becoming active.
+  changed identity or sats, an active tree incorrectly resetting health, a
+  funded stump failing to regrow in one batch, or a terminal stump becoming
+  active.
 - Withdraw-leaf LOG leakage: sats, PLAYER_ID, XP, or more LOG than declared
   leaving player state, or a destination funded by anything but the wallet
   dust input.
@@ -65,9 +66,9 @@ Security-sensitive areas include:
   checkpoint signatures, batch graph validation, or forfeit handling.
 - Manifest validation, signer or service pinning, creating-transaction binding,
   or indexed-asset reconstruction failures.
-- Emulator-gate failures: accepting future, stale, non-minimal, duplicated, or
-  malformed marked attestations; exposing the stock-emulator upstream; leaking
-  Bitcoin RPC credentials; or serving an origin outside the configured policy.
+- Stock-emulator endpoint failures: signer/version substitution, incorrect
+  Arkade Script execution, request tampering, or serving an origin outside the
+  configured policy.
 - Pending-transaction journaling, unknown-submission recovery, replay, or crash
   consistency failures.
 - Deterministic key derivation, mnemonic exposure, incorrect recovery, output
@@ -83,7 +84,7 @@ Security-sensitive areas include:
 
 Public deterministic player luck, PLAYER_ID Sybil and identity grinding,
 unprovable pre-covenant PLAYER_ID ancestry, non-covenant map location and
-adjacency, chat content and moderation, Arkade/emulator-gate/server availability,
+adjacency, chat content and moderation, Arkade/emulator/server availability,
 request-rate abuse, public identity aggregation, signer retirement without
 rotation, NUMS-exit recovery limits, and the reference browser's localStorage
 custody are known boundaries documented in [`README.md`](README.md),
@@ -91,14 +92,13 @@ custody are known boundaries documented in [`README.md`](README.md),
 prevents choosing a favorable tree but does not make permissionless identities
 unique. An intermediate marker output can select any starting roll and credit
 within the corridor; the recursive rate budget and streak bounds remain enforced.
-Tree renewal and two-tip regrowth are permissionless covenant paths — no
+Tree renewal and one-batch regrowth are permissionless covenant paths — no
 project-held lifecycle key gates them — and the operator watcher is a
-convenience, not a trust root. The emulator gate is a trust root specifically
-for its Bitcoin Core height observation.
+convenience, not a trust root.
 
 Service-endpoint authentication rests on HTTPS and the manifest's URL, signer,
 and forfeit pins; arkd's per-boot ephemeral batch-operator key cannot be pinned,
 so an attacker who defeats those channels could disrupt or strand renewal
 batches but cannot redirect the pinned sweep key, forfeit payout, or covenant
-outputs. The stock emulator and Bitcoin RPC must remain private behind the
-gate; exposing either bypasses the public gate's policy boundary.
+outputs. The pinned stock emulator remains a trust boundary for Arkade Script
+execution.

@@ -94,7 +94,7 @@ function assertFixedSats(state, expected, label) {
 async function main() {
   await Promise.all([
     waitForHttp(`${ARKD}/v1/info`, 5_000),
-    waitForHttp('http://127.0.0.1:7074/v1/info', 5_000),
+    waitForHttp('http://127.0.0.1:7073/v1/info', 5_000),
     ...(EXTERNAL_WEB_URL ? [] : [assertPortAvailable(WEB_PORT, 'web server')]),
     assertPortAvailable(DRIVER_PORT, 'WebDriver'),
   ]);
@@ -1006,8 +1006,6 @@ async function main() {
       (tree) => tree.treeId === firstTree.treeId,
     );
     assert.equal(partialTree.health, 10 - TARGET_HITS);
-    assert.equal(partialTree.stumpHeight, 0);
-    assert.equal(partialTree.regrowAtHeight, null);
     assert.equal(partialTree.logReserveRemaining, 50_000 - TARGET_HITS);
     assert.equal(partialTree.xpRemaining, 50_000 - TARGET_HITS);
     assert.equal(partialTree.depleted, false);

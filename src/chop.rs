@@ -540,7 +540,6 @@ pub fn prepare_chop(
     world: &ChopWorld,
     player_state: &PlayerChopState,
     tree: &TreeChopState,
-    block_height: u32,
     mutation: ChopMutation,
 ) -> Result<PreparedChop> {
     let player_logs_before = player_state
@@ -702,7 +701,6 @@ pub fn prepare_chop(
         world.contract,
         [player_state.previous_tx, tree.previous_tx],
         next_state,
-        block_height,
     )?;
     mutation.mutate_extensions(
         &mut chop.ark_tx,

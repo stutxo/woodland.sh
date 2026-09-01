@@ -81,7 +81,6 @@ struct Services {
 struct CurrentTree {
     state: tree::TreeState,
     health: tree::TreeHealth,
-    stump_height: tree::TreeStumpHeight,
     record: VtxoRecord,
     previous_tx: bitcoin::Transaction,
 }
@@ -399,10 +398,6 @@ async fn connect_services() -> Result<Services> {
         .get_info()
         .await
         .context("read emulator info")?;
-    emulator_rest
-        .get_block_tip()
-        .await
-        .context("verify trusted block-aware emulator gate")?;
     if emulator.version.trim().is_empty() {
         return Err(anyhow!("emulator did not report a version"));
     }
@@ -796,10 +791,6 @@ fn build_plan(
             tree::attach_tree_health_packet(
                 &mut deployment.ark_tx,
                 tree::TreeHealth::new(ACTIVE_LOGS_PER_TREE)?,
-            )?;
-            tree::attach_tree_stump_height_packet(
-                &mut deployment.ark_tx,
-                tree::TreeStumpHeight::new(0)?,
             )?;
             let deployment_txid = deployment.ark_tx.unsigned_tx.compute_txid();
             manifest_deployments.push((state, deployment_txid));
@@ -1247,13 +1238,8 @@ async fn load_current_trees(
             .ok_or_else(|| anyhow!("current tree transaction has no state packet"))?;
         let health = tree::tree_health_from_tx(transaction)?
             .ok_or_else(|| anyhow!("current tree transaction has no health packet"))?;
-        let stump_height = tree::tree_stump_height_from_tx(transaction)?
-            .ok_or_else(|| anyhow!("current tree transaction has no stump height packet"))?;
-        if health.value() > logs
-            || health.value() > xp_balance
-            || (health.value() == 0) != (stump_height.value() > 0)
-        {
-            return Err(anyhow!("tree health or stump height is invalid"));
+        if health.value() > logs || health.value() > xp_balance {
+            return Err(anyhow!("tree health is invalid"));
         }
         let declared = declared_trees
             .iter()
@@ -1263,8 +1249,7 @@ async fn load_current_trees(
         let transition = tree::classify_transition(transaction, is_deployment)?;
         let expected_vout = transition.output_index();
         if record.outpoint.vout != expected_vout
-            || (is_deployment
-                && (health.value() != ACTIVE_LOGS_PER_TREE || stump_height.value() != 0))
+            || (is_deployment && health.value() != ACTIVE_LOGS_PER_TREE)
         {
             return Err(anyhow!("current tree lineage is invalid"));
         }
@@ -1278,7 +1263,6 @@ async fn load_current_trees(
         current.push(CurrentTree {
             state,
             health,
-            stump_height,
             record,
             previous_tx: transaction.clone(),
         });
@@ -1293,18 +1277,17 @@ async fn load_current_trees(
 fn tree_rollover_due(
     expires_at: Option<i64>,
     health: u64,
-    stump_height: u64,
     logs: u64,
-    block_height: u32,
     now: i64,
     margin: i64,
 ) -> bool {
+    let Some(expires_at) = expires_at else {
+        return false;
+    };
     if health == 0 && logs > 0 {
-        return stump_height
-            .checked_add(tree::REGROWTH_BLOCKS)
-            .is_some_and(|eligible| u64::from(block_height) >= eligible);
+        return true;
     }
-    expires_at.is_some_and(|expiry| expiry - now < margin)
+    expires_at - now < margin
 }
 
 /// Split the live tree lineages into renewal candidates and the records the
@@ -1315,7 +1298,6 @@ fn partition_rollover_candidates(
     trees: Vec<CurrentTree>,
     log_asset: AssetId,
     now: i64,
-    block_height: u32,
 ) -> (Vec<(i64, CurrentTree)>, Vec<OutPoint>) {
     let mut candidates = Vec::new();
     let mut missing_expiry = Vec::new();
@@ -1328,9 +1310,7 @@ fn partition_rollover_candidates(
         if !tree_rollover_due(
             Some(expires_at),
             current.health.value(),
-            current.stump_height.value(),
             logs,
-            block_height,
             now,
             current.record.rollover_margin_seconds(),
         ) {
@@ -1350,14 +1330,8 @@ async fn renew_expiring_trees(
     let manifest = read_manifest(path)?;
     let world = manifest.validate(&participant_keys.secp, &services.params, &services.emulator)?;
     let trees = wait_for_current_trees(&services.rest, &manifest, &world).await?;
-    let block_tip = services
-        .emulator_rest
-        .get_block_tip()
-        .await
-        .context("read attested Bitcoin tip for tree rollover")?;
     let now = crate::arkade::now_unix();
-    let (candidates, missing_expiry) =
-        partition_rollover_candidates(trees, world.log_asset, now, block_tip.height);
+    let (candidates, missing_expiry) = partition_rollover_candidates(trees, world.log_asset, now);
     if !missing_expiry.is_empty() {
         eprintln!(
             "woodland.sh rollover: {} live tree(s) have no indexed expiry and cannot be renewed",
@@ -1386,7 +1360,6 @@ async fn renew_expiring_trees(
                         world,
                         &current.record,
                         &current.previous_tx,
-                        block_tip.height,
                     )
                     .await,
                 )
@@ -1648,20 +1621,12 @@ fn renewal_expiry_margin_secs() -> i64 {
     }
 }
 
-fn require_rollover_due(
-    record: &VtxoRecord,
-    health: tree::TreeHealth,
-    stump_height: tree::TreeStumpHeight,
-    logs: u64,
-    block_height: u32,
-) -> Result<()> {
+fn require_rollover_due(record: &VtxoRecord, health: tree::TreeHealth, logs: u64) -> Result<()> {
     if force_rollover_enabled()
         || tree_rollover_due(
             record.expires_at,
             health.value(),
-            stump_height.value(),
             logs,
-            block_height,
             crate::arkade::now_unix(),
             record.rollover_margin_seconds(),
         )
@@ -1689,7 +1654,6 @@ async fn renew_current_tree(
     world: &crate::world::ValidatedWorld,
     record: &VtxoRecord,
     previous_tx: &bitcoin::Transaction,
-    block_height: u32,
 ) -> Result<RenewedTree> {
     let tree_id = crate::renewal::tree_state_from_tx(previous_tx)?
         .map(|state| state.tree_id)
@@ -1704,7 +1668,6 @@ async fn renew_current_tree(
         world.log_asset,
         world.xp_asset,
         services.params.dust_sats,
-        block_height,
         renewal_expiry_margin_secs(),
     )?;
     let outcome = run_one_renewal(participant_keys, services, world, prepared, previous_tx).await?;
@@ -1751,29 +1714,13 @@ async fn renew_tree(
     }
     let health = tree::tree_health_from_tx(&previous_tx)?
         .ok_or_else(|| anyhow!("tree transaction has no health packet"))?;
-    let stump_height = tree::tree_stump_height_from_tx(&previous_tx)?
-        .ok_or_else(|| anyhow!("tree transaction has no stump height packet"))?;
-    let block_tip = services
-        .emulator_rest
-        .get_block_tip()
-        .await
-        .context("read attested Bitcoin tip for tree renewal")?;
     require_rollover_due(
         &record,
         health,
-        stump_height,
         record.asset_amount(world.log_asset).unwrap_or(0),
-        block_tip.height,
     )?;
-    let renewed = renew_current_tree(
-        participant_keys,
-        services,
-        &world,
-        &record,
-        &previous_tx,
-        block_tip.height,
-    )
-    .await?;
+    let renewed =
+        renew_current_tree(participant_keys, services, &world, &record, &previous_tx).await?;
     println!(
         "{}",
         serde_json::json!({
@@ -1943,7 +1890,7 @@ mod tests {
         assert!(validate_service_urls(
             bitcoin::Network::Signet,
             "http://127.0.0.1:7070",
-            "http://127.0.0.1:7074",
+            "http://127.0.0.1:7073",
         )
         .is_ok());
         for (arkade, emulator) in [
@@ -2049,7 +1996,6 @@ mod tests {
                 y: 0,
             },
             health: tree::TreeHealth::new(5).unwrap(),
-            stump_height: tree::TreeStumpHeight::new(0).unwrap(),
             record: VtxoRecord {
                 outpoint: OutPoint {
                     txid: Txid::from_str(&format!("{:064x}", tree_id)).unwrap(),
@@ -2077,19 +2023,16 @@ mod tests {
     }
 
     #[test]
-    fn rollover_selection_obeys_expiry_and_two_block_regrowth_gate() {
+    fn rollover_selection_renews_funded_stumps_in_one_batch() {
         let now = 10_000;
         let due = Some(now + 99);
         let far = Some(now + 100);
-        assert!(tree_rollover_due(due, 5, 0, 10, 100, now, 100));
-        assert!(tree_rollover_due(due, 0, 100, 0, 100, now, 100));
-        // A funded stump cannot renew at the first observed tip advance.
-        assert!(!tree_rollover_due(far, 0, 100, 5, 101, now, 100));
-        assert!(!tree_rollover_due(due, 0, 100, 5, 101, now, 100));
-        assert!(tree_rollover_due(far, 0, 100, 5, 102, now, 100));
-        assert!(!tree_rollover_due(far, 5, 0, 10, 102, now, 100));
-        // A missing expiry is never due; the partitioner surfaces it.
-        assert!(!tree_rollover_due(None, 5, 0, 10, 102, now, 100));
+        assert!(tree_rollover_due(due, 5, 10, now, 100));
+        assert!(tree_rollover_due(far, 0, 5, now, 100));
+        assert!(tree_rollover_due(due, 0, 0, now, 100));
+        assert!(!tree_rollover_due(far, 0, 0, now, 100));
+        assert!(!tree_rollover_due(far, 5, 10, now, 100));
+        assert!(!tree_rollover_due(None, 0, 5, now, 100));
         assert_eq!(
             plan_path(Path::new("/tmp/mutinynet-season-1.json")),
             PathBuf::from("/tmp/mutinynet-season-1-plan.json")
@@ -2108,7 +2051,7 @@ mod tests {
         let missing = current_tree(3, None);
         let missing_outpoint = missing.record.outpoint;
         let (candidates, missing_expiry) =
-            partition_rollover_candidates(vec![far, due, missing], asset(4), now, 100);
+            partition_rollover_candidates(vec![far, due, missing], asset(4), now);
         let candidate_ids = candidates
             .iter()
             .map(|(_, current)| current.state.tree_id)

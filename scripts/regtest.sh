@@ -13,9 +13,6 @@ WORLD_MANIFEST="$ROOT/regtest/_build/woodland-world.json"
 WORLD_PLAN="$ROOT/regtest/_build/woodland-world-plan.json"
 DEPLOYER_SECRET=${WOODLAND_DEPLOYER_SECRET:-1111111111111111111111111111111111111111111111111111111111111111}
 ROLLOVER_SECRET=${WOODLAND_ROLLOVER_SECRET:-4444444444444444444444444444444444444444444444444444444444444444}
-GATE_BIN="$ROOT/target/debug/woodland-emulator-gate"
-GATE_PID_FILE="$ROOT/regtest/_build/emulator-gate.pid"
-GATE_LOG="$ROOT/regtest/_build/emulator-gate.log"
 
 usage() {
   cat <<'EOF'
@@ -101,7 +98,7 @@ fund_address() {
 run_world_bootstrap() {
   WOODLAND_NETWORK=regtest \
   WOODLAND_ARKADE_SERVICE_URL="${WOODLAND_ARKADE_SERVICE_URL:-http://127.0.0.1:7070}" \
-  WOODLAND_EMULATOR_URL="${WOODLAND_EMULATOR_URL:-http://127.0.0.1:7074}" \
+  WOODLAND_EMULATOR_URL="${WOODLAND_EMULATOR_URL:-http://127.0.0.1:7073}" \
   WOODLAND_DEPLOYER_SECRET="$DEPLOYER_SECRET" \
   WOODLAND_ROLLOVER_SECRET="$ROLLOVER_SECRET" cargo run \
     --manifest-path "$ROOT/Cargo.toml" \
@@ -112,68 +109,6 @@ run_world_bootstrap() {
     -- "$@"
 }
 
-stop_emulator_gate() {
-  if [[ ! -f "$GATE_PID_FILE" ]]; then
-    return
-  fi
-  local pid executable gate_executable
-  pid=$(cat "$GATE_PID_FILE")
-  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-    executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
-    gate_executable=$(readlink -f "$GATE_BIN" 2>/dev/null || true)
-    if [[ "$executable" != "$gate_executable" && "$executable" != "$gate_executable (deleted)" ]]; then
-      echo "error: refuse to stop unrelated PID $pid from $GATE_PID_FILE" >&2
-      exit 1
-    fi
-    kill "$pid"
-    for _ in {1..50}; do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "error: emulator gate PID $pid did not stop" >&2
-      exit 1
-    fi
-  fi
-  rm -f "$GATE_PID_FILE"
-}
-
-start_emulator_gate() {
-  stop_emulator_gate
-  mkdir -p "$(dirname "$GATE_LOG")"
-  local allowed_origin="${WOODLAND_EMULATOR_GATE_ORIGIN:-${WOODLAND_SERVER_ORIGIN:-${WOODLAND_SERVER_PUBLIC_URL:-http://127.0.0.1:8000}}}"
-  cargo build \
-    --manifest-path "$ROOT/Cargo.toml" \
-    --locked \
-    --quiet \
-    --features server \
-    --bin woodland-emulator-gate
-  WOODLAND_EMULATOR_GATE_BIND=127.0.0.1:7074 \
-  WOODLAND_EMULATOR_UPSTREAM_URL=http://127.0.0.1:7073 \
-  WOODLAND_BITCOIN_RPC_URL=http://127.0.0.1:18443 \
-  WOODLAND_BITCOIN_RPC_USER=admin1 \
-  WOODLAND_BITCOIN_RPC_PASSWORD=123 \
-  WOODLAND_EMULATOR_GATE_ORIGIN="$allowed_origin" \
-    nohup "$GATE_BIN" >"$GATE_LOG" 2>&1 &
-  local pid=$!
-  printf '%s\n' "$pid" >"$GATE_PID_FILE"
-  for attempt in {1..60}; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      cat "$GATE_LOG" >&2
-      echo "error: emulator gate exited before readiness" >&2
-      exit 1
-    fi
-    if curl --fail --silent http://127.0.0.1:7074/health.json >/dev/null; then
-      return
-    fi
-    if [[ $attempt == 60 ]]; then
-      cat "$GATE_LOG" >&2
-      echo "error: emulator gate did not become ready" >&2
-      exit 1
-    fi
-    sleep 0.25
-  done
-}
 
 ensure_world() {
   local output status address sats
@@ -319,7 +254,6 @@ esac
 case "$command" in
   start)
     require_regtest
-    stop_emulator_gate
     ensure_images
     load_existing_bitcoin_wallet
     node "$REGTEST" start --profile ark
@@ -328,14 +262,12 @@ case "$command" in
   start-tree)
     require_regtest
     ensure_images
-    stop_emulator_gate
     # A prior full-profile run can leave optional containers alive because
     # Compose does not stop services omitted from a later profile selection.
     node "$REGTEST" stop
     load_existing_bitcoin_wallet
     node "$REGTEST" start --profile emulator
     assert_pinned_images
-    start_emulator_gate
     ensure_world
     ;;
   renew-world)
@@ -348,20 +280,17 @@ case "$command" in
     ;;
   stop)
     require_regtest
-    stop_emulator_gate
     node "$REGTEST" stop
     assert_stack_stopped
     ;;
   clean)
     require_regtest
-    stop_emulator_gate
     node "$REGTEST" clean
     assert_stack_removed
     docker volume rm "$OWNER_VOLUME" >/dev/null
     rm -f \
       "$WORLD_MANIFEST" \
-      "$WORLD_PLAN" \
-      "$GATE_LOG"
+      "$WORLD_PLAN"
     ;;
   build-images)
     build_images "${1:-}"

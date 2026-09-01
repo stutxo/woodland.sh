@@ -41,7 +41,7 @@ const ARKADE_UPSTREAM = configuredSetting(
 ).replace(/\/+$/, '');
 const EMULATOR_UPSTREAM = configuredSetting(
   'WOODLAND_EMULATOR_URL',
-  'http://127.0.0.1:7074',
+  'http://127.0.0.1:7073',
 ).replace(/\/+$/, '');
 
 const watcherLockId = createHash('sha256').update(WORLD_MANIFEST).digest('hex').slice(0, 16);

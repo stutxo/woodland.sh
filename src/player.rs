@@ -1201,7 +1201,6 @@ pub fn attach_player_chop_context(
     tree_contract: &crate::tree::TreeContract,
     previous_input_txs: [&Transaction; 2],
     next_state: PlayerState,
-    block_height: u32,
 ) -> Result<()> {
     if psbt.unsigned_tx.input.len() != 2 {
         return Err(anyhow!("player chop requires exactly two inputs"));
@@ -1243,10 +1242,7 @@ pub fn attach_player_chop_context(
     let previous_tree_health =
         crate::tree::tree_health_from_tx(previous_input_txs[TREE_INPUT_INDEX])?
             .ok_or_else(|| anyhow!("previous tree transaction has no tree health"))?;
-    let previous_stump_height =
-        crate::tree::tree_stump_height_from_tx(previous_input_txs[TREE_INPUT_INDEX])?
-            .ok_or_else(|| anyhow!("previous tree transaction has no stump height"))?;
-    if previous_tree_health.value() == 0 || previous_stump_height.value() != 0 {
+    if previous_tree_health.value() == 0 {
         return Err(anyhow!("cannot chop a stump"));
     }
     let (expected_luck, success) = previous_state.luck.advance(previous_state.xp.value());
@@ -1270,16 +1266,9 @@ pub fn attach_player_chop_context(
             .checked_sub(u64::from(success))
             .ok_or_else(|| anyhow!("tree health underflow"))?,
     )?;
-    let next_stump_height = if next_health.value() == 0 {
-        crate::tree::TreeStumpHeight::new(u64::from(block_height))?
-    } else {
-        previous_stump_height
-    };
-    let block_witness = crate::tree::block_attestation_witness(block_height)?;
     attach_player_state_packets(&mut updated, next_state)?;
     crate::tree::attach_tree_state_packet(&mut updated, tree_state)?;
     crate::tree::attach_tree_health_packet(&mut updated, next_health)?;
-    crate::tree::attach_tree_stump_height_packet(&mut updated, next_stump_height)?;
     let packet = ark_core::introspector::packet::Packet::new(vec![
         ark_core::introspector::packet::IntrospectorEntry {
             vin: PLAYER_STATE_INPUT_INDEX as u16,
@@ -1289,7 +1278,7 @@ pub fn attach_player_chop_context(
         ark_core::introspector::packet::IntrospectorEntry {
             vin: TREE_INPUT_INDEX as u16,
             script: tree_contract.chop_arkade_script.clone(),
-            witness: block_witness,
+            witness: bitcoin::Witness::default(),
         },
     ])
     .context("build player chop emulator packet")?;

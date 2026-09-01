@@ -2,9 +2,9 @@
 
 ## Status
 
-Protocol v2 uses schema 2, stock arkd behind a block-aware emulator gate,
+Protocol v2 uses schema 2, stock arkd and the stock Arkade Script emulator,
 self-issued PLAYER_ID markers, unlimited permissionless activation, owner
-renewal, permissionless tree regrowth, and fixed world LOG/XP supply.
+renewal, one-batch permissionless tree regrowth, and fixed world LOG/XP supply.
 
 ## State Partitioning
 
@@ -12,8 +12,7 @@ The world contains:
 
 - one recursive VTXO per player, holding 330 sats, one PLAYER_ID, identity,
   position, player luck, LOG, and XP;
-- one recursive VTXO per tree, holding TREE, remaining local LOG/XP, health,
-  and stump height;
+- one recursive VTXO per tree, holding TREE, remaining local LOG/XP, and health;
 - no shared supply vault, global player reserve, PLAYER_TICKET, allocator, or
   protocol registry.
 
@@ -108,9 +107,9 @@ browser participates directly in Arkade batch signing. The optional watchtower
 uses a separate exact-self-send leaf and can be horizontally sharded by owner,
 PLAYER_ID, or outpoint.
 
-Tree renewal contends per tree. Funded stumps use the same path, but regrow only
-after two Bitcoin tip advances; different stumps remain independent. The
-renewal watcher can process eligible trees concurrently with a fixed bound.
+Tree renewal contends per tree. Funded stumps use the same path and regrow in
+one fresh batch; different stumps remain independent. The renewal watcher can
+process funded stumps concurrently with a fixed bound.
 Delegated player renewals are exact per-player self-sends. The server processes
 due delegations sequentially, so they share batch/service capacity but no
 gameplay input.
@@ -144,8 +143,8 @@ needs reverse-proxy request limits.
 
 ## Failure Domains
 
-- Direct Arkade and emulator-gate calls remove Woodland game-server availability
-  and bandwidth from the player path.
+- Direct Arkade and emulator calls remove Woodland game-server availability and
+  bandwidth from the player path.
 - Loss of either the browser key or its PLAYER_ID profile prevents deterministic
   recovery; reference localStorage is not production custody.
 - A player can self-renew without Woodland infrastructure.
@@ -154,18 +153,16 @@ needs reverse-proxy request limits.
   and player authorization is unaffected.
 - Game-server failure hides social state and rankings; online clients fall back
   to owner renewal and gameplay remains direct.
-- Operator, emulator, or gate retirement still strands NUMS-exit recursive
-  state; no signer or service rotation is encoded.
+- Operator or emulator retirement still strands NUMS-exit recursive state; no
+  signer or service rotation is encoded.
 
 ## Launch Risks
 
 Production still needs hardened key custody, service pin rotation policy,
-stock-emulator support commitments, hardened Bitcoin Core RPC isolation,
-monitoring for gate health and tree renewal, and UX for batch renewal latency.
-The emulator gate is a trust boundary for Bitcoin height: a dishonest or
-bypassed gate can waive the two-tip delay. Player-bound deterministic rolls
-prevent tree-target grinding and bounded credit limits
-streaks; both remain public game mechanics, not fair hidden randomness.
+stock-emulator support commitments, monitoring for emulator and tree-renewal
+health, and UX for batch renewal latency. Player-bound deterministic rolls
+prevent tree-target grinding and bounded credit limits streaks; both remain
+public game mechanics, not fair hidden randomness.
 Permissionless PLAYER_ID creation means Sybil and identity grinding remain
 possible, and an intermediate marker output can choose any starting roll and
 credit within the corridor before the recursive covenant takes control.

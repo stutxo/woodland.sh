@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Regrowth E2E: ten successful drops turn a pristine tree into a funded
-// stump. An unfunded, inactive browser is rejected before two Bitcoin tip
-// advances, then permissionlessly regrows the exact same local reserve.
+// stump. A separate unfunded, inactive browser permissionlessly renews it in
+// one fresh Ark batch without minting assets or changing identity.
 import { execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -20,14 +20,12 @@ import {
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const WEB_URL = (process.env.WOODLAND_E2E_WEB_URL || 'http://127.0.0.1:8090').replace(/\/$/, '');
-const MANIFEST = process.env.WOODLAND_WORLD_MANIFEST
-  || path.join(ROOT, 'regtest/_build/woodland-world.json');
 const DRIVER_BASE_PORT = setting('WOODLAND_REGROWTH_DRIVER_PORT', 16_500, 1_024, 60_000);
 const OPERATION_TIMEOUT_MS = setting(
   'WOODLAND_REGROWTH_TIMEOUT_MS',
-  600_000,
+  120_000,
   30_000,
-  900_000,
+  300_000,
 );
 const BOOT_TIMEOUT_MS = setting('WOODLAND_REGROWTH_BOOT_TIMEOUT_MS', 120_000, 30_000, 300_000);
 const MAX_ROUNDS = setting('WOODLAND_REGROWTH_MAX_ROUNDS', 500, 20, 10_000);
@@ -88,16 +86,19 @@ async function createBrowser(driverUrl, label) {
   `);
   const chop = (snapshot, tree) => executeAsync(`
     const done = arguments[arguments.length - 1];
-    globalThis.__WOODLAND_E2E_CHOP_EXPECTED(...Array.from(arguments).slice(0, -1))
+    const args = Array.from(arguments).slice(0, -1);
+    const app = globalThis.__WOODLAND_E2E_APP;
+    if (!app) {
+      done({ ok: false, message: 'missing browser app' });
+      return;
+    }
+    const operation = typeof app.chopExpected === 'function'
+      ? globalThis.__WOODLAND_E2E_CHOP_EXPECTED(...args)
+      : globalThis.__WOODLAND_E2E_CHOP_NATURAL(args[0]);
+    operation
       .then(done)
       .catch((error) => done({ ok: false, message: String(error) }));
   `, [tree.treeId, tree.treeOutpoint, snapshot.playerStateOutpoint, tree.nextDrop]);
-  const regrow = (treeId) => executeAsync(`
-    const done = arguments[arguments.length - 1];
-    globalThis.__WOODLAND_E2E_REGROW(arguments[0])
-      .then((state) => done({ state }))
-      .catch((error) => done({ message: String(error) }));
-  `, [treeId]);
   const clickMapCell = (x, y) => execute(`
     if (!globalThis.__WOODLAND_E2E_CLICK_MAP) throw new Error('missing canvas map hook');
     globalThis.__WOODLAND_E2E_CLICK_MAP(arguments[0], arguments[1]);
@@ -114,7 +115,6 @@ async function createBrowser(driverUrl, label) {
     refreshWorld,
     chop,
     clickMapCell,
-    regrow,
   };
 }
 
@@ -122,8 +122,6 @@ function treeProjection(state) {
   return state.trees.map((tree) => ({
     treeId: tree.treeId,
     health: tree.health,
-    stumpHeight: tree.stumpHeight,
-    regrowAtHeight: tree.regrowAtHeight,
     logReserveRemaining: tree.logReserveRemaining,
     xpRemaining: tree.xpRemaining,
     treeOutpoint: tree.treeOutpoint,
@@ -162,26 +160,6 @@ async function fetchAssetSupply(baseUrl, assetId) {
   return supply;
 }
 
-async function blockTip(emulatorUrl) {
-  const response = await fetch(`${emulatorUrl.replace(/\/$/, '')}/v1/block-tip`, {
-    cache: 'no-store',
-    signal: AbortSignal.timeout(20_000),
-  });
-  assert.equal(response.ok, true, `block tip returned ${response.status}`);
-  const tip = await response.json();
-  assert.ok(Number.isInteger(tip.height) && tip.height > 0, 'gate returned an invalid block height');
-  assert.match(tip.blockHash, /^[0-9a-f]{64}$/i, 'gate returned an invalid block hash');
-  return tip;
-}
-
-function mine(blocks) {
-  execFileSync(path.join(ROOT, 'scripts/regtest.sh'), ['mine', String(blocks)], {
-    cwd: ROOT,
-    stdio: 'pipe',
-    encoding: 'utf8',
-    timeout: 120_000,
-  });
-}
 
 async function waitForIndexedRecord(baseUrl, outpoint, spent) {
   return waitFor(
@@ -231,7 +209,7 @@ try {
   await Promise.all([
     waitForHttp(`${WEB_URL}/health.json`, 20_000),
     waitForHttp(`${arkadeBase}/v1/info`, 20_000),
-    waitForHttp(`${manifest.emulatorUrl.replace(/\/$/, '')}/v1/block-tip`, 20_000),
+    waitForHttp(`${manifest.emulatorUrl.replace(/\/$/, '')}/v1/info`, 20_000),
     ...driverConfigs.flatMap(({ port, websocketPort }, index) => [
       assertPortAvailable(port, `regrowth WebDriver ${index + 1}`),
       assertPortAvailable(websocketPort, `regrowth WebDriver ${index + 1} WebSocket`),
@@ -309,19 +287,26 @@ try {
   const initialOutpoint = target.treeOutpoint;
   let rounds = 0;
   let drops = 0;
+  let naturalChops = false;
 
+  assert.equal((await regrower.inspect()).state.playerAsset, null, 'regrower must remain unfunded');
   while (target.health > 0) {
     rounds += 1;
     assert.ok(rounds <= MAX_ROUNDS, `stumping tree exceeded ${MAX_ROUNDS} rounds`);
     const before = target;
     const result = await chopper.chop(chopperState, before);
     assert.equal(result.ok, true, `round ${rounds}: ${result.message || 'chop rejected'}`);
+    naturalChops ||= result.natural === true;
     chopperState = result.state;
     target = chopperState.trees.find((tree) => tree.treeId === before.treeId);
     assert.ok(target, `round ${rounds}: target tree disappeared`);
     assert.notEqual(target.treeOutpoint, before.treeOutpoint, `round ${rounds}: tree did not rotate`);
     const dropped = before.logReserveRemaining - target.logReserveRemaining;
-    assert.equal(dropped, Number(before.nextDrop), `round ${rounds}: reward prediction mismatch`);
+    if (typeof before.nextDrop === 'boolean') {
+      assert.equal(dropped, Number(before.nextDrop), `round ${rounds}: reward prediction mismatch`);
+    } else {
+      assert.ok(dropped === 0 || dropped === 1, `round ${rounds}: invalid natural drop`);
+    }
     assert.equal(target.xpRemaining, before.xpRemaining - dropped, `round ${rounds}: XP mismatch`);
     assert.equal(target.health, before.health - dropped, `round ${rounds}: health mismatch`);
     drops += dropped;
@@ -331,52 +316,27 @@ try {
   assert.equal(target.logReserveRemaining, LOG_RESERVE_PER_TREE - ACTIVE_LOGS_PER_TREE);
   assert.equal(target.xpRemaining, LOG_RESERVE_PER_TREE - ACTIVE_LOGS_PER_TREE);
   assert.equal(target.depleted, false, 'funded stump must not be terminal');
-  assert.ok(target.stumpHeight > 0, 'final chop must record a Bitcoin stump height');
-  assert.equal(target.regrowAtHeight, target.stumpHeight + 2);
   const stumpOutpoint = target.treeOutpoint;
-  const stumpTip = await blockTip(manifest.emulatorUrl);
-  assert.equal(stumpTip.height, target.stumpHeight, 'final chop must stamp the attested tip');
+  const [, preRegrowth] = await refreshBoth(chopper, regrower, 'pre-regrowth');
+  const visibleStump = preRegrowth.trees.find((tree) => tree.treeId === target.treeId);
+  assert.ok(visibleStump, 'regrower cannot see the funded stump');
+  assert.equal(visibleStump.health, 0, 'regrower must refresh the stump before clicking it');
+  const regrowthStartedAt = Date.now();
 
-  const early = await regrower.regrow(target.treeId);
-  assert.match(early.message || '', /requires Bitcoin height/i, 'same-tip regrowth must fail');
-  const [, sameTipState] = await refreshBoth(chopper, regrower, 'same-tip rejection');
-  assert.equal(
-    sameTipState.trees.find((tree) => tree.treeId === target.treeId)?.treeOutpoint,
-    stumpOutpoint,
-    'same-tip rejection changed the tree lineage',
-  );
-  mine(1);
-  const oneTip = await blockTip(manifest.emulatorUrl);
-  assert.equal(oneTip.height, target.stumpHeight + 1, 'first tip advance was not observed');
-  const stillEarly = await regrower.regrow(target.treeId);
-  assert.match(stillEarly.message || '', /requires Bitcoin height/i, 'one-tip regrowth must fail');
-  const [, oneTipState] = await refreshBoth(chopper, regrower, 'one-tip rejection');
-  assert.equal(
-    oneTipState.trees.find((tree) => tree.treeId === target.treeId)?.treeOutpoint,
-    stumpOutpoint,
-    'one-tip rejection changed the tree lineage',
-  );
-  mine(1);
-  const twoTips = await blockTip(manifest.emulatorUrl);
-  assert.equal(twoTips.height, target.stumpHeight + 2, 'second tip advance was not observed');
-
-  await regrower.clickMapCell(target.x, target.y);
+  await regrower.clickMapCell(visibleStump.x, visibleStump.y);
   await waitFor(
     'anonymous map-click regrowth',
     regrower.inspect,
     (view) => !view.busy
       && view.state?.playerActive === false
       && view.state?.trees.find((tree) => tree.treeId === target.treeId)?.health
-        === ACTIVE_LOGS_PER_TREE
-      && view.state?.trees.find((tree) => tree.treeId === target.treeId)?.stumpHeight === 0,
+        === ACTIVE_LOGS_PER_TREE,
     OPERATION_TIMEOUT_MS,
   );
   const [finalChopper, finalRegrower] = await refreshBoth(chopper, regrower, 'post-regrowth');
   const regrown = finalRegrower.trees.find((tree) => tree.treeId === target.treeId);
   assert.ok(regrown, 'regrown tree disappeared');
   assert.equal(regrown.health, ACTIVE_LOGS_PER_TREE, 'regrowth must restore ten health');
-  assert.equal(regrown.stumpHeight, 0, 'regrowth must clear the stump height');
-  assert.equal(regrown.regrowAtHeight, null, 'active tree must not advertise regrowth');
   assert.equal(regrown.logReserveRemaining, target.logReserveRemaining, 'regrowth minted LOG');
   assert.equal(regrown.xpRemaining, target.xpRemaining, 'regrowth minted XP');
   assert.equal(regrown.depleted, false);
@@ -390,6 +350,7 @@ try {
 
   const stumpRecord = await waitForIndexedRecord(arkadeBase, stumpOutpoint, true);
   const regrownRecord = await waitForIndexedRecord(arkadeBase, regrown.treeOutpoint, false);
+  const batchLatencyMs = Date.now() - regrowthStartedAt;
   assert.equal(stumpRecord.script, manifest.treeScript, 'stump changed covenant script');
   assert.equal(regrownRecord.script, manifest.treeScript, 'regrowth changed covenant script');
   assert.equal(Number(regrownRecord.amount), 330, 'regrowth changed tree sats');
@@ -417,12 +378,13 @@ try {
     initialOutpoint,
     stumpOutpoint,
     regrownOutpoint: regrown.treeOutpoint,
-    stumpHeight: target.stumpHeight,
-    eligibleHeight: target.regrowAtHeight,
+    batchLatencyMs,
     rounds,
     drops,
+    naturalChops,
     localReserveAfter: regrown.logReserveRemaining,
     permissionlessRegrowerActive: finalRegrower.playerActive,
+    permissionlessRegrowerAsset: finalRegrower.playerAsset,
     indexedAssetSupplies: { logs, xp },
     durationMs: Date.now() - startedAt,
   };
