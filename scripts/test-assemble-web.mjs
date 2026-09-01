@@ -15,6 +15,19 @@ const base = {
   gameId: 'woodland.sh',
   rulesetId: 'woodland.sh/forest/v3',
   woodcuttingXpPerLog: 25,
+  stoneAsset: `${'33'.repeat(32)}0300`,
+  ironOreAsset: `${'33'.repeat(32)}0400`,
+  stoneReservePerTree: 50_000,
+  ironOreReservePerTree: 50_000,
+  stoneDropBasisPoints: 1_000,
+  ironOreDropBasisPoints: 200,
+  ironOreUnlockLevel: 10,
+  maxLogDropBasisPoints: 3_800,
+  axeRecipes: [
+    { axe: 'wooden', requiredLevel: 1, logCost: 1, stoneCost: 0, ironOreCost: 0 },
+    { axe: 'stone', requiredLevel: 5, logCost: 2, stoneCost: 2, ironOreCost: 0 },
+    { axe: 'iron', requiredLevel: 15, logCost: 5, stoneCost: 0, ironOreCost: 2 },
+  ],
   deployerSigner: '11'.repeat(32),
   manifestSignature: '22'.repeat(64),
   network: 'signet',
@@ -111,6 +124,16 @@ try {
   assert.notEqual(wrongScale.status, 0);
   assert.match(
     wrongScale.stderr,
+    /requires a signed woodland\.sh protocol v3 schema 3 manifest/,
+  );
+
+  const missingProgression = path.join(temporary, 'missing-progression.json');
+  const { stoneAsset: _stoneAsset, ...withoutProgression } = base;
+  await writeFile(missingProgression, JSON.stringify(withoutProgression));
+  const missing = run(missingProgression, path.join(temporary, 'missing-progression'));
+  assert.notEqual(missing.status, 0);
+  assert.match(
+    missing.stderr,
     /requires a signed woodland\.sh protocol v3 schema 3 manifest/,
   );
 

@@ -77,12 +77,16 @@ if (
   throw new Error('forced tree renewal requires one tree per round');
 }
 const SOAK_VIEWPORT_MAX = 64;
-// All fixed LOG and XP supply is issued into the 420 tree-local reserves at
-// genesis.
+// All fixed progression-asset supply is issued into the 420 tree-local
+// reserves at genesis.
 const INDEXED_LOG_SUPPLY = 21_000_000;
 const INDEXED_XP_SUPPLY = 21_000_000;
+const INDEXED_STONE_SUPPLY = 21_000_000;
+const INDEXED_IRON_ORE_SUPPLY = 21_000_000;
 let expectedLogSupply = 0;
 let expectedXpSupply = 0;
+let expectedStoneSupply = 0;
+let expectedIronOreSupply = 0;
 const ROUND_DELAY_MS = setting('WOODLAND_SOAK_ROUND_DELAY_MS', 500, 0, 60_000);
 const DRIVER_BASE_PORT = setting('WOODLAND_SOAK_DRIVER_PORT', 15_500, 1_024, 60_000);
 const OPERATION_TIMEOUT_MS = setting('WOODLAND_SOAK_TIMEOUT_MS', 240_000, 30_000, 900_000);
@@ -207,6 +211,8 @@ function treeProjection(state) {
     health: tree.health,
     logReserveRemaining: tree.logReserveRemaining,
     xpRemaining: tree.xpRemaining,
+    stoneRemaining: tree.stoneRemaining,
+    ironOreRemaining: tree.ironOreRemaining,
     valueSats: tree.valueSats,
     treeOutpoint: tree.treeOutpoint,
     lastAttemptTxid: tree.lastAttemptTxid || null,
@@ -218,6 +224,9 @@ function playerGameProjection(state) {
     playerAsset: state.playerAsset,
     playerXp: state.playerXp,
     playerLogs: state.playerLogs,
+    playerStone: state.playerStone,
+    playerIronOre: state.playerIronOre,
+    playerAxe: state.playerAxe,
     playerLuckCredit: state.playerLuckCredit,
     playerLevel: state.playerLevel,
   };
@@ -229,6 +238,8 @@ function treeRenewalProjection(tree) {
     y: tree.y,
     logReserveRemaining: tree.logReserveRemaining,
     xpRemaining: tree.xpRemaining,
+    stoneRemaining: tree.stoneRemaining,
+    ironOreRemaining: tree.ironOreRemaining,
     valueSats: tree.valueSats,
     deploymentTxid: tree.deploymentTxid,
     depleted: tree.depleted,
@@ -262,10 +273,30 @@ function assertConverged(views, label) {
     0,
   );
   const treeXp = views[0].state.trees.reduce((total, tree) => total + tree.xpRemaining, 0);
+  const treeStone = views[0].state.trees.reduce(
+    (total, tree) => total + tree.stoneRemaining,
+    0,
+  );
+  const treeIronOre = views[0].state.trees.reduce(
+    (total, tree) => total + tree.ironOreRemaining,
+    0,
+  );
   const playerLogs = views.reduce((total, view) => total + view.state.playerLogs, 0);
   const playerXp = views.reduce((total, view) => total + view.state.playerXp, 0);
+  const playerStone = views.reduce((total, view) => total + view.state.playerStone, 0);
+  const playerIronOre = views.reduce((total, view) => total + view.state.playerIronOre, 0);
   assert.equal(treeLogs + playerLogs, expectedLogSupply, `${label}: LOG supply changed`);
   assert.equal(treeXp + playerXp, expectedXpSupply, `${label}: XP supply changed`);
+  assert.equal(
+    treeStone + playerStone,
+    expectedStoneSupply,
+    `${label}: STONE supply changed`,
+  );
+  assert.equal(
+    treeIronOre + playerIronOre,
+    expectedIronOreSupply,
+    `${label}: IRON ORE supply changed`,
+  );
 }
 
 async function refreshUntilConverged(players, label) {
@@ -660,6 +691,8 @@ try {
   expectedXpSupply = manifest.xpPerTree
     * manifest.woodcuttingXpPerLog
     * manifest.trees.length;
+  expectedStoneSupply = manifest.stoneReservePerTree * manifest.trees.length;
+  expectedIronOreSupply = manifest.ironOreReservePerTree * manifest.trees.length;
   const arkadeHost = new URL(manifest.arkadeServiceUrl).hostname;
   const localFunding = ['127.0.0.1', 'localhost'].includes(arkadeHost);
   if (!localFunding && !FUND_COMMAND) {
@@ -956,15 +989,19 @@ try {
   const health = await fetch(`${WEB_URL}/health.json`).then((response) => response.json());
   assert.equal(health.ready, true, `server unhealthy after soak: ${JSON.stringify(health)}`);
   assert.equal(health.lastError ?? null, null, `server retained an error: ${JSON.stringify(health)}`);
-  const [treeMarkers, logs, xp] = await Promise.all([
+  const [treeMarkers, logs, xp, stone, ironOre] = await Promise.all([
     fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.treeAsset),
     fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.logAsset),
     fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.xpAsset),
+    fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.stoneAsset),
+    fetchAssetSupply(manifest.arkadeServiceUrl, views[0].state.ironOreAsset),
   ]);
-  const indexedAssetSupplies = { treeMarkers, logs, xp };
+  const indexedAssetSupplies = { treeMarkers, logs, xp, stone, ironOre };
   assert.equal(treeMarkers, views[0].state.trees.length, 'indexed TREE supply changed');
   assert.equal(logs, INDEXED_LOG_SUPPLY, 'indexed LOG supply changed');
   assert.equal(xp, INDEXED_XP_SUPPLY, 'indexed XP supply changed');
+  assert.equal(stone, INDEXED_STONE_SUPPLY, 'indexed STONE supply changed');
+  assert.equal(ironOre, INDEXED_IRON_ORE_SUPPLY, 'indexed IRON ORE supply changed');
   const report = {
     profile: E2E_PROFILE,
     webUrl: WEB_URL,

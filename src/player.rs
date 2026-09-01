@@ -1,13 +1,14 @@
 //! Recursive player state for atomic tree chopping.
 //!
 //! A player owns one 330-sat recursive state VTXO. PLAYER_ID identifies its
-//! lineage, LOG and XP assets are its inventory and progression, and only the
-//! deterministic roll plus bounded luck credit remain as mutable packets.
+//! lineage; LOG, XP, STONE, and IRON ORE assets are its inventory and
+//! progression; and deterministic luck plus the equipped axe are mutable
+//! packets.
 
 use crate::protocol::{
-    PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_ROLL_PACKET_TYPE, PLAYER_STATE_INPUT_INDEX,
-    PLAYER_STATE_OUTPUT_INDEX, RENEWAL_STATE_INPUT_INDEX, RENEWAL_STATE_OUTPUT_INDEX,
-    TREE_INPUT_INDEX, TREE_OUTPUT_INDEX,
+    PLAYER_AXE_PACKET_TYPE, PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_ROLL_PACKET_TYPE,
+    PLAYER_STATE_INPUT_INDEX, PLAYER_STATE_OUTPUT_INDEX, RENEWAL_STATE_INPUT_INDEX,
+    RENEWAL_STATE_OUTPUT_INDEX, TREE_INPUT_INDEX, TREE_OUTPUT_INDEX,
 };
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
@@ -29,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 
 const PLAYER_ROLL_LEN: usize = 32;
 const PLAYER_LUCK_CREDIT_LEN: usize = 9;
+const PLAYER_AXE_LEN: usize = 1;
 const P2A_PROGRAM: [u8; 2] = [0x4e, 0x73];
 
 /// BIP340 consent proof for publishing one PLAYER_ID to one game server.
@@ -101,10 +103,21 @@ pub const LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS: [u64; 5] = [
     xp_balance_for_woodcutting_xp(LEVEL_LOG_DROP_XP_THRESHOLDS[4]),
 ];
 pub const MAX_LEVEL_LOG_DROP_BASIS_POINTS: u64 = 3_000;
+pub const WOODEN_AXE_BONUS_BASIS_POINTS: u64 = 200;
+pub const STONE_AXE_BONUS_BASIS_POINTS: u64 = 500;
+pub const IRON_AXE_BONUS_BASIS_POINTS: u64 = 800;
+pub const MAX_LOG_DROP_BASIS_POINTS: u64 =
+    MAX_LEVEL_LOG_DROP_BASIS_POINTS + IRON_AXE_BONUS_BASIS_POINTS;
+pub const STONE_DROP_BASIS_POINTS: u64 = 1_000;
+pub const IRON_ORE_DROP_BASIS_POINTS: u64 = 200;
+pub const IRON_ORE_UNLOCK_LEVEL: u64 = 10;
+pub const IRON_ORE_UNLOCK_XP_BALANCE: u64 =
+    xp_balance_for_woodcutting_xp(XP_FOR_LEVEL[(IRON_ORE_UNLOCK_LEVEL - 1) as usize]);
 pub const LUCK_WINDOW_BASIS_POINTS: u64 = 10_000;
 pub const MAX_LUCK_CREDIT: u64 = LUCK_WINDOW_BASIS_POINTS * 2;
 pub const INITIAL_LUCK_CREDIT: u64 = LUCK_WINDOW_BASIS_POINTS - BASE_LOG_DROP_BASIS_POINTS;
 const PLAYER_ROLL_DOMAIN: &[u8] = b"woodland.sh/player-roll/v2";
+const MATERIAL_ROLL_DOMAIN: &[u8] = b"woodland.sh/material-roll/v1";
 
 /// Convert the canonical soulbound balance into user-facing Woodcutting XP.
 /// Saturation is unreachable for the signed fixed-supply world.
@@ -117,8 +130,115 @@ pub const fn xp_balance_for_woodcutting_xp(woodcutting_xp: u64) -> u64 {
     woodcutting_xp.div_ceil(WOODCUTTING_XP_PER_LOG)
 }
 
-/// Drop chance derives directly from the soulbound XP asset balance.
-pub const fn log_drop_basis_points(player_xp_balance: u64) -> u64 {
+/// Soulbound axe tier. The highest crafted tier is always equipped.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Deserialize,
+    serde::Serialize,
+)]
+#[repr(u8)]
+#[serde(rename_all = "camelCase")]
+pub enum AxeTier {
+    #[default]
+    None = 0,
+    Wooden = 1,
+    Stone = 2,
+    Iron = 3,
+}
+
+impl AxeTier {
+    pub const fn encode(self) -> [u8; PLAYER_AXE_LEN] {
+        [self as u8]
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self> {
+        match encoded {
+            [0] => Ok(Self::None),
+            [1] => Ok(Self::Wooden),
+            [2] => Ok(Self::Stone),
+            [3] => Ok(Self::Iron),
+            _ => Err(anyhow!("invalid player axe packet")),
+        }
+    }
+
+    pub const fn bonus_basis_points(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::Wooden => WOODEN_AXE_BONUS_BASIS_POINTS,
+            Self::Stone => STONE_AXE_BONUS_BASIS_POINTS,
+            Self::Iron => IRON_AXE_BONUS_BASIS_POINTS,
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::None => "No Axe",
+            Self::Wooden => "Wooden Axe",
+            Self::Stone => "Stone Axe",
+            Self::Iron => "Iron Axe",
+        }
+    }
+
+    pub const fn next_recipe(self) -> Option<AxeRecipe> {
+        match self {
+            Self::None => Some(AXE_RECIPES[0]),
+            Self::Wooden => Some(AXE_RECIPES[1]),
+            Self::Stone => Some(AXE_RECIPES[2]),
+            Self::Iron => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AxeRecipe {
+    pub axe: AxeTier,
+    pub required_level: u64,
+    pub log_cost: u64,
+    pub stone_cost: u64,
+    pub iron_ore_cost: u64,
+}
+
+impl AxeRecipe {
+    pub const fn required_xp_balance(self) -> u64 {
+        xp_balance_for_woodcutting_xp(XP_FOR_LEVEL[(self.required_level - 1) as usize])
+    }
+}
+
+pub const AXE_RECIPES: [AxeRecipe; 3] = [
+    AxeRecipe {
+        axe: AxeTier::Wooden,
+        required_level: 1,
+        log_cost: 1,
+        stone_cost: 0,
+        iron_ore_cost: 0,
+    },
+    AxeRecipe {
+        axe: AxeTier::Stone,
+        required_level: 5,
+        log_cost: 2,
+        stone_cost: 2,
+        iron_ore_cost: 0,
+    },
+    AxeRecipe {
+        axe: AxeTier::Iron,
+        required_level: 15,
+        log_cost: 5,
+        stone_cost: 0,
+        iron_ore_cost: 2,
+    },
+];
+
+/// Drop chance derives from soulbound XP and the permanent axe tier.
+pub const fn log_drop_basis_points(player_xp_balance: u64, axe: AxeTier) -> u64 {
     let mut basis_points = BASE_LOG_DROP_BASIS_POINTS;
     let mut index = 0;
     while index < LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS.len() {
@@ -128,10 +248,9 @@ pub const fn log_drop_basis_points(player_xp_balance: u64) -> u64 {
         index += 1;
     }
     if basis_points > MAX_LEVEL_LOG_DROP_BASIS_POINTS {
-        MAX_LEVEL_LOG_DROP_BASIS_POINTS
-    } else {
-        basis_points
+        basis_points = MAX_LEVEL_LOG_DROP_BASIS_POINTS;
     }
+    basis_points + axe.bonus_basis_points()
 }
 
 /// Public deterministic entropy bound to one recursive player lineage.
@@ -169,6 +288,54 @@ impl PlayerRoll {
         self.0.iter().rev().fold(0_u64, |value, byte| {
             (value * 256 + u64::from(*byte)) % CHOP_ROLL_BASIS_POINTS
         })
+    }
+
+    /// Independent crafting-material bucket derived from this next player roll.
+    pub fn material_bucket(self) -> u64 {
+        let mut engine = sha256::Hash::engine();
+        engine.input(MATERIAL_ROLL_DOMAIN);
+        engine.input(&self.0);
+        sha256::Hash::from_engine(engine)
+            .to_byte_array()
+            .iter()
+            .rev()
+            .fold(0_u64, |value, byte| {
+                (value * 256 + u64::from(*byte)) % CHOP_ROLL_BASIS_POINTS
+            })
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize,
+)]
+#[repr(u8)]
+#[serde(rename_all = "camelCase")]
+pub enum MaterialDrop {
+    #[default]
+    None,
+    Stone,
+    IronOre,
+}
+
+/// A material can accompany a successful LOG. Buckets are disjoint, so one
+/// chop can never find both materials.
+pub fn material_drop(next_roll: PlayerRoll, player_xp_balance: u64, success: bool) -> MaterialDrop {
+    if !success {
+        return MaterialDrop::None;
+    }
+    let bucket = next_roll.material_bucket();
+    if player_xp_balance >= IRON_ORE_UNLOCK_XP_BALANCE {
+        if bucket < IRON_ORE_DROP_BASIS_POINTS {
+            MaterialDrop::IronOre
+        } else if bucket < IRON_ORE_DROP_BASIS_POINTS + STONE_DROP_BASIS_POINTS {
+            MaterialDrop::Stone
+        } else {
+            MaterialDrop::None
+        }
+    } else if bucket < STONE_DROP_BASIS_POINTS {
+        MaterialDrop::Stone
+    } else {
+        MaterialDrop::None
     }
 }
 
@@ -242,9 +409,9 @@ impl PlayerLuck {
         })
     }
 
-    pub fn advance(self, player_xp_balance: u64) -> (Self, bool) {
+    pub fn advance(self, player_xp_balance: u64, axe: AxeTier) -> (Self, bool) {
         let next_roll = self.roll.next();
-        let drop_basis_points = log_drop_basis_points(player_xp_balance);
+        let drop_basis_points = log_drop_basis_points(player_xp_balance, axe);
         let raw_credit = self.credit.value() + drop_basis_points;
         let candidate = next_roll.bucket() < drop_basis_points;
         let success = if raw_credit > MAX_LUCK_CREDIT {
@@ -282,6 +449,7 @@ pub fn xp_for_level(level: u64) -> Option<u64> {
 #[serde(rename_all = "camelCase")]
 pub struct PlayerState {
     pub luck: PlayerLuck,
+    pub axe: AxeTier,
 }
 
 /// Host-side mirror of one canonical atomic chop.
@@ -298,12 +466,20 @@ pub struct PlayerChopTransition {
     pub state_logs_after: u64,
     pub state_xp_balance_before: u64,
     pub state_xp_balance_after: u64,
+    pub state_stone_before: u64,
+    pub state_stone_after: u64,
+    pub state_iron_ore_before: u64,
+    pub state_iron_ore_after: u64,
     pub tree_markers_before: u64,
     pub tree_markers_after: u64,
     pub tree_logs_before: u64,
     pub tree_logs_after: u64,
     pub tree_xp_balance_before: u64,
     pub tree_xp_balance_after: u64,
+    pub tree_stone_before: u64,
+    pub tree_stone_after: u64,
+    pub tree_iron_ore_before: u64,
+    pub tree_iron_ore_after: u64,
     pub state_value_before: u64,
     pub state_value_after: u64,
     pub tree_value_before: u64,
@@ -313,14 +489,24 @@ pub struct PlayerChopTransition {
 
 impl PlayerChopTransition {
     pub fn validate(self) -> Result<()> {
+        if self.next_state.axe != self.previous_state.axe {
+            return Err(anyhow!("axe tier changed during chop"));
+        }
         let (expected_luck, expected_success) = self
             .previous_state
             .luck
-            .advance(self.state_xp_balance_before);
+            .advance(self.state_xp_balance_before, self.previous_state.axe);
         if self.next_state.luck != expected_luck || self.success != expected_success {
             return Err(anyhow!("player chop luck transition is invalid"));
         }
         let reward = u64::from(self.success);
+        let material = material_drop(
+            expected_luck.roll,
+            self.state_xp_balance_before,
+            self.success,
+        );
+        let stone_reward = u64::from(material == MaterialDrop::Stone);
+        let iron_ore_reward = u64::from(material == MaterialDrop::IronOre);
         if self.state_xp_balance_after
             != self
                 .state_xp_balance_before
@@ -338,6 +524,21 @@ impl PlayerChopTransition {
                 .ok_or_else(|| anyhow!("player LOG balance overflow"))?
         {
             return Err(anyhow!("player LOG balance does not match the chop roll"));
+        }
+        if self.state_stone_after
+            != self
+                .state_stone_before
+                .checked_add(stone_reward)
+                .ok_or_else(|| anyhow!("player STONE balance overflow"))?
+            || self.state_iron_ore_after
+                != self
+                    .state_iron_ore_before
+                    .checked_add(iron_ore_reward)
+                    .ok_or_else(|| anyhow!("player IRON ORE balance overflow"))?
+        {
+            return Err(anyhow!(
+                "player material balances do not match the chop roll"
+            ));
         }
         if self.previous_tree_state != self.next_tree_state {
             return Err(anyhow!("tree identity or position changed during chop"));
@@ -367,6 +568,16 @@ impl PlayerChopTransition {
                     .tree_xp_balance_before
                     .checked_sub(reward)
                     .ok_or_else(|| anyhow!("tree XP balance underflow"))?
+            || self.tree_stone_after
+                != self
+                    .tree_stone_before
+                    .checked_sub(stone_reward)
+                    .ok_or_else(|| anyhow!("tree STONE balance underflow"))?
+            || self.tree_iron_ore_after
+                != self
+                    .tree_iron_ore_before
+                    .checked_sub(iron_ore_reward)
+                    .ok_or_else(|| anyhow!("tree IRON ORE balance underflow"))?
         {
             return Err(anyhow!("tree inventory does not match the chop roll"));
         }
@@ -394,15 +605,21 @@ pub struct PlayerContract {
     /// Optional unattended renewal path for the low-authority watchtower.
     pub watchtower_renewal_spend_script: ScriptBuf,
     pub renewal_arkade_script: ScriptBuf,
-    /// Owner-authorized LOG withdrawal; XP is soulbound and cannot move.
+    /// Owner-authorized LOG withdrawal; progression and materials stay soulbound.
     pub withdraw_spend_script: ScriptBuf,
     pub withdraw_arkade_script: ScriptBuf,
+    /// Owner-authorized exact recipe burn advancing the permanent axe tier.
+    pub craft_spend_script: ScriptBuf,
+    pub craft_arkade_script: ScriptBuf,
     pub owner: XOnlyPublicKey,
     pub operator: XOnlyPublicKey,
     pub emulator: XOnlyPublicKey,
     pub chop_tweaked_emulator: XOnlyPublicKey,
     pub log_asset: AssetId,
     pub xp_asset: AssetId,
+    pub craft_tweaked_emulator: XOnlyPublicKey,
+    pub stone_asset: AssetId,
+    pub iron_ore_asset: AssetId,
     pub dust_sats: u64,
     pub tree_script_pubkey: ScriptBuf,
 }
@@ -412,11 +629,9 @@ pub struct PlayerContract {
 /// dynamically without committing its post-transaction AssetId into P2TR.
 ///
 /// Tapleaf authority is deliberately split:
-///
-/// - chop: owner + operator + covenant-tweaked emulator;
-/// - owner renewal: owner + operator + covenant-tweaked emulator;
 /// - watchtower renewal: rollover + operator + covenant-tweaked emulator;
-/// - LOG withdrawal: owner + operator + covenant-tweaked emulator.
+/// - LOG withdrawal: owner + operator + covenant-tweaked emulator;
+/// - axe crafting: owner + operator + covenant-tweaked emulator.
 ///
 /// The required Arkade CSV exit is keyed to the NUMS point, so it satisfies
 /// expiry accounting without creating a unilateral path around recursion.
@@ -432,6 +647,8 @@ pub fn build_player_contract<C: Verification>(
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
     dust_sats: u64,
     tree_script: &ScriptBuf,
 ) -> Result<PlayerContract> {
@@ -443,27 +660,52 @@ pub fn build_player_contract<C: Verification>(
     {
         return Err(anyhow!("player contract signers must be distinct"));
     }
-    if [tree_asset, log_asset, xp_asset]
+    if [tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset]
         .into_iter()
         .collect::<HashSet<_>>()
         .len()
-        != 3
+        != 5
     {
-        return Err(anyhow!("TREE, LOG, and XP assets must differ"));
+        return Err(anyhow!(
+            "TREE, LOG, XP, STONE, and IRON ORE assets must differ"
+        ));
     }
-    let chop_arkade_script =
-        player_chop_covenant_script(log_asset, xp_asset, dust_sats, tree_script)?;
-    let renewal_arkade_script = player_renewal_covenant_script(log_asset, xp_asset, dust_sats)?;
-    let withdraw_arkade_script = player_withdraw_covenant_script(log_asset, xp_asset, dust_sats)?;
+    let chop_arkade_script = player_chop_covenant_script(
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+        dust_sats,
+        tree_script,
+    )?;
+    let renewal_arkade_script = player_renewal_covenant_script(
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+        dust_sats,
+    )?;
+    let withdraw_arkade_script = player_withdraw_covenant_script(
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+        dust_sats,
+    )?;
+    let craft_arkade_script =
+        player_craft_covenant_script(log_asset, xp_asset, stone_asset, iron_ore_asset, dust_sats)?;
     let chop_tweaked_emulator =
         ark_script::compute_arkade_script_public_key(&emulator_pk, &chop_arkade_script)
-            .context("derive player emulator signer")?;
+            .context("derive player chop emulator signer")?;
     let renewal_tweaked_emulator =
         ark_script::compute_arkade_script_public_key(&emulator_pk, &renewal_arkade_script)
-            .context("derive player emulator signer")?;
+            .context("derive player renewal emulator signer")?;
     let withdraw_tweaked_emulator =
         ark_script::compute_arkade_script_public_key(&emulator_pk, &withdraw_arkade_script)
-            .context("derive player emulator signer")?;
+            .context("derive player withdraw emulator signer")?;
+    let craft_tweaked_emulator =
+        ark_script::compute_arkade_script_public_key(&emulator_pk, &craft_arkade_script)
+            .context("derive player craft emulator signer")?;
     let nums: bitcoin::PublicKey = ark_core::UNSPENDABLE_KEY
         .parse()
         .context("parse Arkade NUMS key")?;
@@ -476,6 +718,7 @@ pub fn build_player_contract<C: Verification>(
         chop_tweaked_emulator,
         renewal_tweaked_emulator,
         withdraw_tweaked_emulator,
+        craft_tweaked_emulator,
     ] {
         if [owner_pk, operator_pk, rollover_pk].contains(&tweaked_emulator) {
             return Err(anyhow!("tweaked emulator collides with a player signer"));
@@ -513,19 +756,27 @@ pub fn build_player_contract<C: Verification>(
             },
             introspectors: vec![emulator_pk],
         }),
+        ArkadeVtxoInput::Arkade(ArkadeLeaf {
+            arkade_script: craft_arkade_script.clone(),
+            tapscript: ArkadeTapscript::Multisig {
+                pubkeys: vec![owner_pk, operator_pk],
+            },
+            introspectors: vec![emulator_pk],
+        }),
     ])
     .context("build player Arkade tapleaves")?;
-    let [chop_spend_script, renewal_spend_script, watchtower_renewal_spend_script, withdraw_spend_script] =
+    let [chop_spend_script, renewal_spend_script, watchtower_renewal_spend_script, withdraw_spend_script, craft_spend_script] =
         processed.scripts.as_slice()
     else {
         return Err(anyhow!(
-            "player contract must have chop, renewal, and withdraw leaves"
+            "player contract must have chop, renewal, withdraw, and craft leaves"
         ));
     };
     let chop_spend_script = chop_spend_script.clone();
     let renewal_spend_script = renewal_spend_script.clone();
     let watchtower_renewal_spend_script = watchtower_renewal_spend_script.clone();
     let withdraw_spend_script = withdraw_spend_script.clone();
+    let craft_spend_script = craft_spend_script.clone();
     let scripts = processed
         .scripts
         .into_iter()
@@ -550,22 +801,199 @@ pub fn build_player_contract<C: Verification>(
         renewal_arkade_script,
         withdraw_spend_script,
         withdraw_arkade_script,
+        craft_spend_script,
+        craft_arkade_script,
         owner: owner_pk,
         operator: operator_pk,
         emulator: emulator_pk,
         chop_tweaked_emulator,
         log_asset,
         xp_asset,
+        stone_asset,
+        craft_tweaked_emulator,
+        iron_ore_asset,
         dust_sats,
         tree_script_pubkey: tree_script.clone(),
     })
 }
+/// Covenant-enforced axe crafting. Exact ingredients are burned while every
+/// other player resource and mutable packet stays in the recursive state.
+pub fn player_craft_covenant_script(
+    log_asset: AssetId,
+    xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
+    dust_sats: u64,
+) -> Result<ScriptBuf> {
+    if [log_asset, xp_asset, stone_asset, iron_ore_asset]
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .len()
+        != 4
+    {
+        return Err(anyhow!("player inventory asset IDs must differ"));
+    }
+    let dust = crate::tree::script_int(dust_sats, "player dust")?;
+    let anchor_program =
+        crate::tree::witness_v1_program(&ark_core::anchor_output().script_pubkey, "Arkade anchor")?;
+    let builder = Builder::new()
+        .push_opcode(op::PUSHCURRENTINPUTINDEX)
+        .push_int(crate::protocol::CRAFT_STATE_INPUT_INDEX as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(op::INSPECTVERSION)
+        .push_int(crate::protocol::CRAFT_TRANSACTION_VERSION)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(op::INSPECTNUMINPUTS)
+        .push_int(crate::protocol::CRAFT_INPUT_COUNT as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(op::INSPECTNUMOUTPUTS)
+        .push_int(crate::protocol::CRAFT_OUTPUT_COUNT as i64)
+        .push_opcode(OP_EQUALVERIFY);
+    let builder = crate::tree::push_equal_input_output_scripts(
+        builder,
+        crate::protocol::CRAFT_STATE_INPUT_INDEX,
+        crate::protocol::CRAFT_STATE_OUTPUT_INDEX,
+    )
+    .push_int(i64::from(crate::protocol::CRAFT_STATE_OUTPUT_INDEX))
+    .push_opcode(op::INSPECTOUTPUTVALUE)
+    .push_int(dust)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_int(crate::protocol::CRAFT_STATE_INPUT_INDEX as i64)
+    .push_opcode(op::INSPECTINPUTVALUE)
+    .push_int(dust)
+    .push_opcode(OP_EQUALVERIFY);
+    let builder = crate::tree::push_extension_and_anchor_shape(
+        builder,
+        crate::protocol::CRAFT_EXTENSION_OUTPUT_INDEX,
+        crate::protocol::CRAFT_ANCHOR_OUTPUT_INDEX,
+        &anchor_program,
+    )
+    .push_int(i64::from(crate::protocol::CRAFT_EXTENSION_OUTPUT_INDEX))
+    .push_opcode(op::INSPECTOUTASSETCOUNT)
+    .push_int(0)
+    .push_opcode(OP_EQUALVERIFY)
+    .push_int(i64::from(crate::protocol::CRAFT_ANCHOR_OUTPUT_INDEX))
+    .push_opcode(op::INSPECTOUTASSETCOUNT)
+    .push_int(0)
+    .push_opcode(OP_EQUALVERIFY);
+    let builder =
+        push_canonical_initial_player_luck(builder, crate::protocol::CRAFT_STATE_INPUT_INDEX);
+    let builder = crate::tree::push_equal_state_packet_at(
+        builder,
+        PLAYER_ROLL_PACKET_TYPE,
+        crate::protocol::CRAFT_STATE_INPUT_INDEX,
+    );
+    let builder = crate::tree::push_equal_state_packet_at(
+        builder,
+        PLAYER_LUCK_CREDIT_PACKET_TYPE,
+        crate::protocol::CRAFT_STATE_INPUT_INDEX,
+    );
+    let builder = crate::tree::push_player_marker_group(
+        builder,
+        crate::protocol::CRAFT_STATE_INPUT_INDEX,
+        crate::protocol::CRAFT_STATE_OUTPUT_INDEX,
+    );
+    let builder = crate::tree::push_player_renewal_group_set(
+        builder,
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+    );
+    let builder = crate::tree::push_canonical_player_asset_counts(
+        builder,
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+    );
+    let builder = push_exact_state_asset_burn(builder, xp_asset, 0);
+
+    // Validate the one-tier transition, retaining the input tier for the
+    // recipe branch.
+    let builder = push_player_axe_value(builder, Some(crate::protocol::CRAFT_STATE_INPUT_INDEX))
+        .push_opcode(OP_DUP)
+        .push_int(AxeTier::Iron as i64)
+        .push_opcode(OP_LESSTHAN)
+        .push_opcode(OP_VERIFY)
+        .push_opcode(OP_DUP)
+        .push_int(1)
+        .push_opcode(OP_ADD);
+    let builder = push_player_axe_value(builder, None).push_opcode(OP_EQUALVERIFY);
+
+    let builder = builder
+        .push_opcode(OP_DUP)
+        .push_int(AxeTier::None as i64)
+        .push_opcode(OP_EQUAL)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_DROP);
+    let builder = push_exact_state_asset_burn(builder, log_asset, AXE_RECIPES[0].log_cost);
+    let builder = push_exact_state_asset_burn(builder, stone_asset, 0);
+    let builder = push_exact_state_asset_burn(builder, iron_ore_asset, 0)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_DUP)
+        .push_int(AxeTier::Wooden as i64)
+        .push_opcode(OP_EQUAL)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_DROP);
+    let builder = push_required_xp_balance(builder, xp_asset, AXE_RECIPES[1].required_xp_balance());
+    let builder = push_exact_state_asset_burn(builder, log_asset, AXE_RECIPES[1].log_cost);
+    let builder = push_exact_state_asset_burn(builder, stone_asset, AXE_RECIPES[1].stone_cost);
+    let builder = push_exact_state_asset_burn(builder, iron_ore_asset, 0)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_DROP);
+    let builder = push_required_xp_balance(builder, xp_asset, AXE_RECIPES[2].required_xp_balance());
+    let builder = push_exact_state_asset_burn(builder, log_asset, AXE_RECIPES[2].log_cost);
+    let builder = push_exact_state_asset_burn(builder, stone_asset, 0);
+    Ok(
+        push_exact_state_asset_burn(builder, iron_ore_asset, AXE_RECIPES[2].iron_ore_cost)
+            .push_opcode(OP_ENDIF)
+            .push_opcode(OP_ENDIF)
+            .push_int(1)
+            .into_script(),
+    )
+}
+
+fn push_exact_state_asset_burn(builder: Builder, asset: AssetId, amount: u64) -> Builder {
+    let builder = crate::tree::push_optional_input_asset_lookup(
+        builder,
+        crate::protocol::CRAFT_STATE_INPUT_INDEX,
+        asset,
+    )
+    .push_opcode(OP_DROP);
+    crate::tree::push_optional_output_asset_lookup(
+        builder,
+        crate::protocol::CRAFT_STATE_OUTPUT_INDEX,
+        asset,
+    )
+    .push_opcode(OP_DROP)
+    .push_int(amount as i64)
+    .push_opcode(OP_ADD)
+    .push_opcode(OP_EQUALVERIFY)
+}
+
+fn push_required_xp_balance(builder: Builder, xp_asset: AssetId, required: u64) -> Builder {
+    crate::tree::push_optional_input_asset_lookup(
+        builder,
+        crate::protocol::CRAFT_STATE_INPUT_INDEX,
+        xp_asset,
+    )
+    .push_opcode(OP_DROP)
+    // Asset amounts are integers: `balance > required - 1` is the exact
+    // inclusive level gate.
+    .push_int(required.saturating_sub(1) as i64)
+    .push_opcode(OP_GREATERTHAN)
+    .push_opcode(OP_VERIFY)
+}
 
 /// Covenant for both player batch-renewal paths. It permits only an exact
-/// self-send preserving P2TR, value, luck packets, PLAYER_ID, LOG, and XP.
+/// self-send preserving P2TR, value, every player packet, PLAYER_ID, and all
+/// inventory assets.
 pub fn player_renewal_covenant_script(
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
     dust_sats: u64,
 ) -> Result<ScriptBuf> {
     let dust = i64::try_from(dust_sats)
@@ -587,60 +1015,64 @@ pub fn player_renewal_covenant_script(
     let builder = push_canonical_initial_player_luck(builder, RENEWAL_STATE_INPUT_INDEX);
     let builder = crate::tree::push_equal_state_packet(builder, PLAYER_ROLL_PACKET_TYPE);
     let builder = crate::tree::push_equal_state_packet(builder, PLAYER_LUCK_CREDIT_PACKET_TYPE);
+    let builder = crate::tree::push_equal_state_packet(builder, PLAYER_AXE_PACKET_TYPE);
     let builder = crate::tree::push_renewal_asset_shell(builder)?;
     let builder = crate::tree::push_player_marker_group(
         builder,
         RENEWAL_STATE_INPUT_INDEX,
         RENEWAL_STATE_OUTPUT_INDEX,
     );
-    let builder = crate::tree::push_player_renewal_group_set(builder, log_asset, xp_asset);
-
-    let builder = crate::tree::push_optional_input_asset_lookup(
+    let builder = crate::tree::push_player_renewal_group_set(
         builder,
-        RENEWAL_STATE_INPUT_INDEX,
         log_asset,
-    );
-    let builder = crate::tree::push_optional_output_asset_lookup(
-        builder,
-        RENEWAL_STATE_OUTPUT_INDEX,
-        log_asset,
-    )
-    .push_opcode(OP_ROT)
-    .push_opcode(OP_EQUALVERIFY)
-    .push_opcode(OP_EQUALVERIFY);
-    let builder =
-        crate::tree::push_optional_input_asset_lookup(builder, RENEWAL_STATE_INPUT_INDEX, xp_asset);
-    let builder = crate::tree::push_optional_output_asset_lookup(
-        builder,
-        RENEWAL_STATE_OUTPUT_INDEX,
         xp_asset,
+        stone_asset,
+        iron_ore_asset,
     );
-    Ok(builder
+
+    let mut builder = builder;
+    for asset in [log_asset, xp_asset, stone_asset, iron_ore_asset] {
+        builder = crate::tree::push_optional_input_asset_lookup(
+            builder,
+            RENEWAL_STATE_INPUT_INDEX,
+            asset,
+        );
+        builder = crate::tree::push_optional_output_asset_lookup(
+            builder,
+            RENEWAL_STATE_OUTPUT_INDEX,
+            asset,
+        )
         .push_opcode(OP_ROT)
         .push_opcode(OP_EQUALVERIFY)
-        .push_opcode(OP_EQUAL)
-        .into_script())
+        .push_opcode(OP_EQUALVERIFY);
+    }
+    Ok(builder.push_int(1).into_script())
 }
 
-/// Covenant for the owner-authorized LOG withdrawal leaf. Only LOG may leave:
-/// the player state must exit with its exact P2TR, dust, PLAYER_ID, luck, and
-/// XP asset balance intact, so progression is soulbound. The destination is
-/// the owner's choice, funded entirely by the wallet input.
+/// Covenant for owner-authorized LOG withdrawal. Only LOG may leave: player
+/// P2TR, dust, PLAYER_ID, all packets, XP, STONE, and IRON ORE stay exact.
 ///
 /// Canonical shape:
 ///
 /// ```text
 /// vin 0 player state | vin 1 wallet funding
 /// vout 0 player state | vout 1 LOG destination | vout 2 extension | vout 3 anchor
-/// groups 0..2 PLAYER_ID | LOG | XP
+/// groups PLAYER_ID | LOG | XP | STONE | IRON ORE
 /// ```
 pub fn player_withdraw_covenant_script(
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
     dust_sats: u64,
 ) -> Result<ScriptBuf> {
-    if log_asset == xp_asset {
-        return Err(anyhow!("LOG and XP assets must differ"));
+    if [log_asset, xp_asset, stone_asset, iron_ore_asset]
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .len()
+        != 4
+    {
+        return Err(anyhow!("player inventory asset IDs must differ"));
     }
     let dust = i64::try_from(dust_sats)
         .map_err(|_| anyhow!("player dust exceeds script integer range"))?;
@@ -691,6 +1123,11 @@ pub fn player_withdraw_covenant_script(
         PLAYER_LUCK_CREDIT_PACKET_TYPE,
         crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
     );
+    let builder = crate::tree::push_equal_state_packet_at(
+        builder,
+        PLAYER_AXE_PACKET_TYPE,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+    );
     let builder = crate::tree::push_extension_and_anchor_shape(
         builder,
         crate::protocol::WITHDRAW_EXTENSION_OUTPUT_INDEX,
@@ -710,7 +1147,13 @@ pub fn player_withdraw_covenant_script(
         crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
         crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX,
     );
-    let builder = crate::tree::push_player_renewal_group_set(builder, log_asset, xp_asset);
+    let builder = crate::tree::push_player_renewal_group_set(
+        builder,
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+    );
 
     // LOG conservation: state-in minus state-out is exactly the destination.
     let builder = crate::tree::push_input_asset_lookup(
@@ -734,21 +1177,24 @@ pub fn player_withdraw_covenant_script(
     )
     .push_opcode(OP_DROP)
     .push_opcode(OP_EQUALVERIFY);
-    // XP is soulbound: presence and amount are preserved exactly.
-    let builder = crate::tree::push_optional_input_asset_lookup(
-        builder,
-        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
-        xp_asset,
-    );
-    Ok(crate::tree::push_optional_output_asset_lookup(
-        builder,
-        crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX,
-        xp_asset,
-    )
-    .push_opcode(OP_ROT)
-    .push_opcode(OP_EQUALVERIFY)
-    .push_opcode(OP_EQUAL)
-    .into_script())
+    // XP and materials are soulbound: presence and amount remain exact.
+    let mut builder = builder;
+    for asset in [xp_asset, stone_asset, iron_ore_asset] {
+        builder = crate::tree::push_optional_input_asset_lookup(
+            builder,
+            crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+            asset,
+        );
+        builder = crate::tree::push_optional_output_asset_lookup(
+            builder,
+            crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX,
+            asset,
+        )
+        .push_opcode(OP_ROT)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_EQUALVERIFY);
+    }
+    Ok(builder.push_int(1).into_script())
 }
 
 /// Convert a canonical indexed player-state VTXO into its chop spend path.
@@ -794,25 +1240,26 @@ fn canonical_player_state_assets<'a>(
         .iter()
         .filter(|asset| asset.asset_id == player_asset)
         .count();
-    let log_entries = record
-        .assets
-        .iter()
-        .filter(|asset| asset.asset_id == contract.log_asset)
-        .count();
-    let xp_entries = record
-        .assets
-        .iter()
-        .filter(|asset| asset.asset_id == contract.xp_asset)
-        .count();
-    let canonical_assets = (1..=3).contains(&record.assets.len())
+    let canonical_ids = [
+        contract.log_asset,
+        contract.xp_asset,
+        contract.stone_asset,
+        contract.iron_ore_asset,
+    ];
+    let canonical_assets = (1..=5).contains(&record.assets.len())
         && marker_entries == 1
-        && log_entries <= 1
-        && xp_entries <= 1
-        && record.assets.iter().all(|asset| {
-            asset.asset_id == player_asset
-                || asset.asset_id == contract.log_asset
-                || asset.asset_id == contract.xp_asset
-        });
+        && canonical_ids.iter().all(|asset_id| {
+            record
+                .assets
+                .iter()
+                .filter(|asset| asset.asset_id == *asset_id)
+                .count()
+                <= 1
+        })
+        && record
+            .assets
+            .iter()
+            .all(|asset| asset.asset_id == player_asset || canonical_ids.contains(&asset.asset_id));
     if record.amount_sats != contract.dust_sats
         || record.script != contract.vtxo.script_pubkey()
         || marker_count != Some(1)
@@ -825,23 +1272,24 @@ fn canonical_player_state_assets<'a>(
     Ok(record.assets.as_slice())
 }
 
-/// Build the personalized half of the atomic PLAYER/TREE chop.
-///
-/// The player state owns its LOG and XP inventory directly. The shared tree
-/// covenant enforces the reciprocal transfers and player-luck transition.
-///
-/// This half proves owner continuity: the player P2TR/value, PLAYER_ID, luck,
-/// and XP balance survive, and both tree endpoints are the manifest-pinned
-/// shared contract. The tree half computes the public player-bound reward.
-/// player-bound reward and enforces the reciprocal TREE/LOG/XP and health deltas.
+/// Build the personalized half of the atomic PLAYER/TREE chop. The shared tree
+/// covenant owns every reciprocal resource delta and the player-luck
+/// transition; this half pins that tree and preserves owner continuity.
 pub fn player_chop_covenant_script(
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
     dust_sats: u64,
     tree_script: &ScriptBuf,
 ) -> Result<ScriptBuf> {
-    if log_asset == xp_asset {
-        return Err(anyhow!("LOG and XP assets must differ"));
+    if [log_asset, xp_asset, stone_asset, iron_ore_asset]
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .len()
+        != 4
+    {
+        return Err(anyhow!("player inventory asset IDs must differ"));
     }
     if dust_sats == 0 {
         return Err(anyhow!("player chop dust must be non-zero"));
@@ -911,7 +1359,15 @@ pub fn player_chop_covenant_script(
     );
     let builder = crate::tree::push_transfer_group_shell(builder, log_asset);
     let builder = crate::tree::push_transfer_group_shell(builder, xp_asset);
-    let builder = crate::tree::push_canonical_player_asset_counts(builder, log_asset, xp_asset);
+    let builder = crate::tree::push_transfer_group_shell(builder, stone_asset);
+    let builder = crate::tree::push_transfer_group_shell(builder, iron_ore_asset);
+    let builder = crate::tree::push_canonical_player_asset_counts(
+        builder,
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+    );
     Ok(builder.push_int(1).into_script())
 }
 
@@ -930,21 +1386,28 @@ pub fn attach_player_state_packets(psbt: &mut Psbt, state: PlayerState) -> Resul
         &state.luck.credit.encode(),
     )
     .context("attach player luck credit packet")?;
+    ark_core::extension::add_packet_to_psbt(
+        &mut updated,
+        PLAYER_AXE_PACKET_TYPE,
+        &state.axe.encode(),
+    )
+    .context("attach player axe packet")?;
     *psbt = updated;
     Ok(())
 }
 
 /// Decode complete player state from a transaction. No player packets means
-/// `None`; a partial pair is rejected rather than silently defaulted.
+/// `None`; a partial set is rejected rather than silently defaulted.
 pub fn player_state_from_tx(tx: &Transaction) -> Result<Option<PlayerState>> {
-    let [roll, credit] = player_packet_payloads(tx)?;
-    match (roll, credit) {
-        (None, None) => Ok(None),
-        (Some(roll), Some(credit)) => Ok(Some(PlayerState {
+    let [roll, credit, axe] = player_packet_payloads(tx)?;
+    match (roll, credit, axe) {
+        (None, None, None) => Ok(None),
+        (Some(roll), Some(credit), Some(axe)) => Ok(Some(PlayerState {
             luck: PlayerLuck {
                 roll: PlayerRoll::decode(roll)?,
                 credit: PlayerLuckCredit::decode(credit)?,
             },
+            axe: AxeTier::decode(axe)?,
         })),
         _ => Err(anyhow!("transaction contains incomplete player state")),
     }
@@ -1004,10 +1467,12 @@ pub fn attach_player_chop_context(
     if previous_tree_health.value() == 0 {
         return Err(anyhow!("cannot chop a stump"));
     }
-    let (expected_luck, success) = previous_state.luck.advance(player_xp_before);
-    if next_state.luck != expected_luck {
+    let (expected_luck, success) = previous_state
+        .luck
+        .advance(player_xp_before, previous_state.axe);
+    if next_state.luck != expected_luck || next_state.axe != previous_state.axe {
         return Err(anyhow!(
-            "next player state does not match the canonical luck transition"
+            "next player state does not match the canonical chop transition"
         ));
     }
     let next_health = crate::tree::TreeHealth::new(
@@ -1205,8 +1670,8 @@ fn verify_exact_signatures(
     Ok(())
 }
 
-fn player_packet_payloads(tx: &Transaction) -> Result<[Option<&[u8]>; 2]> {
-    let mut packets = [None, None];
+fn player_packet_payloads(tx: &Transaction) -> Result<[Option<&[u8]>; 3]> {
+    let mut packets = [None, None, None];
     for output in &tx.output {
         let Some(extension) = ark_core::extension::extension_payload(&output.script_pubkey) else {
             continue;
@@ -1217,6 +1682,7 @@ fn player_packet_payloads(tx: &Transaction) -> Result<[Option<&[u8]>; 2]> {
             let slot = match packet_type {
                 PLAYER_ROLL_PACKET_TYPE => &mut packets[0],
                 PLAYER_LUCK_CREDIT_PACKET_TYPE => &mut packets[1],
+                PLAYER_AXE_PACKET_TYPE => &mut packets[2],
                 _ => continue,
             };
             if slot.replace(payload).is_some() {
@@ -1252,6 +1718,67 @@ fn push_player_roll_bucket(builder: Builder, player_input_index: usize) -> Build
         .push_opcode(OP_MOD)
 }
 
+fn push_player_axe_value(builder: Builder, input_index: Option<usize>) -> Builder {
+    let builder = builder.push_int(PLAYER_AXE_PACKET_TYPE.into());
+    let builder = match input_index {
+        Some(index) => builder
+            .push_int(index as i64)
+            .push_opcode(op::INSPECTINPUTPACKET),
+        None => builder.push_opcode(op::INSPECTPACKET),
+    };
+    builder
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_SIZE)
+        .push_int(PLAYER_AXE_LEN as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_DUP)
+        .push_opcode(op::BIN2NUM)
+        .push_opcode(OP_DUP)
+        .push_int(PLAYER_AXE_LEN as i64)
+        .push_opcode(op::NUM2BIN)
+        .push_opcode(OP_ROT)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_DUP)
+        .push_int(-1)
+        .push_opcode(OP_GREATERTHAN)
+        .push_opcode(OP_VERIFY)
+        .push_opcode(OP_DUP)
+        .push_int(4)
+        .push_opcode(OP_LESSTHAN)
+        .push_opcode(OP_VERIFY)
+}
+
+fn push_axe_bonus_basis_points(builder: Builder, player_input_index: usize) -> Builder {
+    push_player_axe_value(builder, Some(player_input_index))
+        .push_opcode(OP_DUP)
+        .push_int(AxeTier::Wooden as i64)
+        .push_opcode(OP_EQUAL)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_DROP)
+        .push_int(WOODEN_AXE_BONUS_BASIS_POINTS as i64)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_DUP)
+        .push_int(AxeTier::Stone as i64)
+        .push_opcode(OP_EQUAL)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_DROP)
+        .push_int(STONE_AXE_BONUS_BASIS_POINTS as i64)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_DUP)
+        .push_int(AxeTier::Iron as i64)
+        .push_opcode(OP_EQUAL)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_DROP)
+        .push_int(IRON_AXE_BONUS_BASIS_POINTS as i64)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_DROP)
+        .push_int(0)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_ENDIF)
+}
+
 fn push_log_drop_basis_points(
     builder: Builder,
     player_input_index: usize,
@@ -1274,10 +1801,70 @@ fn push_log_drop_basis_points(
             .push_opcode(OP_ADD)
             .push_opcode(OP_ENDIF);
     }
-    builder
+    let builder = builder
         .push_opcode(OP_TOALTSTACK)
         .push_opcode(OP_DROP)
-        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_FROMALTSTACK);
+    push_axe_bonus_basis_points(builder, player_input_index).push_opcode(OP_ADD)
+}
+/// Derive the independent next-roll material outcome. Leaves 0 for none, 1
+/// for STONE, or 2 for IRON ORE on the stack; LOG success is applied by the
+/// tree covenant after this helper returns.
+pub(crate) fn push_material_drop_code(
+    builder: Builder,
+    player_input_index: usize,
+    xp_asset: AssetId,
+) -> Builder {
+    let domain = PushBytesBuf::try_from(MATERIAL_ROLL_DOMAIN.to_vec())
+        .expect("material-roll domain is a bounded push");
+    let positive_sign = PushBytesBuf::try_from(vec![0]).expect("one-byte sign extension");
+    let builder = builder
+        .push_slice(domain)
+        .push_int(PLAYER_ROLL_PACKET_TYPE.into())
+        .push_opcode(op::INSPECTPACKET)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_SIZE)
+        .push_int(PLAYER_ROLL_LEN as i64)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_CAT)
+        .push_opcode(OP_SHA256)
+        .push_slice(positive_sign)
+        .push_opcode(OP_CAT)
+        .push_opcode(op::BIN2NUM)
+        .push_int(CHOP_ROLL_BASIS_POINTS as i64)
+        .push_opcode(OP_MOD);
+    let builder =
+        crate::tree::push_optional_input_asset_lookup(builder, player_input_index, xp_asset)
+            .push_opcode(OP_DROP)
+            .push_int((IRON_ORE_UNLOCK_XP_BALANCE - 1) as i64)
+            .push_opcode(OP_GREATERTHAN)
+            .push_opcode(OP_IF)
+            .push_opcode(OP_DUP)
+            .push_int(IRON_ORE_DROP_BASIS_POINTS as i64)
+            .push_opcode(OP_LESSTHAN)
+            .push_opcode(OP_IF)
+            .push_opcode(OP_DROP)
+            .push_int(MaterialDrop::IronOre as i64)
+            .push_opcode(OP_ELSE)
+            .push_int((IRON_ORE_DROP_BASIS_POINTS + STONE_DROP_BASIS_POINTS) as i64)
+            .push_opcode(OP_LESSTHAN)
+            .push_opcode(OP_IF)
+            .push_int(MaterialDrop::Stone as i64)
+            .push_opcode(OP_ELSE)
+            .push_int(MaterialDrop::None as i64)
+            .push_opcode(OP_ENDIF)
+            .push_opcode(OP_ENDIF)
+            .push_opcode(OP_ELSE)
+            .push_int(STONE_DROP_BASIS_POINTS as i64)
+            .push_opcode(OP_LESSTHAN)
+            .push_opcode(OP_IF)
+            .push_int(MaterialDrop::Stone as i64)
+            .push_opcode(OP_ELSE)
+            .push_int(MaterialDrop::None as i64)
+            .push_opcode(OP_ENDIF)
+            .push_opcode(OP_ENDIF);
+    builder
 }
 
 fn push_luck_credit_value(builder: Builder, input_index: Option<usize>) -> Builder {
@@ -1342,8 +1929,11 @@ pub(crate) fn push_canonical_initial_player_luck(
         .push_int(1)
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(OP_EQUALVERIFY);
-    push_luck_credit_value(builder, Some(player_input_index))
+    let builder = push_luck_credit_value(builder, Some(player_input_index))
         .push_int(INITIAL_LUCK_CREDIT as i64)
+        .push_opcode(OP_EQUALVERIFY);
+    push_player_axe_value(builder, Some(player_input_index))
+        .push_int(AxeTier::None as i64)
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(OP_ENDIF)
 }
@@ -1356,6 +1946,8 @@ pub(crate) fn push_advanced_player_luck(
     player_input_index: usize,
     xp_asset: AssetId,
 ) -> Builder {
+    let builder = push_player_axe_value(builder, Some(player_input_index));
+    let builder = push_player_axe_value(builder, None).push_opcode(OP_EQUALVERIFY);
     let builder = push_player_roll_bucket(builder, player_input_index);
     let builder = push_log_drop_basis_points(builder, player_input_index, xp_asset)
         .push_opcode(OP_DUP)
@@ -1423,6 +2015,7 @@ mod tests {
     fn state() -> PlayerState {
         PlayerState {
             luck: PlayerLuck::initial(&player_script(7)).unwrap(),
+            axe: crate::player::AxeTier::None,
         }
     }
 
@@ -1434,14 +2027,23 @@ mod tests {
         };
         let player_xp = 4;
         let mut previous_state = state();
-        previous_state.luck.credit =
-            PlayerLuckCredit::new(CHOP_ROLL_BASIS_POINTS - log_drop_basis_points(player_xp))
-                .unwrap();
+        previous_state.luck.credit = PlayerLuckCredit::new(
+            CHOP_ROLL_BASIS_POINTS - log_drop_basis_points(player_xp, crate::player::AxeTier::None),
+        )
+        .unwrap();
         loop {
-            let (next_luck, drop) = previous_state.luck.advance(player_xp);
+            let (next_luck, drop) = previous_state
+                .luck
+                .advance(player_xp, crate::player::AxeTier::None);
             if drop == success {
                 let reward = u64::from(success);
-                let next_state = PlayerState { luck: next_luck };
+                let next_state = PlayerState {
+                    luck: next_luck,
+                    axe: crate::player::AxeTier::None,
+                };
+                let material = material_drop(next_luck.roll, player_xp, success);
+                let stone_reward = u64::from(material == MaterialDrop::Stone);
+                let iron_ore_reward = u64::from(material == MaterialDrop::IronOre);
                 return PlayerChopTransition {
                     previous_state,
                     next_state,
@@ -1454,12 +2056,20 @@ mod tests {
                     state_logs_after: 9 + reward,
                     state_xp_balance_before: player_xp,
                     state_xp_balance_after: player_xp + reward,
+                    state_stone_before: 2,
+                    state_stone_after: 2 + stone_reward,
+                    state_iron_ore_before: 1,
+                    state_iron_ore_after: 1 + iron_ore_reward,
                     tree_markers_before: 1,
                     tree_markers_after: 1,
                     tree_logs_before: 5,
                     tree_logs_after: 5 - reward,
                     tree_xp_balance_before: 5,
                     tree_xp_balance_after: 5 - reward,
+                    tree_stone_before: 5,
+                    tree_stone_after: 5 - stone_reward,
+                    tree_iron_ore_before: 5,
+                    tree_iron_ore_after: 5 - iron_ore_reward,
                     state_value_before: 330,
                     state_value_after: 330,
                     tree_value_before: 330,
@@ -1484,6 +2094,7 @@ mod tests {
         let packets = player_packet_payloads(&psbt.unsigned_tx).unwrap();
         assert_eq!(packets[0].unwrap().len(), PLAYER_ROLL_LEN);
         assert_eq!(packets[1].unwrap().len(), PLAYER_LUCK_CREDIT_LEN);
+        assert_eq!(packets[2].unwrap(), AxeTier::None.encode());
         let mut packet_types = Vec::new();
         for output in &psbt.unsigned_tx.output {
             if let Some(extension) = ark_core::extension::extension_payload(&output.script_pubkey) {
@@ -1498,7 +2109,11 @@ mod tests {
         packet_types.sort_unstable();
         assert_eq!(
             packet_types,
-            vec![PLAYER_ROLL_PACKET_TYPE, PLAYER_LUCK_CREDIT_PACKET_TYPE]
+            vec![
+                PLAYER_ROLL_PACKET_TYPE,
+                PLAYER_LUCK_CREDIT_PACKET_TYPE,
+                PLAYER_AXE_PACKET_TYPE,
+            ]
         );
     }
     #[test]
@@ -1512,7 +2127,7 @@ mod tests {
             initial.credit.encode().to_lower_hex_string(),
             "401f00000000000000"
         );
-        let (next, success) = initial.advance(0);
+        let (next, success) = initial.advance(0, crate::player::AxeTier::None);
         assert_eq!(
             next.roll.encode().to_lower_hex_string(),
             "0e89adc39d4766f1e3cb6aaa62d2531db41f014971e9e1c2fe169fe2fd71a836"
@@ -1535,6 +2150,83 @@ mod tests {
     }
 
     #[test]
+    fn axe_recipes_drop_bonuses_and_material_vectors_are_stable() {
+        assert_eq!(
+            AXE_RECIPES,
+            [
+                AxeRecipe {
+                    axe: AxeTier::Wooden,
+                    required_level: 1,
+                    log_cost: 1,
+                    stone_cost: 0,
+                    iron_ore_cost: 0,
+                },
+                AxeRecipe {
+                    axe: AxeTier::Stone,
+                    required_level: 5,
+                    log_cost: 2,
+                    stone_cost: 2,
+                    iron_ore_cost: 0,
+                },
+                AxeRecipe {
+                    axe: AxeTier::Iron,
+                    required_level: 15,
+                    log_cost: 5,
+                    stone_cost: 0,
+                    iron_ore_cost: 2,
+                },
+            ]
+        );
+        assert_eq!(AXE_RECIPES.map(AxeRecipe::required_xp_balance), [0, 16, 97]);
+        for (axe, base, capped) in [
+            (AxeTier::None, 2_000, 3_000),
+            (AxeTier::Wooden, 2_200, 3_200),
+            (AxeTier::Stone, 2_500, 3_500),
+            (AxeTier::Iron, 2_800, 3_800),
+        ] {
+            assert_eq!(log_drop_basis_points(0, axe), base);
+            assert_eq!(log_drop_basis_points(u64::MAX, axe), capped);
+            assert_eq!(AxeTier::decode(&axe.encode()).unwrap(), axe);
+        }
+        assert!(AxeTier::decode(&[4]).is_err());
+
+        let initial = PlayerLuck::initial(&player_script(7)).unwrap().roll;
+        assert_eq!(initial.material_bucket(), 5_857);
+        let no_material = initial.next();
+        assert_eq!(no_material.material_bucket(), 8_780);
+        assert_eq!(
+            material_drop(no_material, IRON_ORE_UNLOCK_XP_BALANCE, true),
+            MaterialDrop::None
+        );
+        let stone = no_material.next();
+        assert_eq!(stone.material_bucket(), 922);
+        assert_eq!(material_drop(stone, 0, true), MaterialDrop::Stone);
+        assert_eq!(
+            material_drop(stone, IRON_ORE_UNLOCK_XP_BALANCE, true),
+            MaterialDrop::Stone
+        );
+
+        let mut iron = initial;
+        for _ in 0..106 {
+            iron = iron.next();
+        }
+        assert_eq!(iron.material_bucket(), 179);
+        assert_eq!(IRON_ORE_UNLOCK_XP_BALANCE, 47);
+        assert_eq!(
+            material_drop(iron, IRON_ORE_UNLOCK_XP_BALANCE - 1, true),
+            MaterialDrop::Stone
+        );
+        assert_eq!(
+            material_drop(iron, IRON_ORE_UNLOCK_XP_BALANCE, true),
+            MaterialDrop::IronOre
+        );
+        assert_eq!(
+            material_drop(iron, IRON_ORE_UNLOCK_XP_BALANCE, false),
+            MaterialDrop::None
+        );
+    }
+
+    #[test]
     fn luck_credit_bounds_long_runs_above_and_below_expectation() {
         let xp_balances = [
             0,
@@ -1547,7 +2239,7 @@ mod tests {
         for (index, xp_balance) in xp_balances.into_iter().enumerate() {
             let mut luck = PlayerLuck::initial(&player_script(index as u8 + 1)).unwrap();
             let initial_credit = luck.credit.value();
-            let rate = log_drop_basis_points(xp_balance);
+            let rate = log_drop_basis_points(xp_balance, crate::player::AxeTier::None);
             let mut successes = 0_u64;
             let mut miss_run = 0_u64;
             let mut success_run = 0_u64;
@@ -1555,7 +2247,7 @@ mod tests {
             let mut max_success_run = 0_u64;
             for _ in 0..100_000 {
                 let previous_credit = luck.credit.value();
-                let (next, success) = luck.advance(xp_balance);
+                let (next, success) = luck.advance(xp_balance, crate::player::AxeTier::None);
                 assert!(next.credit.value() <= MAX_LUCK_CREDIT);
                 assert_eq!(
                     next.credit.value() + u64::from(success) * CHOP_ROLL_BASIS_POINTS,
@@ -1618,6 +2310,15 @@ mod tests {
         let mut missing_log = valid;
         missing_log.state_logs_after -= 1;
         assert!(missing_log.validate().is_err());
+        let mut forged_stone = valid;
+        forged_stone.state_stone_after += 1;
+        assert!(forged_stone.validate().is_err());
+        let mut forged_iron_ore = valid;
+        forged_iron_ore.state_iron_ore_after += 1;
+        assert!(forged_iron_ore.validate().is_err());
+        let mut changed_axe = valid;
+        changed_axe.next_state.axe = AxeTier::Wooden;
+        assert!(changed_axe.validate().is_err());
     }
 
     #[test]
@@ -1627,6 +2328,9 @@ mod tests {
         let mut forged = valid;
         forged.state_xp_balance_after += 1;
         assert!(forged.validate().is_err());
+        let mut forged_material = valid;
+        forged_material.tree_stone_after -= 1;
+        assert!(forged_material.validate().is_err());
     }
 
     #[test]
@@ -1649,13 +2353,26 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             &tree_script,
         )
         .unwrap();
         assert_eq!(contract.tree_script_pubkey, tree_script);
-        assert_eq!(contract.vtxo.tapscripts().len(), 5);
+        assert_eq!(contract.vtxo.tapscripts().len(), 6);
         assert!(contract.chop_arkade_script.len() <= 10_000);
+        let craft_emulator =
+            ark_script::compute_arkade_script_public_key(&emulator, &contract.craft_arkade_script)
+                .unwrap();
+        assert_eq!(contract.craft_tweaked_emulator, craft_emulator);
+        let craft_signers =
+            ark_core::script::extract_checksig_pubkeys(&contract.craft_spend_script);
+        assert_eq!(craft_signers.len(), 3);
+        assert!(craft_signers.contains(&owner));
+        assert!(craft_signers.contains(&operator));
+        assert!(craft_signers.contains(&craft_emulator));
+        assert!(!craft_signers.contains(&rollover));
 
         let renewal_emulator = ark_script::compute_arkade_script_public_key(
             &emulator,
@@ -1766,7 +2483,7 @@ mod tests {
             (u64::MAX, 3_000),
         ] {
             assert_eq!(
-                log_drop_basis_points(xp_balance),
+                log_drop_basis_points(xp_balance, AxeTier::None),
                 basis_points,
                 "XP asset balance {xp_balance}"
             );
@@ -1775,7 +2492,14 @@ mod tests {
 
     #[test]
     fn withdraw_script_moves_log_only_and_keeps_xp_soulbound() {
-        let withdraw = player_withdraw_covenant_script(asset(2, 1), asset(2, 2), 330).unwrap();
+        let withdraw = player_withdraw_covenant_script(
+            asset(2, 1),
+            asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
+            330,
+        )
+        .unwrap();
         assert!(withdraw.len() <= 10_000);
         let asm = ark_script::to_asm(&withdraw).unwrap();
         // Two-input/four-output shape pinned by the covenant.
@@ -1806,6 +2530,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             &tree_script,
         )
@@ -1823,6 +2549,59 @@ mod tests {
     }
 
     #[test]
+    fn craft_covenant_pins_single_state_recipe_burn_shape() {
+        let craft =
+            player_craft_covenant_script(asset(2, 1), asset(2, 2), asset(2, 3), asset(2, 4), 330)
+                .unwrap();
+        assert!(craft.len() <= 10_000);
+        let asm = ark_script::to_asm(&craft).unwrap();
+        assert!(asm.contains("OP_INSPECTVERSION OP_PUSHNUM_3 OP_EQUALVERIFY"));
+        assert!(asm.contains("OP_INSPECTNUMINPUTS OP_PUSHNUM_1 OP_EQUALVERIFY"));
+        assert!(asm.contains("OP_INSPECTNUMOUTPUTS OP_PUSHNUM_3 OP_EQUALVERIFY"));
+        assert!(asm.contains("OP_INSPECTOUTPUTVALUE"));
+        assert!(asm.contains("OP_INSPECTINPUTVALUE"));
+        for recipe in &AXE_RECIPES[1..] {
+            let threshold = recipe.required_xp_balance().saturating_sub(1) as i64;
+            let exact_gate = Builder::new()
+                .push_int(threshold)
+                .push_opcode(OP_GREATERTHAN)
+                .push_opcode(OP_VERIFY)
+                .into_script();
+            assert!(
+                craft
+                    .as_bytes()
+                    .windows(exact_gate.len())
+                    .any(|window| window == exact_gate.as_bytes()),
+                "{} level gate is absent",
+                recipe.axe.display_name()
+            );
+            let early_gate = Builder::new()
+                .push_int(1)
+                .push_opcode(OP_ADD)
+                .push_int(threshold)
+                .push_opcode(OP_GREATERTHAN)
+                .push_opcode(OP_VERIFY)
+                .into_script();
+            assert!(
+                !craft
+                    .as_bytes()
+                    .windows(early_gate.len())
+                    .any(|window| window == early_gate.as_bytes()),
+                "{} level gate permits one XP unit too early",
+                recipe.axe.display_name()
+            );
+        }
+        assert!(player_craft_covenant_script(
+            asset(2, 1),
+            asset(2, 2),
+            asset(2, 2),
+            asset(2, 4),
+            330,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn player_contract_rejects_tweaked_emulator_collision() {
         let secp = Secp256k1::new();
         let operator = xonly(&secp, 4);
@@ -1831,11 +2610,27 @@ mod tests {
         let tree_script =
             Address::p2tr(&secp, xonly(&secp, 6), None, Network::Regtest).script_pubkey();
         let (tree_asset, log_asset, xp_asset) = (asset(2, 0), asset(2, 1), asset(2, 2));
-        let chop = player_chop_covenant_script(log_asset, xp_asset, 330, &tree_script).unwrap();
-        let renewal = player_renewal_covenant_script(log_asset, xp_asset, 330).unwrap();
+        let chop = player_chop_covenant_script(
+            log_asset,
+            xp_asset,
+            asset(2, 3),
+            asset(2, 4),
+            330,
+            &tree_script,
+        )
+        .unwrap();
+        let renewal =
+            player_renewal_covenant_script(log_asset, xp_asset, asset(2, 3), asset(2, 4), 330)
+                .unwrap();
+        let withdraw =
+            player_withdraw_covenant_script(log_asset, xp_asset, asset(2, 3), asset(2, 4), 330)
+                .unwrap();
+        let craft =
+            player_craft_covenant_script(log_asset, xp_asset, asset(2, 3), asset(2, 4), 330)
+                .unwrap();
         // An owner key equal to a script-tweaked emulator key could satisfy
         // the emulator position without executing the covenant.
-        for script in [&chop, &renewal] {
+        for script in [&chop, &renewal, &withdraw, &craft] {
             let owner = ark_script::compute_arkade_script_public_key(&emulator, script).unwrap();
             let error = build_player_contract(
                 &secp,
@@ -1848,6 +2643,8 @@ mod tests {
                 tree_asset,
                 log_asset,
                 xp_asset,
+                asset(2, 3),
+                asset(2, 4),
                 330,
                 &tree_script,
             )

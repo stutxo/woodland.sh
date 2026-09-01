@@ -146,17 +146,19 @@ function outpoint(record) {
   return `${record.outpoint.txid}:${record.outpoint.vout}`;
 }
 
-function worldAssetTotals(records, treeAsset, logAsset, xpAsset) {
+function worldAssetTotals(records, treeAsset, logAsset, xpAsset, stoneAsset, ironOreAsset) {
   return records.reduce(
     (sum, record) => {
       for (const asset of record.assets || []) {
         if (asset.assetId === treeAsset) sum.trees += Number(asset.amount);
         if (asset.assetId === logAsset) sum.logs += Number(asset.amount);
         if (asset.assetId === xpAsset) sum.xp += Number(asset.amount);
+        if (asset.assetId === stoneAsset) sum.stone += Number(asset.amount);
+        if (asset.assetId === ironOreAsset) sum.ironOre += Number(asset.amount);
       }
       return sum;
     },
-    { trees: 0, logs: 0, xp: 0 },
+    { trees: 0, logs: 0, xp: 0, stone: 0, ironOre: 0 },
   );
 }
 
@@ -192,11 +194,22 @@ async function main() {
     [1_154, 4_470, 13_363, 37_224, 101_333],
   );
   assert.equal(manifest.maxLevelLogDropBasisPoints, 3_000);
+  assert.equal(manifest.maxLogDropBasisPoints, 3_800);
+  assert.equal(manifest.stoneDropBasisPoints, 1_000);
+  assert.equal(manifest.ironOreDropBasisPoints, 200);
+  assert.equal(manifest.ironOreUnlockLevel, 10);
+  assert.deepEqual(manifest.axeRecipes, [
+    { axe: 'wooden', requiredLevel: 1, logCost: 1, stoneCost: 0, ironOreCost: 0 },
+    { axe: 'stone', requiredLevel: 5, logCost: 2, stoneCost: 2, ironOreCost: 0 },
+    { axe: 'iron', requiredLevel: 15, logCost: 5, stoneCost: 0, ironOreCost: 2 },
+  ]);
   assert.equal(manifest.luckWindowBasisPoints, 10_000);
   assert.equal(manifest.initialLuckCredit, 8_000);
   assert.equal(manifest.activeLogsPerTree, 10);
   assert.equal(manifest.logReservePerTree, 50_000);
   assert.equal(manifest.xpPerTree, 50_000);
+  assert.equal(manifest.stoneReservePerTree, 50_000);
+  assert.equal(manifest.ironOreReservePerTree, 50_000);
   assert.ok(manifest.rolloverSigner, 'world manifest must pin a rollover signer');
   for (const removed of [
     'treeRetireArkadeScript',
@@ -220,6 +233,8 @@ async function main() {
   const treeAsset = manifest.treeAsset;
   const logAsset = manifest.logAsset;
   const xpAsset = manifest.xpAsset;
+  const stoneAsset = manifest.stoneAsset;
+  const ironOreAsset = manifest.ironOreAsset;
   const assetInfo = async (assetId, label) => {
     const response = await fetch(`${ARKD}/v1/indexer/asset/${assetId}`);
     if (!response.ok) {
@@ -243,11 +258,24 @@ async function main() {
   const treeAssetInfo = await assetInfo(treeAsset, 'TREE');
   const logAssetInfo = await assetInfo(logAsset, 'LOG');
   const xpAssetInfo = await assetInfo(xpAsset, 'XP');
+  const stoneAssetInfo = await assetInfo(stoneAsset, 'STONE');
+  const ironOreAssetInfo = await assetInfo(ironOreAsset, 'IRON ORE');
   assert.equal(treeAssetInfo.supply, '420', 'indexed TREE supply changed');
-  assert.equal(logAssetInfo.supply, '21000000', 'indexed LOG supply changed');
+  // The preceding browser stage always crafts one Wooden Axe and its covenant
+  // burns the exact first recipe. Issuance remains fixed; indexed circulating
+  // supply records the burn.
+  assert.equal(
+    logAssetInfo.supply,
+    String(21_000_000 - manifest.axeRecipes[0].logCost),
+    'indexed LOG supply does not reflect the Wooden Axe recipe',
+  );
   assert.equal(xpAssetInfo.supply, '21000000', 'indexed XP supply changed');
+  assert.equal(stoneAssetInfo.supply, '21000000', 'indexed STONE supply changed');
+  assert.equal(ironOreAssetInfo.supply, '21000000', 'indexed IRON ORE supply changed');
   assert.equal(logAssetInfo.controlAsset || '', '');
   assert.equal(xpAssetInfo.controlAsset || '', '');
+  assert.equal(stoneAssetInfo.controlAsset || '', '');
+  assert.equal(ironOreAssetInfo.controlAsset || '', '');
   fundRenewals();
   const worldBefore = await indexerVtxos({ scripts: treeScript, spendableOnly: 'true' });
   assert.equal(
@@ -261,12 +289,27 @@ async function main() {
     assert.equal(markers.length, 1, 'every tree carries exactly one TREE marker');
     assert.equal(Number(markers[0].amount), 1, 'every tree carries exactly one TREE marker');
   }
-  const totalsBefore = worldAssetTotals(worldBefore, treeAsset, logAsset, xpAsset);
+  const totalsBefore = worldAssetTotals(
+    worldBefore,
+    treeAsset,
+    logAsset,
+    xpAsset,
+    stoneAsset,
+    ironOreAsset,
+  );
   assert.equal(totalsBefore.trees, manifest.trees.length);
   assert.equal(totalsBefore.logs, totalsBefore.xp);
   assert.ok(
     totalsBefore.logs > 0
       && totalsBefore.logs <= manifest.logReservePerTree * manifest.trees.length,
+  );
+  assert.ok(
+    totalsBefore.stone > 0
+      && totalsBefore.stone <= manifest.stoneReservePerTree * manifest.trees.length,
+  );
+  assert.ok(
+    totalsBefore.ironOre > 0
+      && totalsBefore.ironOre <= manifest.ironOreReservePerTree * manifest.trees.length,
   );
 
   // Serialize fee-funded maintenance so the exact ordinary-wallet change from
@@ -315,6 +358,8 @@ async function main() {
   assert.equal(holdings.get(treeAsset), previousHoldings.get(treeAsset));
   assert.equal(holdings.get(logAsset), previousHoldings.get(logAsset));
   assert.equal(holdings.get(xpAsset), previousHoldings.get(xpAsset));
+  assert.equal(holdings.get(stoneAsset), previousHoldings.get(stoneAsset));
+  assert.equal(holdings.get(ironOreAsset), previousHoldings.get(ironOreAsset));
   assert.equal(Number(renewed[0].amount), Number(previous.amount));
   assert.equal(renewed[0].script, treeScript, 'renewed tree keeps the world contract');
 
@@ -335,7 +380,14 @@ async function main() {
   // World-wide conservation is untouched by every renewal.
   const world = await indexerVtxos({ scripts: treeScript, spendableOnly: 'true' });
   assert.equal(world.length, manifest.trees.length, 'all declared trees remain live');
-  const totals = worldAssetTotals(world, treeAsset, logAsset, xpAsset);
+  const totals = worldAssetTotals(
+    world,
+    treeAsset,
+    logAsset,
+    xpAsset,
+    stoneAsset,
+    ironOreAsset,
+  );
   assert.deepEqual(
     totals,
     totalsBefore,

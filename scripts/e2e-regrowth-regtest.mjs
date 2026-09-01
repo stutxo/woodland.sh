@@ -36,6 +36,8 @@ const ACTIVE_LOGS_PER_TREE = 10;
 const LOG_RESERVE_PER_TREE = 50_000;
 const INDEXED_LOG_SUPPLY = 21_000_000;
 const INDEXED_XP_SUPPLY = 21_000_000;
+const INDEXED_STONE_SUPPLY = 21_000_000;
+const INDEXED_IRON_ORE_SUPPLY = 21_000_000;
 const FUND_COMMAND = process.env.WOODLAND_REGROWTH_FUND_COMMAND;
 const REQUIRE_RENEWAL_FEE = process.env.WOODLAND_E2E_REQUIRE_RENEWAL_FEE === '1';
 const reportPath = path.resolve(
@@ -209,6 +211,8 @@ try {
   assert.equal(manifest.activeLogsPerTree, ACTIVE_LOGS_PER_TREE);
   assert.equal(manifest.logReservePerTree, LOG_RESERVE_PER_TREE);
   assert.equal(manifest.xpPerTree, LOG_RESERVE_PER_TREE);
+  assert.equal(manifest.stoneReservePerTree, LOG_RESERVE_PER_TREE);
+  assert.equal(manifest.ironOreReservePerTree, LOG_RESERVE_PER_TREE);
   for (const removed of [
     'vaultScript',
     'vaultRestockArkadeScript',
@@ -317,6 +321,8 @@ try {
     rounds += 1;
     assert.ok(rounds <= MAX_ROUNDS, `stumping tree exceeded ${MAX_ROUNDS} rounds`);
     const before = target;
+    const playerStoneBefore = chopperState.playerStone;
+    const playerIronOreBefore = chopperState.playerIronOre;
     const result = await chopper.chop(chopperState, before);
     assert.equal(result.ok, true, `round ${rounds}: ${result.message || 'chop rejected'}`);
     naturalChops ||= result.natural === true;
@@ -335,6 +341,22 @@ try {
       before.xpRemaining - dropped * manifest.woodcuttingXpPerLog,
       `round ${rounds}: XP mismatch`,
     );
+    const material = chopperState.lastAttempt?.material;
+    assert.ok(['none', 'stone', 'ironOre'].includes(material), `round ${rounds}: material`);
+    const stoneReward = Number(material === 'stone');
+    const ironOreReward = Number(material === 'ironOre');
+    assert.equal(
+      target.stoneRemaining,
+      before.stoneRemaining - stoneReward,
+      `round ${rounds}: STONE mismatch`,
+    );
+    assert.equal(
+      target.ironOreRemaining,
+      before.ironOreRemaining - ironOreReward,
+      `round ${rounds}: IRON ORE mismatch`,
+    );
+    assert.equal(chopperState.playerStone, playerStoneBefore + stoneReward);
+    assert.equal(chopperState.playerIronOre, playerIronOreBefore + ironOreReward);
     assert.equal(target.health, before.health - dropped, `round ${rounds}: health mismatch`);
     drops += dropped;
   }
@@ -369,6 +391,8 @@ try {
   assert.equal(regrown.health, ACTIVE_LOGS_PER_TREE, 'regrowth must restore ten health');
   assert.equal(regrown.logReserveRemaining, target.logReserveRemaining, 'regrowth minted LOG');
   assert.equal(regrown.xpRemaining, target.xpRemaining, 'regrowth minted XP');
+  assert.equal(regrown.stoneRemaining, target.stoneRemaining, 'regrowth minted STONE');
+  assert.equal(regrown.ironOreRemaining, target.ironOreRemaining, 'regrowth minted IRON ORE');
   assert.equal(regrown.depleted, false);
   assert.notEqual(regrown.treeOutpoint, stumpOutpoint, 'regrowth must rotate the lineage');
   const regrowerFeeChange = finalRegrower.walletVtxos.filter(
@@ -410,13 +434,19 @@ try {
   assert.equal(holdings.get(manifest.treeAsset), 1);
   assert.equal(holdings.get(manifest.logAsset), LOG_RESERVE_PER_TREE - ACTIVE_LOGS_PER_TREE);
   assert.equal(holdings.get(manifest.xpAsset), LOG_RESERVE_PER_TREE - ACTIVE_LOGS_PER_TREE);
+  assert.equal(holdings.get(manifest.stoneAsset), regrown.stoneRemaining);
+  assert.equal(holdings.get(manifest.ironOreAsset), regrown.ironOreRemaining);
 
-  const [logs, xp] = await Promise.all([
+  const [logs, xp, stone, ironOre] = await Promise.all([
     fetchAssetSupply(arkadeBase, manifest.logAsset),
     fetchAssetSupply(arkadeBase, manifest.xpAsset),
+    fetchAssetSupply(arkadeBase, manifest.stoneAsset),
+    fetchAssetSupply(arkadeBase, manifest.ironOreAsset),
   ]);
   assert.equal(logs, INDEXED_LOG_SUPPLY, 'indexed LOG supply changed');
   assert.equal(xp, INDEXED_XP_SUPPLY, 'indexed XP supply changed');
+  assert.equal(stone, INDEXED_STONE_SUPPLY, 'indexed STONE supply changed');
+  assert.equal(ironOre, INDEXED_IRON_ORE_SUPPLY, 'indexed IRON ORE supply changed');
 
   const report = {
     profile: 'regrowth',

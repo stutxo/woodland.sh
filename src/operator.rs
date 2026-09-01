@@ -6,8 +6,8 @@ use crate::tree;
 use crate::txbuild;
 use crate::world::{
     asset_metadata_entries, tree_states, WorldManifest, ACTIVE_LOGS_PER_TREE, GAME_ID,
-    LOG_RESERVE_PER_TREE, MANIFEST_SCHEMA_VERSION, PROTOCOL_DUST_SATS, PROTOCOL_VERSION,
-    TREE_COUNT, XP_PER_TREE,
+    IRON_ORE_RESERVE_PER_TREE, LOG_RESERVE_PER_TREE, MANIFEST_SCHEMA_VERSION, PROTOCOL_DUST_SATS,
+    PROTOCOL_VERSION, STONE_RESERVE_PER_TREE, TREE_COUNT, XP_PER_TREE,
 };
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::packet::{AssetGroup, AssetInput, AssetOutput, Packet};
@@ -547,15 +547,19 @@ fn build_plan(
     let tree_states = tree_states();
     let tree_count = tree_states.len();
     let funding_sats = world_funding_sats(&services.params)?;
-    if LOG_RESERVE_PER_TREE
-        .checked_mul(tree_count as u64)
-        .filter(|total| *total == crate::world::LOG_SUPPLY)
-        .is_none()
-        || XP_PER_TREE
+    if [
+        (LOG_RESERVE_PER_TREE, crate::world::LOG_SUPPLY),
+        (XP_PER_TREE, crate::world::XP_SUPPLY),
+        (STONE_RESERVE_PER_TREE, crate::world::STONE_SUPPLY),
+        (IRON_ORE_RESERVE_PER_TREE, crate::world::IRON_ORE_SUPPLY),
+    ]
+    .into_iter()
+    .any(|(reserve, supply)| {
+        reserve
             .checked_mul(tree_count as u64)
-            .filter(|total| *total == crate::world::XP_SUPPLY)
+            .filter(|total| *total == supply)
             .is_none()
-    {
+    }) {
         return Err(anyhow!("per-tree reserves do not exhaust the fixed supply"));
     }
     let funding_total = funding.iter().try_fold(0_u64, |total, record| {
@@ -604,6 +608,8 @@ fn build_plan(
                 genesis_group("TREE", tree_count as u64),
                 genesis_group("LOG", crate::world::LOG_SUPPLY),
                 genesis_group("XP", crate::world::XP_SUPPLY),
+                genesis_group("STONE", crate::world::STONE_SUPPLY),
+                genesis_group("IRON ORE", crate::world::IRON_ORE_SUPPLY),
             ],
         },
     )
@@ -622,6 +628,14 @@ fn build_plan(
         txid: genesis_txid,
         group_index: 2,
     };
+    let stone_asset = AssetId {
+        txid: genesis_txid,
+        group_index: 3,
+    };
+    let iron_ore_asset = AssetId {
+        txid: genesis_txid,
+        group_index: 4,
+    };
     let contract = tree::build_tree_contract(
         &keys.secp,
         services.params.signer_pk,
@@ -632,6 +646,8 @@ fn build_plan(
         tree_asset,
         log_asset,
         xp_asset,
+        stone_asset,
+        iron_ore_asset,
         services.params.dust_sats,
     )?;
     let tree_value = services.params.dust_sats;
@@ -648,6 +664,14 @@ fn build_plan(
             Asset {
                 asset_id: xp_asset,
                 amount: XP_PER_TREE * remaining_trees,
+            },
+            Asset {
+                asset_id: stone_asset,
+                amount: STONE_RESERVE_PER_TREE * remaining_trees,
+            },
+            Asset {
+                asset_id: iron_ore_asset,
+                amount: IRON_ORE_RESERVE_PER_TREE * remaining_trees,
             },
         ]
         .to_vec()
@@ -712,6 +736,16 @@ fn build_plan(
                     vec![(0, crate::world::XP_SUPPLY)],
                     shard_outputs(XP_PER_TREE),
                 ),
+                transfer_group(
+                    stone_asset,
+                    vec![(0, crate::world::STONE_SUPPLY)],
+                    shard_outputs(STONE_RESERVE_PER_TREE),
+                ),
+                transfer_group(
+                    iron_ore_asset,
+                    vec![(0, crate::world::IRON_ORE_SUPPLY)],
+                    shard_outputs(IRON_ORE_RESERVE_PER_TREE),
+                ),
             ],
         },
     )
@@ -774,10 +808,14 @@ fn build_plan(
             let mut tree_outputs = vec![(0, 1)];
             let mut log_outputs = vec![(0, LOG_RESERVE_PER_TREE)];
             let mut xp_outputs = vec![(0, XP_PER_TREE)];
+            let mut stone_outputs = vec![(0, STONE_RESERVE_PER_TREE)];
+            let mut iron_ore_outputs = vec![(0, IRON_ORE_RESERVE_PER_TREE)];
             if remaining_after > 0 {
                 tree_outputs.push((1, remaining_after));
                 log_outputs.push((1, LOG_RESERVE_PER_TREE * remaining_after));
                 xp_outputs.push((1, XP_PER_TREE * remaining_after));
+                stone_outputs.push((1, STONE_RESERVE_PER_TREE * remaining_after));
+                iron_ore_outputs.push((1, IRON_ORE_RESERVE_PER_TREE * remaining_after));
             }
             let groups = vec![
                 transfer_group(tree_asset, vec![(0, remaining_before)], tree_outputs),
@@ -790,6 +828,16 @@ fn build_plan(
                     xp_asset,
                     vec![(0, XP_PER_TREE * remaining_before)],
                     xp_outputs,
+                ),
+                transfer_group(
+                    stone_asset,
+                    vec![(0, STONE_RESERVE_PER_TREE * remaining_before)],
+                    stone_outputs,
+                ),
+                transfer_group(
+                    iron_ore_asset,
+                    vec![(0, IRON_ORE_RESERVE_PER_TREE * remaining_before)],
+                    iron_ore_outputs,
                 ),
             ];
             ark_core::asset::packet::add_asset_packet_to_psbt(
@@ -849,6 +897,8 @@ fn build_plan(
         tree_asset,
         log_asset,
         xp_asset,
+        stone_asset,
+        iron_ore_asset,
         &contract,
         genesis_txid,
         &manifest_deployments,
@@ -1072,6 +1122,18 @@ async fn execute_plan(
             XP_PER_TREE * shard.tree_count,
             "shard XP",
         )?;
+        require_asset_amount(
+            record,
+            world.stone_asset,
+            STONE_RESERVE_PER_TREE * shard.tree_count,
+            "shard STONE",
+        )?;
+        require_asset_amount(
+            record,
+            world.iron_ore_asset,
+            IRON_ORE_RESERVE_PER_TREE * shard.tree_count,
+            "shard IRON ORE",
+        )?;
     }
 
     let results = stream::iter(plan.shards.iter().map(|shard| {
@@ -1148,6 +1210,18 @@ async fn execute_deployment_shard(
             XP_PER_TREE * remaining,
             "shard XP",
         )?;
+        require_asset_amount(
+            &asset_record,
+            world.stone_asset,
+            STONE_RESERVE_PER_TREE * remaining,
+            "shard STONE",
+        )?;
+        require_asset_amount(
+            &asset_record,
+            world.iron_ore_asset,
+            IRON_ORE_RESERVE_PER_TREE * remaining,
+            "shard IRON ORE",
+        )?;
         submit_direct(
             deployer_keys,
             &services.rest,
@@ -1164,6 +1238,18 @@ async fn execute_deployment_shard(
             "deployed LOG reserve",
         )?;
         require_asset_amount(&tree_record, world.xp_asset, XP_PER_TREE, "deployed XP")?;
+        require_asset_amount(
+            &tree_record,
+            world.stone_asset,
+            STONE_RESERVE_PER_TREE,
+            "deployed STONE reserve",
+        )?;
+        require_asset_amount(
+            &tree_record,
+            world.iron_ore_asset,
+            IRON_ORE_RESERVE_PER_TREE,
+            "deployed IRON ORE reserve",
+        )?;
         submitted += 1;
     }
     Ok(submitted)
@@ -1218,6 +1304,8 @@ async fn load_current_trees(
     let tree_asset = world.tree_asset;
     let log_asset = world.log_asset;
     let xp_asset = world.xp_asset;
+    let stone_asset = world.stone_asset;
+    let iron_ore_asset = world.iron_ore_asset;
     let declared_trees = &world.trees;
     let trees = load_exact_tree_records(rest, world).await?;
     let txids: Vec<_> = trees.iter().map(|record| record.outpoint.txid).collect();
@@ -1227,16 +1315,22 @@ async fn load_current_trees(
     for record in trees {
         let logs = record.asset_amount(log_asset).unwrap_or(0);
         let xp_balance = record.asset_amount(xp_asset).unwrap_or(0);
+        let stone = record.asset_amount(stone_asset).unwrap_or(0);
+        let iron_ore = record.asset_amount(iron_ore_asset).unwrap_or(0);
         if record.amount_sats != manifest.dust_sats
             || record.script != contract.vtxo.script_pubkey()
             || record.asset_amount(tree_asset) != Some(1)
             || logs > LOG_RESERVE_PER_TREE
             || xp_balance > XP_PER_TREE
+            || stone > STONE_RESERVE_PER_TREE
+            || iron_ore > IRON_ORE_RESERVE_PER_TREE
             || logs != xp_balance
             || !record.assets.iter().all(|asset| {
                 asset.asset_id == tree_asset
                     || asset.asset_id == log_asset
                     || asset.asset_id == xp_asset
+                    || asset.asset_id == stone_asset
+                    || asset.asset_id == iron_ore_asset
             })
         {
             return Err(anyhow!("shared tree record is invalid"));
@@ -1698,6 +1792,8 @@ async fn renew_current_tree(
         world.tree_asset,
         world.log_asset,
         world.xp_asset,
+        world.stone_asset,
+        world.iron_ore_asset,
         services.params.dust_sats,
         renewal_expiry_margin_secs(),
     )?;

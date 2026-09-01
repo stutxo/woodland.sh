@@ -140,6 +140,8 @@ function treeProjection(state) {
     health: tree.health,
     logReserveRemaining: tree.logReserveRemaining,
     xpRemaining: tree.xpRemaining,
+    stoneRemaining: tree.stoneRemaining,
+    ironOreRemaining: tree.ironOreRemaining,
     valueSats: tree.valueSats,
     treeOutpoint: tree.treeOutpoint,
     lastAttemptTxid: tree.lastAttemptTxid,
@@ -165,6 +167,16 @@ function assertSharedWorld(views, label) {
       view.state.xpAsset,
       shared.xpAsset,
       `${label}: XP asset differs`,
+    );
+    assert.equal(
+      view.state.stoneAsset,
+      shared.stoneAsset,
+      `${label}: STONE asset differs`,
+    );
+    assert.equal(
+      view.state.ironOreAsset,
+      shared.ironOreAsset,
+      `${label}: IRON ORE asset differs`,
     );
     assert.deepEqual(treeProjection(view.state), treeProjection(shared), `${label}: tree state differs`);
   }
@@ -318,6 +330,11 @@ async function main() {
     for (const view of initial) {
       assert.equal(view.state.playerLogs, 0);
       assert.equal(view.state.playerXp, 0);
+      assert.equal(view.state.playerStone, 0);
+      assert.equal(view.state.playerIronOre, 0);
+      assert.equal(view.state.playerAxe, 'none');
+      assert.equal(view.state.nextAxeRecipe, null);
+      assert.equal(view.state.craftAxeReady, false);
       assert.equal(view.state.woodcuttingXpPerLog, manifest.woodcuttingXpPerLog);
       assert.equal(view.state.playerLevel, 1);
       assert.equal(view.state.playerNextLevelXp, 83);
@@ -374,6 +391,13 @@ async function main() {
         && value.state.playerLogs === 0,
     );
     assertPlayersActive(activated, 'post-activation state');
+    for (const view of activated) {
+      assert.equal(view.state.playerStone, 0);
+      assert.equal(view.state.playerIronOre, 0);
+      assert.equal(view.state.playerAxe, 'none');
+      assert.equal(view.state.nextAxeRecipe?.axe, 'wooden');
+      assert.equal(view.state.craftAxeReady, false);
+    }
     assert.notEqual(activated[0].state.playerStateOutpoint, activated[1].state.playerStateOutpoint);
     const playerAssets = activated.map((view) => view.state.playerAsset);
     assert.ok(playerAssets.every(Boolean));

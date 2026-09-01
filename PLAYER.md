@@ -3,14 +3,15 @@
 ## Purpose
 
 A player is one owner-specific recursive VTXO. It holds 330 sats, exactly one
-self-issued PLAYER_ID, a recursive player roll, bounded luck credit, harvested
-LOG, and soulbound XP. There is no carrier, PLAYER_TICKET, allocator, protocol
-registry, or player cap. When configured, the game server indexes public state,
-presence, and chat, but has no role in gameplay authorization.
+self-issued PLAYER_ID, a recursive player roll, bounded luck credit, permanent
+axe tier, harvested LOG, and soulbound XP, STONE, and IRON ORE. There is no
+carrier, PLAYER_TICKET, allocator, protocol registry, or player cap. When
+configured, the game server indexes public state, presence, and chat, but has
+no role in gameplay authorization.
 
 ```text
-player state: D sats + 1 PLAYER_ID + player roll + luck credit
-              + optional LOG + optional XP
+player state: D sats + 1 PLAYER_ID + player roll + luck credit + axe tier
+              + optional LOG + optional XP + optional STONE + optional IRON ORE
 D = 330 sats
 ```
 
@@ -24,6 +25,7 @@ issues a marker and creates the personalized player state. It attaches:
 - metadata `game=woodland.sh`, `protocol=3`, `asset=PLAYER_ID`, and the owner;
 - roll `SHA256("woodland.sh/player-roll/v2" || p2tr_witness_program)`;
 - luck credit 8,000.
+- axe tier packet `None`.
 
 The PLAYER_ID AssetId is `(activation_txid, 0)`. The browser persists that exact
 ID before submission, then discovers only state containing that one-unit asset.
@@ -33,9 +35,9 @@ or mint a decoy marker, but cannot reproduce an existing transaction-derived ID.
 For the reference client's direct issuance-to-state shape, every player
 covenant leaf recognizes the first recursive spend because the PLAYER_ID
 AssetId txid equals the state input's outpoint txid. On that spend it requires
-the script-derived roll, AssetId group index zero, and 8,000 credit. A malformed
-direct activation therefore cannot be laundered through renewal or withdrawal
-before chopping.
+the script-derived roll, AssetId group index zero, 8,000 credit, and axe tier
+`None`. A malformed direct activation therefore cannot be laundered through
+renewal, withdrawal, or crafting before chopping.
 
 ## XP Backing
 
@@ -56,8 +58,9 @@ Level is derived, never stored. The reachable canonical curve is
 boundaries remain levels 10, 20, 30, 40, and 50
 (1,154 / 4,470 / 13,363 / 37,224 / 101,333 Woodcutting XP), reached at XP
 asset balances 47 / 179 / 535 / 1,489 / 4,054. Base LOG chance is 20% and rises
-two percentage points per boundary to a 30% cap while aggregate XP asset supply
-remains fixed.
+two percentage points per boundary to a 30% level cap. The equipped Wooden,
+Stone, or Iron Axe adds 2%, 5%, or 8%, for an absolute 38% cap, while aggregate
+XP asset supply remains fixed.
 
 ## Player-Bound Luck
 
@@ -65,7 +68,7 @@ The next reward belongs to the player lineage. A swing advances
 `Rnext = SHA256(Rprevious)` and maps the successor to a little-endian bucket
 modulo 10,000. Selecting, renewing, or regrowing another tree cannot change that bucket.
 
-For input-XP rate `p`, input credit `C`, `Q = C+p`, and reward bit `G`:
+For input-XP-and-axe rate `p`, input credit `C`, `Q = C+p`, and reward bit `G`:
 
 ```text
 G = 0                    if Q < 10,000
@@ -81,14 +84,27 @@ exceeds ten; no rate permits more than two consecutive successes. The hash
 chain is public and predictable. This prevents tree-target grinding and bounds
 variance; it does not prevent PLAYER_ID Sybils or provide hidden randomness.
 
-## Soulbound XP, Liquid LOG
+## Successful-Swing Materials
 
-XP is soulbound by covenant: no leaf moves it out of player state. The chop
-covenants pin XP deltas to the deterministic drop bit, both renewal leaves
-preserve the XP asset balance exactly, and the LOG withdrawal leaf requires that
-balance to survive unchanged. There is no transfer path at all — not to other
-players, not to ordinary outputs — so a level can never be bought, sold, or
-pooled.
+A separate bucket commits material selection to the next player roll:
+
+```text
+B = SHA256("woodland.sh/material-roll/v1" || Rnext) mod 10,000
+```
+
+Before level 10, `B < 1,000` selects one STONE. From level 10 onward,
+`B < 200` selects one IRON ORE and `200 <= B < 1,200` selects one STONE. The
+tree covenant gates the selected material by `G`, so misses move no material
+and the disjoint ranges can never move both.
+
+## Soulbound Progression, Liquid LOG
+
+XP, STONE, IRON ORE, and axe tier are soulbound by covenant. Chop pins inventory
+deltas to the deterministic reward and material buckets. Both renewal leaves
+preserve every inventory balance and the axe exactly. Withdrawal preserves XP,
+STONE, IRON ORE, and axe, while crafting may only burn its exact declared LOG
+and material recipe. There is no progression transfer path to another player
+or ordinary output.
 
 LOG is the liquid token. The fourth player tapleaf, authorized by the owner
 plus the Arkade operator and tweaked emulator, withdraws an arbitrary amount
@@ -98,33 +114,36 @@ of LOG to any destination:
 inputs:  player state, owner wallet dust input
 outputs: player state minus the withdrawn LOG, LOG destination, extension,
          anchor
-groups:  PLAYER_ID, LOG, XP
+groups:  PLAYER_ID, LOG, XP, STONE, IRON ORE
 ```
 
 The covenant preserves the player P2TR, 330 sats, PLAYER_ID, roll, luck credit,
-and XP asset balance exactly; the destination output is funded entirely by the
-wallet dust input, never by player sats.
+axe tier, and XP/STONE/IRON ORE balances exactly; the destination output is
+funded entirely by the wallet dust input, never by player sats.
 
 ## Atomic Chop
 
 A canonical swing has:
 
 ```text
-input 0:  player state, 1 PLAYER_ID, X XP units, M LOG
-input 1:  tree, one TREE, F XP units, N LOG, health H > 0
+input 0:  player, PLAYER_ID, XP X, LOG M, STONE S, IRON ORE I, axe A
+input 1:  tree, TREE, XP F, LOG N, STONE T, IRON ORE O, health H > 0
 
-output 0: same player state, 1 PLAYER_ID, X+G XP units, M+G LOG
-output 1: same tree, F-G XP units, N-G LOG, health H-G
+output 0: player, PLAYER_ID, XP X+G, LOG M+G, STONE S+K,
+          IRON ORE I+J, axe A
+output 1: tree, TREE, XP F-G, LOG N-G, STONE T-K,
+          IRON ORE O-J, health H-G
 output 2: zero-value merged Ark extension
 output 3: canonical zero-value anchor
 ```
 
-`G` is the deterministic reward bit derived from player roll, luck credit, and
-the input XP asset balance. A success adds 25 user-facing Woodcutting XP. The
-four Asset V1 groups are ordered `PLAYER_ID`, `TREE`, `LOG`, `XP`.
-Group zero is exactly one metadata-free, uncontrolled unit assigned from input
-zero to output zero. Zero LOG/XP assignments are omitted while those world
-groups remain present because the tree has positive inventory before a swing.
+`G` is the deterministic LOG reward bit; `K` and `J` are the gated STONE and
+IRON ORE material bits. A success adds 25 user-facing Woodcutting XP. The six
+Asset V1 groups are ordered `PLAYER_ID`, `TREE`, `LOG`, `XP`, `STONE`,
+`IRON ORE`. Group zero is exactly one metadata-free, uncontrolled unit assigned
+from input zero to output zero. Zero inventory assignments are omitted while
+all five world groups remain present because the tree has positive inventory
+before a swing.
 
 The player covenant requires:
 
@@ -134,25 +153,44 @@ The player covenant requires:
 - the exact shared tree script and fixed tree value;
 - canonical initial luck on the first recursive spend;
 - exact roll hash successor and bounded luck-credit transition;
-- player input/output assets contain exactly one PLAYER_ID and only optional LOG
-  and XP besides it;
+- player input/output assets contain exactly one PLAYER_ID and only optional
+  LOG, XP, STONE, and IRON ORE besides it;
+- equipped axe preservation;
 - canonical extension and anchor.
 
 The reciprocal tree covenant enforces the actual inventory and XP deltas.
 
 ## Authorization
 
-The player contract has four tapleaves:
+The player contract has five covenant tapleaves plus the Arkade CSV exit:
 
 ```text
 chop:                player owner + Arkade operator + script-tweaked emulator
 owner renewal:       player owner + Arkade operator + script-tweaked emulator
 watchtower renewal:  rollover key + Arkade operator + script-tweaked emulator
 LOG withdrawal:      player owner + Arkade operator + script-tweaked emulator
+axe crafting:        player owner + Arkade operator + script-tweaked emulator
 ```
 
 The owner key remains a Bitcoin Taproot signer; owner authorization is not
 merely an emulator policy.
+
+## Covenant-Enforced Axe Crafting
+
+Crafting is a one-input/three-output recursive self-send: player state,
+then merged extension and canonical anchor. It advances exactly one tier and
+burns exactly the covenant-selected recipe:
+
+| Next tier | Required level | Burn | LOG chance bonus |
+| --- | ---: | --- | ---: |
+| Wooden | 1 | 1 LOG | 2% |
+| Stone | 5 | 2 LOG + 2 STONE | 5% |
+| Iron | 15 | 5 LOG + 2 IRON ORE | 8% |
+
+The craft leaf preserves state sats, P2TR, PLAYER_ID, XP, roll, luck, and every
+unspent inventory asset. The next tier is permanent and automatically equipped;
+the transaction cannot downgrade, skip a tier, unequip, or substitute a
+different recipe.
 
 ## Direct Owner Renewal
 
@@ -180,9 +218,9 @@ player's 330 sats and assets never fund the fee.
 Every renewal preserves byte-for-byte:
 
 - player P2TR and 330 sats;
-- roll and luck-credit packets;
+- roll, luck-credit, and axe packets;
 - the one-unit PLAYER_ID;
-- LOG and XP balances.
+- LOG, XP, STONE, and IRON ORE balances.
 
 ## Browser Persistence
 
@@ -210,14 +248,14 @@ against its saved wallet address and reinstates the exact PLAYER_ID profile.
 
 ## Limits
 
-The player count is unlimited, but season resources are not: the world
-contains exactly 21,000,000 LOG and 21,000,000 XP asset units, all issued into
+The player count is unlimited, but season resources are not: the world contains
+exactly 21,000,000 units each of LOG, XP, STONE, and IRON ORE, all issued into
 420 tree-local reserves of 50,000 each. Those XP units represent 525,000,000
-Woodcutting XP. Harvested LOG leaves player state through the owner-authorized
-withdrawal leaf; XP never leaves.
+Woodcutting XP. Harvested LOG leaves player state through withdrawal or exact
+craft burns. Materials leave only through exact craft burns; XP never leaves.
 PLAYER_ID is world-specific. A new deployment has a fresh genesis and fresh
-TREE/LOG/XP AssetIds; an owner may reuse a key, but the transaction-derived
-marker changes.
+TREE/LOG/XP/STONE/IRON ORE AssetIds; an owner may reuse a key, but the
+transaction-derived marker changes.
 
 A covenant sees the current transaction, not arbitrary ancestry from before a
 marker entered player state. An owner can issue a marker to an unconstrained

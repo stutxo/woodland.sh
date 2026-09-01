@@ -49,13 +49,16 @@
     .bag-slot { position: relative; display: grid; width: 72px; height: 72px; place-items: center; border: 1px solid #506047; background: #090c08; }
     .bag-slot.empty-slot { border-color: #283125; background: #0c100b; }
     .bag-item { font-size: 1.75rem; line-height: 1; }
+    .bag-item.material { font: 700 .82rem/1 ui-monospace, monospace; letter-spacing: -.03em; }
+    .bag-item.tool { font: 700 .72rem/1 ui-monospace, monospace; }
     .bag-slot.empty .bag-item { opacity: .35; }
     .bag-count { position: absolute; right: 5px; bottom: 3px; color: #fff; }
     .stats-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: #2b3527; }
     .stat { min-height: 66px; padding: 8px 10px; background: #11170f; }
     .stat > span:first-child { display: block; color: #8e9b88; font-size: .72rem; }
     .stat strong { display: block; margin-top: 4px; color: #dfe9da; }
-    .stats-actions { padding: 8px 10px; text-align: right; }
+    .stats-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 8px 10px; }
+    .stats-actions .muted { margin-right: auto; text-align: left; }
     @media (max-width: 950px) {
       #dashboard.player-active .dashboard-grid { grid-template-columns: minmax(0, 1fr) 262px; }
       .stats-box { grid-column: 1 / -1; width: min(100%, 600px); justify-self: end; }
@@ -187,9 +190,18 @@
               <span class="bag-item" aria-hidden="true">🪵</span>
               <strong class="bag-count">×<span id="player-logs">0</span></strong>
             </div>
-            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
-            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
-            <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
+            <div id="stone-slot" class="bag-slot empty" aria-label="0 STONE in inventory">
+              <span class="bag-item material" aria-hidden="true">STONE</span>
+              <strong class="bag-count">×<span id="player-stone">0</span></strong>
+            </div>
+            <div id="iron-ore-slot" class="bag-slot empty" aria-label="0 IRON ORE in inventory">
+              <span class="bag-item material" aria-hidden="true">IRON</span>
+              <strong class="bag-count">×<span id="player-iron-ore">0</span></strong>
+            </div>
+            <div id="axe-slot" class="bag-slot empty" aria-label="No Axe equipped">
+              <span class="bag-item tool" aria-hidden="true">AXE</span>
+              <strong id="player-axe" class="bag-count">None</strong>
+            </div>
             <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
             <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
             <div class="bag-slot empty-slot" aria-label="Empty inventory slot"></div>
@@ -226,7 +238,11 @@
               <strong id="player-state">Inactive</strong>
             </div>
           </div>
-          <div class="stats-actions"><button id="renew-player" type="button" disabled>Renew player</button></div>
+          <div class="stats-actions">
+            <span id="axe-recipe" class="muted">1 LOG required for Wooden Axe</span>
+            <button id="craft-axe" type="button" disabled>Craft Wooden Axe</button>
+            <button id="renew-player" type="button" disabled>Renew player</button>
+          </div>
         </aside>
       </div>
     </details>
@@ -283,6 +299,8 @@
         <div><dt>Health</dt><dd id="tree-health"></dd></div>
         <div><dt>Tree LOG reserve</dt><dd id="tree-reserve"></dd></div>
         <div><dt>Tree Woodcutting XP</dt><dd id="tree-xp"></dd></div>
+        <div><dt>Tree STONE reserve</dt><dd id="tree-stone"></dd></div>
+        <div><dt>Tree IRON ORE reserve</dt><dd id="tree-iron-ore"></dd></div>
         <div><dt>Forest</dt><dd id="forest-health"></dd></div>
         <div><dt>Tree state</dt><dd id="tree-state"></dd></div>
         <div><dt>Season Woodcutting XP</dt><dd id="xp-backing"></dd></div>
@@ -291,6 +309,8 @@
         <div><dt>TREE asset</dt><dd id="tree-asset"></dd></div>
         <div><dt>LOG asset</dt><dd id="log-asset"></dd></div>
         <div><dt>XP asset</dt><dd id="xp-asset"></dd></div>
+        <div><dt>STONE asset</dt><dd id="stone-asset"></dd></div>
+        <div><dt>IRON ORE asset</dt><dd id="iron-ore-asset"></dd></div>
         <div><dt>Tree value</dt><dd id="tree-value"></dd></div>
         <div><dt>Tree VTXO</dt><dd id="tree-outpoint"></dd></div>
         <div><dt>Last swing</dt><dd id="last-chop">None</dd></div>

@@ -1,8 +1,8 @@
-//! Chop construction and the durable journal for a prepared chop.
+//! Chop and axe-craft construction plus the durable prepared-chop journal.
 //!
-//! `prepare_chop` is the single host-neutral builder for the two-input /
-//! four-output swing transaction; the browser, e2e probes, and headless
-//! clients share it so the covenant shape lives in exactly one place.
+//! `prepare_chop` and `prepare_craft` are the host-neutral builders shared by
+//! the browser, e2e probes, and headless clients, so both covenant shapes live
+//! in exactly one place.
 
 use crate::arkade::VtxoRecord;
 use crate::keys::Keys;
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// Durable journal for one prepared swing, keyed to the exact transactions.
 /// Used by the browser host; headless callers persist their own recovery.
 #[cfg(any(target_arch = "wasm32", test))]
-const PENDING_CHOP_SCHEMA_VERSION: u32 = 1;
+const PENDING_CHOP_SCHEMA_VERSION: u32 = 2;
 
 #[cfg(any(target_arch = "wasm32", test))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,6 +35,7 @@ pub(crate) struct PendingChop {
     schema_version: u32,
     pub(crate) tree_id: u32,
     pub success: bool,
+    pub material: player::MaterialDrop,
     pub(crate) expected_txid: String,
     player_state_input: String,
     tree_input: String,
@@ -47,6 +48,7 @@ impl PendingChop {
     pub(crate) fn new(
         tree_id: u32,
         success: bool,
+        material: player::MaterialDrop,
         player_state_input: OutPoint,
         tree_input: OutPoint,
         ark_psbt: &Psbt,
@@ -56,6 +58,7 @@ impl PendingChop {
             schema_version: PENDING_CHOP_SCHEMA_VERSION,
             tree_id,
             success,
+            material,
             expected_txid: ark_psbt.unsigned_tx.compute_txid().to_string(),
             player_state_input: player_state_input.to_string(),
             tree_input: tree_input.to_string(),
@@ -139,11 +142,9 @@ pub struct PreparedWithdraw {
     pub checkpoint_txs: Vec<Psbt>,
 }
 
-/// Build the owner-authorized LOG withdrawal: player state plus a wallet dust
-/// input in; the LOG-depleted player state, the withdrawn LOG destination,
-/// extension, and anchor out. XP, sats, PLAYER_ID, and all packets stay in
-/// the state, so XP can never move. The destination is the owner's choice and
-/// is funded entirely by the wallet input.
+/// Build owner-authorized LOG withdrawal. XP, materials, sats, PLAYER_ID, and
+/// every player packet remain in the state; only LOG reaches the owner-chosen
+/// destination funded by the wallet input.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_withdraw(
     keys: &Keys,
@@ -238,16 +239,19 @@ pub fn prepare_withdraw(
             log_outputs,
         ),
     ];
-    let xp_balance = record.asset_amount(contract.xp_asset).unwrap_or(0);
-    if xp_balance > 0 {
-        groups.push(transfer_group(
-            contract.xp_asset,
-            vec![(
-                crate::protocol::WITHDRAW_STATE_INPUT_INDEX as u16,
-                xp_balance,
-            )],
-            vec![(crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX, xp_balance)],
-        ));
+    for asset_id in [
+        contract.xp_asset,
+        contract.stone_asset,
+        contract.iron_ore_asset,
+    ] {
+        let balance = record.asset_amount(asset_id).unwrap_or(0);
+        if balance > 0 {
+            groups.push(transfer_group(
+                asset_id,
+                vec![(crate::protocol::WITHDRAW_STATE_INPUT_INDEX as u16, balance)],
+                vec![(crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX, balance)],
+            ));
+        }
     }
     ark_core::asset::packet::add_asset_packet_to_psbt(&mut withdraw.ark_tx, &Packet { groups })
         .map_err(|error| anyhow!("attach withdraw asset packet: {error}"))?;
@@ -303,6 +307,172 @@ pub fn prepare_withdraw(
     })
 }
 
+/// One fully constructed and owner-signed axe upgrade.
+pub struct PreparedCraft {
+    pub recipe: player::AxeRecipe,
+    pub player_state_input: OutPoint,
+    pub ark_tx: Psbt,
+    pub checkpoint_txs: Vec<Psbt>,
+}
+
+/// Build an owner-authorized one-tier axe upgrade. The covenant burns exactly
+/// the selected recipe, preserves PLAYER_ID, XP, value, roll, and luck, and
+/// recreates the recursive player state with the next axe packet.
+pub fn prepare_craft(
+    keys: &Keys,
+    info: &ark_core::server::Info,
+    contract: &PlayerContract,
+    player_asset: AssetId,
+    record: &VtxoRecord,
+    previous_tx: &Transaction,
+    state: PlayerState,
+) -> Result<PreparedCraft> {
+    record.validate_creating_transaction(previous_tx)?;
+    crate::player::validate_player_state_record(record, contract, player_asset)?;
+    if crate::player::player_state_from_tx(previous_tx)? != Some(state) {
+        return Err(anyhow!(
+            "indexed player state packets do not match the creating transaction"
+        ));
+    }
+    record
+        .ensure_live(
+            crate::arkade::now_unix(),
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+        )
+        .context("player state input")?;
+    let recipe = state
+        .axe
+        .next_recipe()
+        .ok_or_else(|| anyhow!("the Iron Axe is already the highest tier"))?;
+    let xp_balance = record.asset_amount(contract.xp_asset).unwrap_or(0);
+    if xp_balance < recipe.required_xp_balance() {
+        return Err(anyhow!(
+            "{} requires Woodcutting level {}",
+            recipe.axe.display_name(),
+            recipe.required_level
+        ));
+    }
+    for (asset_id, required, label) in [
+        (contract.log_asset, recipe.log_cost, "LOG"),
+        (contract.stone_asset, recipe.stone_cost, "STONE"),
+        (contract.iron_ore_asset, recipe.iron_ore_cost, "IRON ORE"),
+    ] {
+        if record.asset_amount(asset_id).unwrap_or(0) < required {
+            return Err(anyhow!(
+                "{} requires {required} {label}",
+                recipe.axe.display_name()
+            ));
+        }
+    }
+
+    let control_block = contract
+        .vtxo
+        .get_spend_info(contract.craft_spend_script.clone())
+        .map_err(|error| anyhow!("craft spend info: {error}"))?;
+    let input = VtxoInput::new(
+        contract.craft_spend_script.clone(),
+        None,
+        control_block,
+        contract.vtxo.tapscripts(),
+        contract.vtxo.script_pubkey(),
+        Amount::from_sat(record.amount_sats),
+        record.outpoint,
+        record.assets.clone(),
+    );
+    let mut craft = build_offchain_transactions(
+        &[SendReceiver::bitcoin(
+            contract.vtxo.to_ark_address(),
+            Amount::from_sat(contract.dust_sats),
+        )],
+        &contract.vtxo.to_ark_address(),
+        &[input],
+        info,
+    )
+    .map_err(|error| anyhow!("build axe crafting transaction: {error}"))?;
+    if craft.ark_tx.unsigned_tx.output.len() != crate::protocol::CRAFT_OUTPUT_COUNT - 1 {
+        return Err(anyhow!(
+            "axe crafting builder produced an unexpected output count"
+        ));
+    }
+
+    let mut groups = vec![transfer_group(
+        player_asset,
+        vec![(crate::protocol::CRAFT_STATE_INPUT_INDEX as u16, 1)],
+        vec![(crate::protocol::CRAFT_STATE_OUTPUT_INDEX, 1)],
+    )];
+    for (asset_id, cost) in [
+        (contract.log_asset, recipe.log_cost),
+        (contract.xp_asset, 0),
+        (contract.stone_asset, recipe.stone_cost),
+        (contract.iron_ore_asset, recipe.iron_ore_cost),
+    ] {
+        let before = record.asset_amount(asset_id).unwrap_or(0);
+        if before == 0 {
+            continue;
+        }
+        let after = before
+            .checked_sub(cost)
+            .ok_or_else(|| anyhow!("axe recipe exceeds the player inventory"))?;
+        let outputs = if after == 0 {
+            Vec::new()
+        } else {
+            vec![(crate::protocol::CRAFT_STATE_OUTPUT_INDEX, after)]
+        };
+        groups.push(transfer_group(
+            asset_id,
+            vec![(crate::protocol::CRAFT_STATE_INPUT_INDEX as u16, before)],
+            outputs,
+        ));
+    }
+    ark_core::asset::packet::add_asset_packet_to_psbt(&mut craft.ark_tx, &Packet { groups })
+        .map_err(|error| anyhow!("attach axe crafting asset packet: {error}"))?;
+
+    let next_state = PlayerState {
+        luck: state.luck,
+        axe: recipe.axe,
+    };
+    let mut updated = craft.ark_tx.clone();
+    crate::txbuild::attach_previous_ark_transactions(
+        &mut updated,
+        &craft.checkpoint_txs,
+        [previous_tx],
+    )?;
+    crate::player::attach_player_state_packets(&mut updated, next_state)?;
+    let packet = ark_core::introspector::packet::Packet::new(vec![
+        ark_core::introspector::packet::IntrospectorEntry {
+            vin: crate::protocol::CRAFT_STATE_INPUT_INDEX as u16,
+            script: contract.craft_arkade_script.clone(),
+            witness: bitcoin::Witness::default(),
+        },
+    ])
+    .context("build axe crafting emulator packet")?;
+    ark_core::introspector::packet::add_packet_to_psbt(&mut updated, &packet)
+        .context("attach axe crafting emulator packet")?;
+    craft.ark_tx = updated;
+    if craft.ark_tx.unsigned_tx.output.len() != crate::protocol::CRAFT_OUTPUT_COUNT {
+        return Err(anyhow!(
+            "axe crafting transaction has an invalid output count"
+        ));
+    }
+    sign_ark_transaction(
+        |_, message| Ok(keys.sign_msg(&message)),
+        &mut craft.ark_tx,
+        crate::protocol::CRAFT_STATE_INPUT_INDEX,
+    )
+    .map_err(|error| anyhow!("sign axe crafting Ark input: {error}"))?;
+    sign_checkpoint_transaction(
+        |_, message| Ok(keys.sign_msg(&message)),
+        &mut craft.checkpoint_txs[crate::protocol::CRAFT_STATE_INPUT_INDEX],
+    )
+    .map_err(|error| anyhow!("sign axe crafting checkpoint: {error}"))?;
+    Ok(PreparedCraft {
+        recipe,
+        player_state_input: record.outpoint,
+        ark_tx: craft.ark_tx,
+        checkpoint_txs: craft.checkpoint_txs,
+    })
+}
+
 /// Expected outcome of a selected swing. The adversarial e2e build checks it
 /// before construction so a changed world fails fast instead of signing a
 /// stale transition.
@@ -324,6 +494,7 @@ pub enum ChopMutation {
     WrongLuckCredit,
     WrongLogDelta,
     WrongXpDelta,
+    WrongMaterialDelta,
     DoubleTreeMarker,
     ExtraOutput,
     WrongAnchor,
@@ -342,6 +513,7 @@ impl ChopMutation {
             "wrong-luck-credit" => Ok(Self::WrongLuckCredit),
             "wrong-log-delta" => Ok(Self::WrongLogDelta),
             "wrong-xp-delta" => Ok(Self::WrongXpDelta),
+            "wrong-material-delta" => Ok(Self::WrongMaterialDelta),
             "noncanonical-health-zero" => Ok(Self::NonCanonicalHealth),
             "double-tree-marker" => Ok(Self::DoubleTreeMarker),
             "extra-output" => Ok(Self::ExtraOutput),
@@ -459,6 +631,8 @@ pub struct ChopWorld<'a> {
     pub tree_asset: AssetId,
     pub log_asset: AssetId,
     pub xp_asset: AssetId,
+    pub stone_asset: AssetId,
+    pub iron_ore_asset: AssetId,
     pub dust_sats: u64,
     pub map_width: u16,
 }
@@ -482,6 +656,7 @@ pub struct TreeChopState<'a> {
 /// One fully constructed and player-signed swing.
 pub struct PreparedChop {
     pub success: bool,
+    pub material: player::MaterialDrop,
     pub player_state_input: OutPoint,
     pub tree_input: OutPoint,
     pub ark_tx: Psbt,
@@ -508,6 +683,14 @@ pub fn prepare_chop(
         .record
         .asset_amount(world.xp_asset)
         .unwrap_or(0);
+    let player_stone_before = player_state
+        .record
+        .asset_amount(world.stone_asset)
+        .unwrap_or(0);
+    let player_iron_ore_before = player_state
+        .record
+        .asset_amount(world.iron_ore_asset)
+        .unwrap_or(0);
     require_asset_amount(
         player_state.record,
         player_state.player_asset,
@@ -518,6 +701,13 @@ pub fn prepare_chop(
         require_nonzero_asset(tree.record, world.log_asset, "tree has no LOG reserve")?;
     let tree_xp_balance_before =
         require_nonzero_asset(tree.record, world.xp_asset, "tree has no XP")?;
+    let tree_stone_before =
+        require_nonzero_asset(tree.record, world.stone_asset, "tree has no STONE reserve")?;
+    let tree_iron_ore_before = require_nonzero_asset(
+        tree.record,
+        world.iron_ore_asset,
+        "tree has no IRON ORE reserve",
+    )?;
     if tree.health.value() == 0 {
         return Err(anyhow!("cannot chop a stump"));
     }
@@ -531,7 +721,10 @@ pub fn prepare_chop(
             .ensure_live(now, crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS)
             .with_context(|| format!("{label} input"))?;
     }
-    let (next_luck, success) = player_state.state.luck.advance(player_xp_balance_before);
+    let (next_luck, success) = player_state
+        .state
+        .luck
+        .advance(player_xp_balance_before, player_state.state.axe);
     let reward = u64::from(success);
     let log_reward = if matches!(mutation, ChopMutation::WrongLogDelta) {
         1 - reward
@@ -543,6 +736,14 @@ pub fn prepare_chop(
     } else {
         reward
     };
+    let material = player::material_drop(next_luck.roll, player_xp_balance_before, success);
+    let expected_stone_reward = u64::from(material == player::MaterialDrop::Stone);
+    let stone_reward = if matches!(mutation, ChopMutation::WrongMaterialDelta) {
+        1 - expected_stone_reward
+    } else {
+        expected_stone_reward
+    };
+    let iron_ore_reward = u64::from(material == player::MaterialDrop::IronOre);
     let tree_logs_after = tree_logs_before - log_reward;
     let player_logs_after = player_logs_before
         .checked_add(log_reward)
@@ -551,7 +752,18 @@ pub fn prepare_chop(
     let player_xp_balance_after = player_xp_balance_before
         .checked_add(xp_reward)
         .ok_or_else(|| anyhow!("player XP balance overflow"))?;
-    let next_state = PlayerState { luck: next_luck };
+    let tree_stone_after = tree_stone_before - stone_reward;
+    let player_stone_after = player_stone_before
+        .checked_add(stone_reward)
+        .ok_or_else(|| anyhow!("player STONE balance overflow"))?;
+    let tree_iron_ore_after = tree_iron_ore_before - iron_ore_reward;
+    let player_iron_ore_after = player_iron_ore_before
+        .checked_add(iron_ore_reward)
+        .ok_or_else(|| anyhow!("player IRON ORE balance overflow"))?;
+    let next_state = PlayerState {
+        luck: next_luck,
+        axe: player_state.state.axe,
+    };
 
     let inputs = [
         player::player_state_vtxo_input(
@@ -633,6 +845,20 @@ pub fn prepare_chop(
         ),
         transfer_group(world.log_asset, log_inputs, log_outputs),
         transfer_group(world.xp_asset, xp_inputs, xp_outputs),
+        player_tree_transfer_group(
+            world.stone_asset,
+            player_stone_before,
+            tree_stone_before,
+            player_stone_after,
+            tree_stone_after,
+        ),
+        player_tree_transfer_group(
+            world.iron_ore_asset,
+            player_iron_ore_before,
+            tree_iron_ore_before,
+            player_iron_ore_after,
+            tree_iron_ore_after,
+        ),
     ];
     mutation.mutate_groups(&mut groups, world.tree_asset);
     ark_core::asset::packet::add_asset_packet_to_psbt(&mut chop.ark_tx, &Packet { groups })
@@ -664,11 +890,37 @@ pub fn prepare_chop(
     .map_err(|error| anyhow!("sign player checkpoint: {error}"))?;
     Ok(PreparedChop {
         success,
+        material,
         player_state_input: player_state.record.outpoint,
         tree_input: tree.record.outpoint,
         ark_tx: chop.ark_tx,
         checkpoint_txs: chop.checkpoint_txs,
     })
+}
+
+fn player_tree_transfer_group(
+    asset_id: AssetId,
+    player_before: u64,
+    tree_before: u64,
+    player_after: u64,
+    tree_after: u64,
+) -> AssetGroup {
+    let mut inputs = Vec::with_capacity(2);
+    if player_before > 0 {
+        inputs.push((
+            crate::protocol::PLAYER_STATE_INPUT_INDEX as u16,
+            player_before,
+        ));
+    }
+    inputs.push((crate::protocol::TREE_INPUT_INDEX as u16, tree_before));
+    let mut outputs = Vec::with_capacity(2);
+    if player_after > 0 {
+        outputs.push((crate::protocol::PLAYER_STATE_OUTPUT_INDEX, player_after));
+    }
+    if tree_after > 0 {
+        outputs.push((crate::protocol::TREE_OUTPUT_INDEX, tree_after));
+    }
+    transfer_group(asset_id, inputs, outputs)
 }
 
 pub fn transfer_group(
@@ -842,6 +1094,7 @@ mod tests {
         let pending = PendingChop::new(
             417,
             true,
+            player::MaterialDrop::Stone,
             OutPoint::null(),
             OutPoint::null(),
             &ark,
@@ -852,6 +1105,7 @@ mod tests {
         assert_eq!(decoded.txid().unwrap(), ark.unsigned_tx.compute_txid());
         assert_eq!(decoded.player_state_input().unwrap(), OutPoint::null());
         assert_eq!(decoded.tree_input().unwrap(), OutPoint::null());
+        assert_eq!(decoded.material, player::MaterialDrop::Stone);
         assert_eq!(decoded_ark, ark);
         assert_eq!(decoded_checkpoints, checkpoints);
     }
@@ -868,6 +1122,7 @@ mod tests {
         let pending = PendingChop::new(
             417,
             false,
+            player::MaterialDrop::None,
             OutPoint::null(),
             OutPoint::null(),
             &ark,
@@ -878,6 +1133,9 @@ mod tests {
         assert!(PendingChop::from_json(&json.to_string()).is_err());
         json["expectedTxid"] =
             serde_json::Value::String(ark.unsigned_tx.compute_txid().to_string());
+        json["schemaVersion"] = serde_json::Value::from(1);
+        assert!(PendingChop::from_json(&json.to_string()).is_err());
+        json["schemaVersion"] = serde_json::Value::from(PENDING_CHOP_SCHEMA_VERSION);
         json["checkpointPsbts"].as_array_mut().unwrap().pop();
         assert!(PendingChop::from_json(&json.to_string()).is_err());
     }

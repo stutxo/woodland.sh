@@ -113,6 +113,21 @@ function assertLogSupply(state, expected, label) {
   assert.equal(total, expected, `${label}: fixed LOG supply is ${total}`);
 }
 
+function assertMaterialSupply(state, expectedStone, expectedIronOre, label) {
+  const treeStone = state.trees.reduce((sum, tree) => sum + tree.stoneRemaining, 0);
+  const treeIronOre = state.trees.reduce((sum, tree) => sum + tree.ironOreRemaining, 0);
+  assert.equal(
+    treeStone + state.playerStone,
+    expectedStone,
+    `${label}: fixed STONE supply is ${treeStone + state.playerStone}`,
+  );
+  assert.equal(
+    treeIronOre + state.playerIronOre,
+    expectedIronOre,
+    `${label}: fixed IRON ORE supply is ${treeIronOre + state.playerIronOre}`,
+  );
+}
+
 function assertXpAccounting(state, expected, label) {
   const total = state.seasonXpRemaining + state.playerXp;
   assert.equal(total, expected, `${label}: remaining plus earned XP is ${total}`);
@@ -165,6 +180,8 @@ async function main() {
     const treeCount = manifest.trees.length;
     const totalLogs = manifest.logReservePerTree * treeCount;
     const totalXp = manifest.xpPerTree * manifest.woodcuttingXpPerLog * treeCount;
+    const totalStone = manifest.stoneReservePerTree * treeCount;
+    const totalIronOre = manifest.ironOreReservePerTree * treeCount;
     const chance = `${manifest.baseLogDropBasisPoints / 100}%`;
     const session = await request('POST', '/session', {
       capabilities: {
@@ -218,6 +235,15 @@ async function main() {
         bagLogs: document.getElementById('player-logs')?.textContent || '',
         logSlotLabel: document.getElementById('log-slot')?.getAttribute('aria-label') || '',
         logIcon: document.querySelector('#log-slot .bag-item')?.textContent || '',
+        bagStone: document.getElementById('player-stone')?.textContent || '',
+        stoneSlotLabel: document.getElementById('stone-slot')?.getAttribute('aria-label') || '',
+        bagIronOre: document.getElementById('player-iron-ore')?.textContent || '',
+        ironOreSlotLabel: document.getElementById('iron-ore-slot')?.getAttribute('aria-label') || '',
+        bagAxe: document.getElementById('player-axe')?.textContent || '',
+        axeSlotLabel: document.getElementById('axe-slot')?.getAttribute('aria-label') || '',
+        craftAxeText: document.getElementById('craft-axe')?.textContent || '',
+        craftAxeDisabled: Boolean(document.getElementById('craft-axe')?.disabled),
+        axeRecipeText: document.getElementById('axe-recipe')?.textContent || '',
         inventorySlots: document.querySelectorAll('.bag-slots > .bag-slot').length,
         emptySlots: document.querySelectorAll('.bag-slots > .empty-slot').length,
         inventoryRows: getComputedStyle(document.querySelector('.bag-slots')).gridTemplateRows
@@ -276,6 +302,9 @@ async function main() {
       assert.equal(result.state.playerStateOutpoint, before.state.playerStateOutpoint, label);
       assert.equal(result.state.playerXp, before.state.playerXp, label);
       assert.equal(result.state.playerLogs, before.state.playerLogs, label);
+      assert.equal(result.state.playerStone, before.state.playerStone, label);
+      assert.equal(result.state.playerIronOre, before.state.playerIronOre, label);
+      assert.equal(result.state.playerAxe, before.state.playerAxe, label);
       assert.equal(afterTree.treeOutpoint, beforeTree.treeOutpoint, label);
       assert.equal(afterTree.health, beforeTree.health, label);
       return { ...before, state: result.state };
@@ -293,6 +322,9 @@ async function main() {
       assert.equal(result.state.playerStateOutpoint, before.state.playerStateOutpoint, label);
       assert.equal(result.state.playerXp, before.state.playerXp, label);
       assert.equal(result.state.playerLogs, before.state.playerLogs, label);
+      assert.equal(result.state.playerStone, before.state.playerStone, label);
+      assert.equal(result.state.playerIronOre, before.state.playerIronOre, label);
+      assert.equal(result.state.playerAxe, before.state.playerAxe, label);
       const afterTree = result.state.trees.find((tree) => tree.treeId === treeId);
       assert.equal(
         afterTree.treeOutpoint,
@@ -315,6 +347,9 @@ async function main() {
       assert.equal(result.state.playerStateOutpoint, before.state.playerStateOutpoint, label);
       assert.equal(result.state.playerXp, before.state.playerXp, label);
       assert.equal(result.state.playerLogs, before.state.playerLogs, label);
+      assert.equal(result.state.playerStone, before.state.playerStone, label);
+      assert.equal(result.state.playerIronOre, before.state.playerIronOre, label);
+      assert.equal(result.state.playerAxe, before.state.playerAxe, label);
       const afterTree = result.state.trees.find((tree) => tree.treeId === treeId);
       assert.equal(afterTree.treeOutpoint, beforeTree.treeOutpoint, label);
       assert.equal(afterTree.health, beforeTree.health, label);
@@ -348,11 +383,16 @@ async function main() {
       assert.equal(refreshed.state.playerAsset, snapshot.playerAsset, label);
       assert.equal(refreshed.state.playerXp, snapshot.playerXp, label);
       assert.equal(refreshed.state.playerLogs, snapshot.playerLogs, label);
+      assert.equal(refreshed.state.playerStone, snapshot.playerStone, label);
+      assert.equal(refreshed.state.playerIronOre, snapshot.playerIronOre, label);
+      assert.equal(refreshed.state.playerAxe, snapshot.playerAxe, label);
       assert.equal(refreshed.state.playerLuckCredit, snapshot.playerLuckCredit, label);
       assert.equal(refreshed.state.playerLevel, snapshot.playerLevel, label);
       assert.equal(currentTree.health, tree.health, label);
       assert.equal(currentTree.logReserveRemaining, tree.logReserveRemaining, label);
       assert.equal(currentTree.xpRemaining, tree.xpRemaining, label);
+      assert.equal(currentTree.stoneRemaining, tree.stoneRemaining, label);
+      assert.equal(currentTree.ironOreRemaining, tree.ironOreRemaining, label);
       assert.equal(currentTree.nextRollBucket, tree.nextRollBucket, label);
       assert.equal(currentTree.nextDrop, tree.nextDrop, label);
       return { result: null, refreshed };
@@ -416,6 +456,9 @@ async function main() {
       );
       assert.equal(after.state.playerXp, before.state.playerXp, label);
       assert.equal(after.state.playerLogs, before.state.playerLogs, label);
+      assert.equal(after.state.playerStone, before.state.playerStone, label);
+      assert.equal(after.state.playerIronOre, before.state.playerIronOre, label);
+      assert.equal(after.state.playerAxe, before.state.playerAxe, label);
       assert.equal(after.state.playerAsset, before.state.playerAsset, label);
       assert.deepEqual(
         after.state.trees.map((tree) => tree.treeOutpoint),
@@ -443,9 +486,14 @@ async function main() {
         180_000,
       );
       const suffix = after.autoChop.swings === 1 ? 'swing' : 'swings';
+      const materialMessage = after.autoChop.material === 'stone'
+        ? ' You also find STONE.'
+        : after.autoChop.material === 'ironOre'
+          ? ' You also find IRON ORE.'
+          : '';
       assert.equal(
         after.status,
-        `You get a LOG and ${manifest.woodcuttingXpPerLog} Woodcutting XP after ${after.autoChop.swings} ${suffix}.`,
+        `You get a LOG and ${manifest.woodcuttingXpPerLog} Woodcutting XP after ${after.autoChop.swings} ${suffix}.${materialMessage}`,
       );
       assert.ok(
         after.autoChop.swings <= 11,
@@ -461,10 +509,18 @@ async function main() {
         .map((effect) => effect.type);
       assert.ok(effects.includes('chop'), `${label}: chop flash was not emitted`);
       assert.equal(effects.at(-1), 'log', `${label}: LOG flash was not emitted`);
-      assert.equal(
-        after.state.trees.find((candidate) => candidate.treeId === tree.treeId).health,
-        tree.health - 1,
+      const material = after.autoChop.material;
+      assert.ok(['none', 'stone', 'ironOre'].includes(material), `${label}: material enum`);
+      const stoneReward = Number(material === 'stone');
+      const ironOreReward = Number(material === 'ironOre');
+      const currentTree = after.state.trees.find(
+        (candidate) => candidate.treeId === tree.treeId,
       );
+      assert.equal(currentTree.health, tree.health - 1);
+      assert.equal(currentTree.stoneRemaining, tree.stoneRemaining - stoneReward);
+      assert.equal(currentTree.ironOreRemaining, tree.ironOreRemaining - ironOreReward);
+      assert.equal(after.state.playerStone, before.state.playerStone + stoneReward);
+      assert.equal(after.state.playerIronOre, before.state.playerIronOre + ironOreReward);
       assert.equal(
         Math.abs(after.player.x - tree.x) + Math.abs(after.player.y - tree.y),
         1,
@@ -474,14 +530,76 @@ async function main() {
         (sum, candidate) => sum + candidate.logReserveRemaining,
         before.state.playerLogs,
       ), label);
+      assertMaterialSupply(after.state, totalStone, totalIronOre, label);
       console.log(
         `continuous chop tree ${tree.treeId}: LOG after ${after.autoChop.swings} swings`,
       );
       return after;
     };
+    const craftWoodenAxe = async (before, label) => {
+      assert.equal(before.state.playerAxe, 'none', `${label}: initial axe`);
+      assert.equal(before.state.nextAxeRecipe?.axe, 'wooden', `${label}: next recipe`);
+      assert.equal(before.state.craftAxeReady, true, `${label}: recipe readiness`);
+      assert.ok(before.state.playerLogs >= 1, `${label}: Wooden Axe requires one LOG`);
+      const treeOutpoints = before.state.trees.map((tree) => tree.treeOutpoint);
+      const result = await executeAsync(`
+        const done = arguments[arguments.length - 1];
+        globalThis.__WOODLAND_E2E_CRAFT_AXE()
+          .then((state) => done({ state }))
+          .catch((error) => done({ error: String(error) }));
+      `);
+      assert.equal(result.error, undefined, `${label}: ${result.error}`);
+      const after = await inspect();
+      assert.equal(after.state.playerAxe, 'wooden', `${label}: equipped axe`);
+      assert.equal(after.state.playerLogs, before.state.playerLogs - 1, `${label}: LOG burn`);
+      assert.equal(after.state.playerXp, before.state.playerXp, `${label}: XP preservation`);
+      assert.equal(after.state.playerStone, before.state.playerStone, `${label}: STONE preservation`);
+      assert.equal(
+        after.state.playerIronOre,
+        before.state.playerIronOre,
+        `${label}: IRON ORE preservation`,
+      );
+      assert.equal(
+        after.state.playerLuckCredit,
+        before.state.playerLuckCredit,
+        `${label}: luck preservation`,
+      );
+      assert.equal(
+        after.state.logDropBasisPoints,
+        before.state.logDropBasisPoints + 200,
+        `${label}: Wooden Axe bonus`,
+      );
+      assert.equal(after.state.nextAxeRecipe?.axe, 'stone', `${label}: tier progression`);
+      assert.equal(after.state.craftAxeReady, false, `${label}: next recipe must remain locked`);
+      assert.notEqual(after.state.playerStateOutpoint, before.state.playerStateOutpoint, label);
+      assert.deepEqual(
+        after.state.trees.map((tree) => tree.treeOutpoint),
+        treeOutpoints,
+        `${label}: crafting touched a tree`,
+      );
+      assert.equal(after.bagAxe, 'Wooden', `${label}: axe inventory label`);
+      assert.equal(after.axeSlotLabel, 'Wooden Axe equipped', `${label}: axe accessibility label`);
+      assert.equal(after.craftAxeText, 'Craft Stone Axe', `${label}: next craft button`);
+      assert.equal(after.craftAxeDisabled, true, `${label}: locked next craft button`);
+      assertLogSupply(after.state, totalLogs - 1, label);
+      assertMaterialSupply(after.state, totalStone, totalIronOre, label);
+      assertXpAccounting(after.state, totalXp, label);
+
+      const rejected = await executeAsync(`
+        const done = arguments[arguments.length - 1];
+        globalThis.__WOODLAND_E2E_CRAFT_AXE()
+          .then(() => done({ ok: true }))
+          .catch((error) => done({ rejection: String(error) }));
+      `);
+      assert.match(rejected.rejection || '', /requires Woodcutting level 5/);
+      const unchanged = await inspect();
+      assert.equal(unchanged.state.playerStateOutpoint, after.state.playerStateOutpoint, label);
+      assert.equal(unchanged.state.playerAxe, 'wooden', label);
+      return unchanged;
+    };
     // The first-party game deliberately has no withdrawal control. Keep
     // protocol/API coverage for a future marketplace or third-party client.
-    const runWithdrawStage = async (before, label) => {
+    const runWithdrawStage = async (before, label, expectedLogSupply = totalLogs) => {
       assert.ok(before.state.playerLogs >= 1, `${label}: withdraw needs at least 1 LOG`);
       const walletOutpointsBefore = new Set(
         before.state.walletVtxos.map((vtxo) => vtxo.outpoint),
@@ -513,6 +631,9 @@ async function main() {
       );
       const logsBefore = view.state.playerLogs;
       const xpBefore = view.state.playerXp;
+      const stoneBefore = view.state.playerStone;
+      const ironOreBefore = view.state.playerIronOre;
+      const axeBefore = view.state.playerAxe;
       // Soulbound proxy: XP has no withdrawal path at all — the withdraw
       // covenant pins the XP balance inside the player state (covered by the
       // native withdraw-leaf unit tests) and the WASM exposes no XP-moving
@@ -533,6 +654,9 @@ async function main() {
       const unchanged = await inspect();
       assert.equal(unchanged.state.playerLogs, logsBefore, label);
       assert.equal(unchanged.state.playerXp, xpBefore, label);
+      assert.equal(unchanged.state.playerStone, stoneBefore, label);
+      assert.equal(unchanged.state.playerIronOre, ironOreBefore, label);
+      assert.equal(unchanged.state.playerAxe, axeBefore, label);
       assert.equal(
         unchanged.state.playerStateOutpoint,
         view.state.playerStateOutpoint,
@@ -574,12 +698,20 @@ async function main() {
         `${label}: withdrawn LOG amount`,
       );
       assert.equal(view.state.playerXp, xpBefore, `${label}: XP must be soulbound`);
+      assert.equal(view.state.playerStone, stoneBefore, `${label}: STONE must stay soulbound`);
+      assert.equal(
+        view.state.playerIronOre,
+        ironOreBefore,
+        `${label}: IRON ORE must stay soulbound`,
+      );
+      assert.equal(view.state.playerAxe, axeBefore, `${label}: axe must be preserved`);
       assert.equal(
         view.state.walletSats,
         before.state.walletSats + 330,
         `${label}: withdraw must not create or destroy sats`,
       );
-      assertLogSupply(view.state, totalLogs, label);
+      assertLogSupply(view.state, expectedLogSupply, label);
+      assertMaterialSupply(view.state, totalStone, totalIronOre, label);
       assertXpAccounting(view.state, totalXp, label);
       return view;
     };
@@ -610,10 +742,25 @@ async function main() {
     assert.ok(initial.state.trees.every(
       (tree) => tree.xpRemaining === manifest.xpPerTree * manifest.woodcuttingXpPerLog,
     ));
+    assert.deepEqual(
+      [...new Set(initial.state.trees.map((tree) => tree.stoneRemaining))],
+      [manifest.stoneReservePerTree],
+      'initial STONE reserves',
+    );
+    assert.deepEqual(
+      [...new Set(initial.state.trees.map((tree) => tree.ironOreRemaining))],
+      [manifest.ironOreReservePerTree],
+      'initial IRON ORE reserves',
+    );
     assert.ok(initial.state.trees.every((tree) => tree.depleted === false));
     assert.equal(initial.state.playerLogs, 0);
     assert.equal(initial.state.fundingRequiredSats, initial.state.dustSats);
     assert.equal(initial.state.playerXp, 0);
+    assert.equal(initial.state.playerStone, 0);
+    assert.equal(initial.state.playerIronOre, 0);
+    assert.equal(initial.state.playerAxe, 'none');
+    assert.equal(initial.state.nextAxeRecipe, null);
+    assert.equal(initial.state.craftAxeReady, false);
     assert.equal(initial.state.woodcuttingXpPerLog, 25);
     assert.equal(initial.state.playerLevel, 1);
     assert.equal(initial.state.playerNextLevelXp, 83);
@@ -629,10 +776,13 @@ async function main() {
         initial.state.treeAsset,
         initial.state.logAsset,
         initial.state.xpAsset,
+        initial.state.stoneAsset,
+        initial.state.ironOreAsset,
       ]).size,
-      3,
+      5,
     );
     assertLogSupply(initial.state, totalLogs, 'initial world');
+    assertMaterialSupply(initial.state, totalStone, totalIronOre, 'initial world');
     assertXpAccounting(initial.state, totalXp, 'initial world');
     assertTreeValue(initial.state, 'initial world');
     assert.equal(manifest.schemaVersion, 3, 'world manifest must be schema 3');
@@ -649,12 +799,54 @@ async function main() {
       [1_154, 4_470, 13_363, 37_224, 101_333],
     );
     assert.equal(manifest.maxLevelLogDropBasisPoints, 3_000);
+    assert.equal(manifest.maxLogDropBasisPoints, 3_800);
+    assert.equal(manifest.stoneDropBasisPoints, 1_000);
+    assert.equal(manifest.ironOreDropBasisPoints, 200);
+    assert.equal(manifest.ironOreUnlockLevel, 10);
+    assert.deepEqual(manifest.axeRecipes, [
+      { axe: 'wooden', requiredLevel: 1, logCost: 1, stoneCost: 0, ironOreCost: 0 },
+      { axe: 'stone', requiredLevel: 5, logCost: 2, stoneCost: 2, ironOreCost: 0 },
+      { axe: 'iron', requiredLevel: 15, logCost: 5, stoneCost: 0, ironOreCost: 2 },
+    ]);
     assert.equal(manifest.luckWindowBasisPoints, 10_000);
     assert.equal(manifest.initialLuckCredit, 8_000);
     assert.equal(manifest.trees.length, 420, 'world must contain exactly 420 trees');
     assert.equal(manifest.activeLogsPerTree, 10);
     assert.equal(manifest.logReservePerTree, 50_000);
     assert.equal(manifest.xpPerTree, 50_000);
+    assert.equal(manifest.stoneReservePerTree, 50_000);
+    assert.equal(manifest.ironOreReservePerTree, 50_000);
+    assert.match(manifest.stoneAsset, /^[0-9a-f]{68}$/);
+    assert.match(manifest.ironOreAsset, /^[0-9a-f]{68}$/);
+    assert.equal(manifest.stoneAsset.slice(0, 64), manifest.genesisTxid);
+    assert.equal(manifest.ironOreAsset.slice(0, 64), manifest.genesisTxid);
+    assert.equal(manifest.stoneAsset.slice(64), '0300');
+    assert.equal(manifest.ironOreAsset.slice(64), '0400');
+    for (const [assetId, label, supply] of [
+      [manifest.treeAsset, 'TREE', treeCount],
+      [manifest.logAsset, 'LOG', totalLogs],
+      [manifest.xpAsset, 'XP', manifest.xpPerTree * treeCount],
+      [manifest.stoneAsset, 'STONE', totalStone],
+      [manifest.ironOreAsset, 'IRON ORE', totalIronOre],
+    ]) {
+      const response = await fetch(`${ARKD}/v1/indexer/asset/${assetId}`);
+      assert.equal(response.ok, true, `${label} asset query`);
+      const details = await response.json();
+      assert.equal(details.assetId, assetId, `${label} asset ID`);
+      assert.equal(details.supply, String(supply), `${label} fixed supply`);
+      assert.equal(details.controlAsset || '', '', `${label} control asset`);
+      const metadata = decodeAssetMetadata(details.metadata);
+      assert.deepEqual(
+        [...metadata.keys()],
+        ['game', 'protocol', 'ruleset', 'asset', 'deployer', 'rollover'],
+      );
+      assert.equal(metadata.get('game'), 'woodland.sh');
+      assert.equal(metadata.get('protocol'), String(manifest.protocolVersion));
+      assert.equal(metadata.get('ruleset'), manifest.rulesetId);
+      assert.equal(metadata.get('asset'), label);
+      assert.equal(metadata.get('deployer'), manifest.deployerSigner);
+      assert.equal(metadata.get('rollover'), manifest.rolloverSigner);
+    }
     for (const removed of [
       'treeRetireArkadeScript',
       'vaultScript',
@@ -709,6 +901,9 @@ async function main() {
         && Boolean(value.state.playerAsset)
         && value.state.playerLevel === 1
         && value.state.playerNextLevelXp === 83
+        && value.state.playerAxe === 'none'
+        && value.state.nextAxeRecipe?.axe === 'wooden'
+        && !value.state.craftAxeReady
         && !value.state.activationReady
         && value.state.logDropBasisPoints === manifest.baseLogDropBasisPoints
         && value.state.walletSats === 330
@@ -724,8 +919,10 @@ async function main() {
         deployed.state.treeAsset,
         deployed.state.logAsset,
         deployed.state.xpAsset,
+        deployed.state.stoneAsset,
+        deployed.state.ironOreAsset,
       ]).size,
-      4,
+      6,
     );
     const playerAssetResponse = await fetch(
       `http://127.0.0.1:7070/v1/indexer/asset/${playerAsset}`,
@@ -761,11 +958,23 @@ async function main() {
       initial.state.trees.map((tree) => tree.treeOutpoint),
     );
     assert.equal(deployed.state.playerLogs, 0);
+    assert.equal(deployed.state.playerStone, 0);
+    assert.equal(deployed.state.playerIronOre, 0);
+    assert.equal(deployed.state.playerAxe, 'none');
     assert.equal(deployed.bagLogs, '0');
     assert.equal(deployed.logSlotLabel, '0 LOG in inventory');
     assert.equal(deployed.logIcon, '🪵');
+    assert.equal(deployed.bagStone, '0');
+    assert.equal(deployed.stoneSlotLabel, '0 STONE in inventory');
+    assert.equal(deployed.bagIronOre, '0');
+    assert.equal(deployed.ironOreSlotLabel, '0 IRON ORE in inventory');
+    assert.equal(deployed.bagAxe, 'None');
+    assert.equal(deployed.axeSlotLabel, 'No Axe equipped');
+    assert.equal(deployed.craftAxeText, 'Craft Wooden Axe');
+    assert.equal(deployed.craftAxeDisabled, true);
+    assert.equal(deployed.axeRecipeText, 'Level 1 · 1 LOG');
     assert.equal(deployed.inventorySlots, 9);
-    assert.equal(deployed.emptySlots, 8);
+    assert.equal(deployed.emptySlots, 5);
     assert.equal(deployed.inventoryRows, 3);
     assert.equal(deployed.bagWidth, 262);
     assert.equal(deployed.bagStats, 0);
@@ -774,6 +983,7 @@ async function main() {
     assert.match(deployed.statsText, /0 Woodcutting XP/);
     assert.match(deployed.statsText, new RegExp(`LOG drop chance ${chance}`));
     assertLogSupply(deployed.state, totalLogs, 'activated player');
+    assertMaterialSupply(deployed.state, totalStone, totalIronOre, 'activated player');
     assertXpAccounting(deployed.state, totalXp, 'activated player');
     assertTreeValue(deployed.state, 'activated player');
     const playerRewardView = await executeAsync(`
@@ -950,6 +1160,7 @@ async function main() {
       ['wrong-luck-credit', 'wrong luck credit successor must be rejected'],
       ['wrong-log-delta', 'LOG delta inconsistent with the reward bit must be rejected'],
       ['wrong-xp-delta', 'XP transfer inconsistent with the reward bit must be rejected'],
+      ['wrong-material-delta', 'material transfer inconsistent with the roll must be rejected'],
       ['asset-metadata', 'transfer metadata mutation must be rejected'],
       ['player-marker-metadata', 'PLAYER_ID transfer metadata must be rejected'],
       ['asset-control', 'transfer control-asset mutation must be rejected'],
@@ -1019,6 +1230,14 @@ async function main() {
       );
       const success = chopped.state.lastAttempt?.success === true;
       assert.equal(success, beforeTree.nextDrop, 'published next-drop prediction must be exact');
+      const material = chopped.state.lastAttempt?.material;
+      assert.ok(['none', 'stone', 'ironOre'].includes(material), 'published material enum');
+      if (!success) assert.equal(material, 'none', 'a miss cannot award materials');
+      if (before.playerLevel < manifest.ironOreUnlockLevel) {
+        assert.notEqual(material, 'ironOre', 'IRON ORE unlocked before level 10');
+      }
+      const stoneReward = Number(material === 'stone');
+      const ironOreReward = Number(material === 'ironOre');
       if (success) hits += 1;
       else sawMiss = true;
       const current = chopped.state.trees.find((tree) => tree.treeId === firstTree.treeId);
@@ -1031,6 +1250,16 @@ async function main() {
         current.xpRemaining,
         beforeTree.xpRemaining - Number(success) * manifest.woodcuttingXpPerLog,
       );
+      assert.equal(
+        current.stoneRemaining,
+        beforeTree.stoneRemaining - stoneReward,
+      );
+      assert.equal(
+        current.ironOreRemaining,
+        beforeTree.ironOreRemaining - ironOreReward,
+      );
+      assert.equal(chopped.state.playerStone, before.playerStone + stoneReward);
+      assert.equal(chopped.state.playerIronOre, before.playerIronOre + ironOreReward);
       assert.equal(chopped.state.playerLogs, hits);
       assert.equal(
         chopped.state.playerXp,
@@ -1052,19 +1281,26 @@ async function main() {
       assertRenewalFeeWallet(chopped.state, `swing ${attempts}`);
       assert.equal(current.valueSats, chopped.state.fullTreeValueSats);
       assertLogSupply(chopped.state, totalLogs, `swing ${attempts}`);
+      assertMaterialSupply(
+        chopped.state,
+        totalStone,
+        totalIronOre,
+        `swing ${attempts}`,
+      );
       assertXpAccounting(chopped.state, totalXp, `swing ${attempts}`);
       assertTreeValue(chopped.state, `swing ${attempts}`);
       assertFixedSats(chopped.state, fixedSats, `swing ${attempts}`);
       console.log(
-        `tree ${firstTree.treeId} swing ${attempts}: ${success ? 'LOG' : 'miss'} ${current.lastAttemptTxid}`,
+        `tree ${firstTree.treeId} swing ${attempts}: ${success ? 'LOG' : 'miss'}`
+          + `${material === 'none' ? '' : ` + ${material}`} ${current.lastAttemptTxid}`,
       );
     }
     assert.ok(
       attempts >= TARGET_HITS && attempts <= TARGET_HITS * 11,
       'drop sequence exceeded the luck-protection bound',
     );
-    assert.ok(sawMiss, 'the bounded luck sequence must exercise at least one miss');
     if (FULL_E2E) {
+      assert.ok(sawMiss, 'the bounded luck sequence must exercise at least one miss');
       assert.equal(checkedNonzeroXpMutation, true, 'nonzero-XP mutation probe did not run');
     }
     chopped = await assertPlayerRenewed(chopped, 'nonzero-XP player renewal');
@@ -1085,7 +1321,11 @@ async function main() {
         chopped.logSlotLabel,
         `${chopped.state.playerLogs} LOG in inventory`,
       );
-      chopped = await runWithdrawStage(chopped, 'smoke LOG withdraw');
+      assert.equal(chopped.state.craftAxeReady, true);
+      assert.equal(chopped.craftAxeDisabled, false);
+      chopped = await craftWoodenAxe(chopped, 'Wooden Axe crafting');
+      assert.equal(chopped.bagLogs, String(chopped.state.playerLogs));
+      chopped = await runWithdrawStage(chopped, 'smoke LOG withdraw', totalLogs - 1);
       console.log(JSON.stringify({
         profile: E2E_PROFILE,
         address: chopped.state.address,
@@ -1093,6 +1333,9 @@ async function main() {
         rollAdvances: attempts,
         playerXp: chopped.state.playerXp,
         playerLogs: chopped.state.playerLogs,
+        playerStone: chopped.state.playerStone,
+        playerIronOre: chopped.state.playerIronOre,
+        playerAxe: chopped.state.playerAxe,
       }));
       return;
     }
@@ -1114,6 +1357,12 @@ async function main() {
     );
     assert.equal(partialTree.depleted, false);
     assertLogSupply(chopped.state, totalLogs, 'partial first-tree harvest');
+    assertMaterialSupply(
+      chopped.state,
+      totalStone,
+      totalIronOre,
+      'partial first-tree harvest',
+    );
     assertXpAccounting(chopped.state, totalXp, 'partial first-tree harvest');
     assertTreeValue(chopped.state, 'partial first-tree harvest');
     assertFixedSats(chopped.state, fixedSats, 'partial first-tree harvest');
@@ -1187,6 +1436,7 @@ async function main() {
     }
     assertRenewalFeeWallet(chopped.state, 'second tree chop');
     assertLogSupply(chopped.state, totalLogs, 'second tree chop');
+    assertMaterialSupply(chopped.state, totalStone, totalIronOre, 'second tree chop');
     assertXpAccounting(chopped.state, totalXp, 'second tree chop');
     assertTreeValue(chopped.state, 'second tree chop');
     assertFixedSats(chopped.state, fixedSats, 'second tree chop');
@@ -1231,13 +1481,15 @@ async function main() {
         && value.state.trees.find((tree) => tree.treeId === secondTree.treeId)?.health === 9,
     );
     assertLogSupply(chopped.state, totalLogs, 'final reload');
+    assertMaterialSupply(chopped.state, totalStone, totalIronOre, 'final reload');
     assertXpAccounting(chopped.state, totalXp, 'final reload');
     assert.equal(chopped.state.playerAsset, playerAsset);
     assertTreeValue(chopped.state, 'final reload');
     assertFixedSats(chopped.state, fixedSats, 'final reload');
     await execute('globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT();');
     chopped = await assertAutoChopUntilLog(chopped, 'continuous chopping UX after full profile');
-    chopped = await runWithdrawStage(chopped, 'full LOG withdraw');
+    chopped = await craftWoodenAxe(chopped, 'Wooden Axe crafting after full profile');
+    chopped = await runWithdrawStage(chopped, 'full LOG withdraw', totalLogs - 1);
     console.log(JSON.stringify({
       profile: E2E_PROFILE,
       address: chopped.state.address,
@@ -1245,11 +1497,16 @@ async function main() {
       treeAsset: chopped.state.treeAsset,
       logAsset: chopped.state.logAsset,
       xpAsset: chopped.state.xpAsset,
+      stoneAsset: chopped.state.stoneAsset,
+      ironOreAsset: chopped.state.ironOreAsset,
       playerAsset: chopped.state.playerAsset,
       playerXp: chopped.state.playerXp,
       playerLevel: chopped.state.playerLevel,
       trees: chopped.state.trees.map((tree) => ({ id: tree.treeId, health: tree.health })),
       playerLogs: chopped.state.playerLogs,
+      playerStone: chopped.state.playerStone,
+      playerIronOre: chopped.state.playerIronOre,
+      playerAxe: chopped.state.playerAxe,
     }));
   } catch (error) {
     console.error(error);

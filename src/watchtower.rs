@@ -86,6 +86,8 @@ pub async fn renew_player(
         world.tree_asset,
         world.log_asset,
         world.xp_asset,
+        world.stone_asset,
+        world.iron_ore_asset,
         services.params.dust_sats,
         &world.contract.vtxo.script_pubkey(),
     )?;

@@ -59,6 +59,8 @@ struct World {
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
     rollover_signer: bitcoin::XOnlyPublicKey,
     contract: TreeContract,
     genesis_txid: Txid,
@@ -153,6 +155,11 @@ struct AppSnapshot {
     player_rollover_margin_seconds: Option<i64>,
     log_drop_basis_points: u64,
     player_logs: u64,
+    player_stone: u64,
+    player_iron_ore: u64,
+    player_axe: player::AxeTier,
+    next_axe_recipe: Option<player::AxeRecipe>,
+    craft_axe_ready: bool,
     player_state_outpoint: Option<String>,
     full_tree_value_sats: u64,
     wallet_vtxos: Vec<WalletVtxoView>,
@@ -162,6 +169,8 @@ struct AppSnapshot {
     tree_asset: String,
     log_asset: String,
     xp_asset: String,
+    stone_asset: String,
+    iron_ore_asset: String,
     genesis_txid: String,
     covenant_script: String,
     pending_chop_txid: Option<String>,
@@ -174,6 +183,7 @@ struct AppSnapshot {
 struct AttemptView {
     tree_id: u32,
     success: bool,
+    material: player::MaterialDrop,
 }
 
 #[derive(Clone, Copy)]
@@ -218,6 +228,8 @@ struct TreeView {
     log_reserve_remaining: u64,
     xp_remaining: u64,
     value_sats: u64,
+    stone_remaining: u64,
+    iron_ore_remaining: u64,
     tree_outpoint: String,
     deployment_txid: String,
     last_attempt_txid: Option<String>,
@@ -299,6 +311,8 @@ impl WoodlandApp {
             tree_asset,
             log_asset,
             xp_asset,
+            stone_asset,
+            iron_ore_asset,
             rollover_signer,
             genesis_txid,
             trees: declared_trees,
@@ -322,7 +336,9 @@ impl WoodlandApp {
                         .parse::<AssetId>()
                         .context("local player profile has an invalid PLAYER_ID")
                         .map_err(js_err)?;
-                    if [tree_asset, log_asset, xp_asset].contains(&asset) {
+                    if [tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset]
+                        .contains(&asset)
+                    {
                         return Err(JsValue::from_str(
                             "local PLAYER_ID collides with a world asset",
                         ));
@@ -354,6 +370,8 @@ impl WoodlandApp {
                 tree_asset,
                 log_asset,
                 xp_asset,
+                stone_asset,
+                iron_ore_asset,
                 rollover_signer,
                 contract,
                 genesis_txid,
@@ -555,6 +573,12 @@ impl WoodlandApp {
             .map_err(js_err)?;
         self.refresh().await
     }
+
+    #[wasm_bindgen(js_name = craftAxe)]
+    pub async fn craft_axe(&mut self) -> Result<JsValue, JsValue> {
+        self.craft_axe_inner().await.map_err(js_err)?;
+        self.refresh().await
+    }
     pub async fn refresh(&mut self) -> Result<JsValue, JsValue> {
         self.sync_player().await.map_err(js_err)?;
         serde_wasm_bindgen::to_value(&self.snapshot())
@@ -576,8 +600,12 @@ impl WoodlandApp {
     }
 
     pub async fn chop(&mut self, tree_id: u32) -> Result<JsValue, JsValue> {
-        let success = self.chop_inner(tree_id).await.map_err(js_err)?;
-        self.last_attempt = Some(AttemptView { tree_id, success });
+        let (success, material) = self.chop_inner(tree_id).await.map_err(js_err)?;
+        self.last_attempt = Some(AttemptView {
+            tree_id,
+            success,
+            material,
+        });
         self.refresh().await
     }
 
@@ -601,11 +629,15 @@ impl WoodlandApp {
             player_state_outpoint: expected_player_state_outpoint,
             drop: expected_drop,
         };
-        let success = self
+        let (success, material) = self
             .chop_inner_with_options(tree_id, ChopMutation::None, Some(expected))
             .await
             .map_err(js_err)?;
-        self.last_attempt = Some(AttemptView { tree_id, success });
+        self.last_attempt = Some(AttemptView {
+            tree_id,
+            success,
+            material,
+        });
         self.refresh().await
     }
 
@@ -655,11 +687,15 @@ impl WoodlandApp {
     #[cfg(feature = "regtest-e2e")]
     #[wasm_bindgen(js_name = testSubmissionRecovery)]
     pub async fn test_submission_recovery(&mut self, tree_id: u32) -> Result<JsValue, JsValue> {
-        let success = self
+        let (success, material) = self
             .chop_inner_with_options(tree_id, ChopMutation::SubmissionFailure, None)
             .await
             .map_err(js_err)?;
-        self.last_attempt = Some(AttemptView { tree_id, success });
+        self.last_attempt = Some(AttemptView {
+            tree_id,
+            success,
+            material,
+        });
         self.refresh().await
     }
 }
@@ -713,6 +749,38 @@ impl WoodlandApp {
             .and_then(|player| player.record.asset_amount(self.world.xp_asset))
             .unwrap_or(0);
         let player_xp = player::woodcutting_xp(player_xp_balance);
+        let (player_logs, player_stone, player_iron_ore, player_axe) = self
+            .player_state
+            .as_ref()
+            .map(|player| {
+                (
+                    player
+                        .record
+                        .asset_amount(self.world.log_asset)
+                        .unwrap_or(0),
+                    player
+                        .record
+                        .asset_amount(self.world.stone_asset)
+                        .unwrap_or(0),
+                    player
+                        .record
+                        .asset_amount(self.world.iron_ore_asset)
+                        .unwrap_or(0),
+                    player.state.axe,
+                )
+            })
+            .unwrap_or((0, 0, 0, player::AxeTier::None));
+        let next_axe_recipe = self
+            .player_state
+            .as_ref()
+            .and_then(|player| player.state.axe.next_recipe());
+        let craft_axe_ready = self.pending_chop.is_none()
+            && next_axe_recipe.is_some_and(|recipe| {
+                player_xp_balance >= recipe.required_xp_balance()
+                    && player_logs >= recipe.log_cost
+                    && player_stone >= recipe.stone_cost
+                    && player_iron_ore >= recipe.iron_ore_cost
+            });
         let wallet_sats = self
             .wallet_records
             .iter()
@@ -739,10 +807,12 @@ impl WoodlandApp {
             })
             .collect();
         #[cfg(feature = "regtest-e2e")]
-        let next_luck = self
-            .player_state
-            .as_ref()
-            .map(|player| player.state.luck.advance(player_xp_balance));
+        let next_luck = self.player_state.as_ref().map(|player| {
+            player
+                .state
+                .luck
+                .advance(player_xp_balance, player.state.axe)
+        });
         let trees = self
             .trees
             .iter()
@@ -750,6 +820,14 @@ impl WoodlandApp {
             .map(|tree| {
                 let logs = tree.record.asset_amount(self.world.log_asset).unwrap_or(0);
                 let xp_balance = tree.record.asset_amount(self.world.xp_asset).unwrap_or(0);
+                let stone = tree
+                    .record
+                    .asset_amount(self.world.stone_asset)
+                    .unwrap_or(0);
+                let iron_ore = tree
+                    .record
+                    .asset_amount(self.world.iron_ore_asset)
+                    .unwrap_or(0);
                 #[cfg(feature = "regtest-e2e")]
                 let (next_roll_bucket, raw_drop) = next_luck
                     .map(|(luck, drop)| (luck.roll.bucket(), drop))
@@ -764,6 +842,8 @@ impl WoodlandApp {
                     log_reserve_remaining: logs,
                     xp_remaining: player::woodcutting_xp(xp_balance),
                     value_sats: tree.record.amount_sats,
+                    stone_remaining: stone,
+                    iron_ore_remaining: iron_ore,
                     tree_outpoint: tree.record.outpoint.to_string(),
                     deployment_txid: tree.deployment_txid.to_string(),
                     last_attempt_txid: tree.last_attempt_txid.map(|txid| txid.to_string()),
@@ -827,12 +907,13 @@ impl WoodlandApp {
             )),
             player_state_expires_in_seconds,
             player_rollover_margin_seconds,
-            log_drop_basis_points: player::log_drop_basis_points(player_xp_balance),
-            player_logs: self
-                .player_state
-                .as_ref()
-                .and_then(|player| player.record.asset_amount(self.world.log_asset))
-                .unwrap_or(0),
+            log_drop_basis_points: player::log_drop_basis_points(player_xp_balance, player_axe),
+            player_logs,
+            player_stone,
+            player_iron_ore,
+            player_axe,
+            next_axe_recipe,
+            craft_axe_ready,
             player_state_outpoint: self
                 .player_state
                 .as_ref()
@@ -845,6 +926,8 @@ impl WoodlandApp {
             tree_asset: self.world.tree_asset.to_string(),
             log_asset: self.world.log_asset.to_string(),
             xp_asset: self.world.xp_asset.to_string(),
+            stone_asset: self.world.stone_asset.to_string(),
+            iron_ore_asset: self.world.iron_ore_asset.to_string(),
             genesis_txid: self.world.genesis_txid.to_string(),
             covenant_script: self.world.contract.vtxo.script_pubkey().to_hex_string(),
             pending_chop_txid: self
@@ -1226,6 +1309,8 @@ impl WoodlandApp {
             self.world.tree_asset,
             self.world.log_asset,
             self.world.xp_asset,
+            self.world.stone_asset,
+            self.world.iron_ore_asset,
             self.params.dust_sats,
             &self.world.contract.vtxo.script_pubkey(),
         )
@@ -1309,6 +1394,7 @@ impl WoodlandApp {
             self.last_attempt = Some(AttemptView {
                 tree_id: pending.tree_id,
                 success: pending.success,
+                material: pending.material,
             });
             self.clear_pending_chop()?;
             return Ok(());
@@ -1484,7 +1570,10 @@ impl WoodlandApp {
         let initial_luck = player::PlayerLuck::initial(&contract.vtxo.script_pubkey())?;
         player::attach_player_state_packets(
             &mut activation.ark_tx,
-            PlayerState { luck: initial_luck },
+            PlayerState {
+                luck: initial_luck,
+                axe: player::AxeTier::None,
+            },
         )?;
         if activation.ark_tx.unsigned_tx.output.len() != crate::protocol::ACTIVATION_OUTPUT_COUNT {
             return Err(anyhow!("activation transaction has an invalid shape"));
@@ -1596,6 +1685,92 @@ impl WoodlandApp {
         Ok(())
     }
 
+    async fn craft_axe_inner(&mut self) -> Result<()> {
+        self.sync_player().await?;
+        if let Some(pending) = &self.pending_chop {
+            return Err(anyhow!(
+                "pending chop {} must reconcile before crafting",
+                pending.expected_txid
+            ));
+        }
+        let state = self
+            .player_state
+            .clone()
+            .ok_or_else(|| anyhow!("activate the player before crafting an axe"))?;
+        let player_asset = self.require_player_asset()?;
+        let prepared = crate::chop::prepare_craft(
+            &self.keys,
+            &self.info,
+            &state.contract,
+            player_asset,
+            &state.record,
+            &state.previous_tx,
+            state.state,
+        )?;
+        let txid = prepared.ark_tx.unsigned_tx.compute_txid();
+        let expected_outpoint = OutPoint {
+            txid,
+            vout: u32::from(crate::protocol::CRAFT_STATE_OUTPUT_INDEX),
+        };
+        let (returned_ark, _) = self
+            .emulator
+            .submit_tx(&prepared.ark_tx, &prepared.checkpoint_txs)
+            .await
+            .context("submit axe crafting transaction to emulator")?;
+        if returned_ark.unsigned_tx != prepared.ark_tx.unsigned_tx {
+            return Err(anyhow!(
+                "emulator changed the submitted axe crafting transaction"
+            ));
+        }
+        wait_for_vtxo(
+            &self.rest,
+            &state.contract.vtxo.script_pubkey().to_hex_string(),
+            expected_outpoint,
+        )
+        .await?;
+        self.sync_player().await?;
+        let settled = self
+            .player_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("crafted player state was not discovered"))?;
+        let recipe = prepared.recipe;
+        if settled.record.outpoint != expected_outpoint
+            || settled.state.axe != recipe.axe
+            || settled.state.luck != state.state.luck
+            || settled
+                .record
+                .asset_amount(self.world.log_asset)
+                .unwrap_or(0)
+                != state.record.asset_amount(self.world.log_asset).unwrap_or(0) - recipe.log_cost
+            || settled
+                .record
+                .asset_amount(self.world.xp_asset)
+                .unwrap_or(0)
+                != state.record.asset_amount(self.world.xp_asset).unwrap_or(0)
+            || settled
+                .record
+                .asset_amount(self.world.stone_asset)
+                .unwrap_or(0)
+                != state
+                    .record
+                    .asset_amount(self.world.stone_asset)
+                    .unwrap_or(0)
+                    - recipe.stone_cost
+            || settled
+                .record
+                .asset_amount(self.world.iron_ore_asset)
+                .unwrap_or(0)
+                != state
+                    .record
+                    .asset_amount(self.world.iron_ore_asset)
+                    .unwrap_or(0)
+                    - recipe.iron_ore_cost
+        {
+            return Err(anyhow!("settled axe crafting state is invalid"));
+        }
+        Ok(())
+    }
+
     async fn renew_player_inner(&mut self) -> Result<()> {
         self.sync_player().await?;
         let state = self
@@ -1684,6 +1859,8 @@ impl WoodlandApp {
             self.world.tree_asset,
             self.world.log_asset,
             self.world.xp_asset,
+            self.world.stone_asset,
+            self.world.iron_ore_asset,
             self.params.dust_sats,
             0,
         )?;
@@ -1780,7 +1957,7 @@ impl WoodlandApp {
         }
     }
 
-    async fn chop_inner(&mut self, tree_id: u32) -> Result<bool> {
+    async fn chop_inner(&mut self, tree_id: u32) -> Result<(bool, player::MaterialDrop)> {
         self.chop_inner_with_options(tree_id, ChopMutation::None, None)
             .await
     }
@@ -1790,7 +1967,7 @@ impl WoodlandApp {
         tree_id: u32,
         mutation: ChopMutation,
         expected: Option<ExpectedChop>,
-    ) -> Result<bool> {
+    ) -> Result<(bool, player::MaterialDrop)> {
         self.sync_tree(tree_id).await?;
         if let Some(pending) = &self.pending_chop {
             return Err(anyhow!(
@@ -1821,7 +1998,7 @@ impl WoodlandApp {
         }
         if let Some(expected) = expected {
             let player_xp = state.record.asset_amount(self.world.xp_asset).unwrap_or(0);
-            let (_, success) = state.state.luck.advance(player_xp);
+            let (_, success) = state.state.luck.advance(player_xp, state.state.axe);
             if tree.record.outpoint.to_string() != expected.tree_outpoint
                 || state.record.outpoint.to_string() != expected.player_state_outpoint
                 || success != expected.drop
@@ -1839,6 +2016,8 @@ impl WoodlandApp {
                 tree_asset: self.world.tree_asset,
                 log_asset: self.world.log_asset,
                 xp_asset: self.world.xp_asset,
+                stone_asset: self.world.stone_asset,
+                iron_ore_asset: self.world.iron_ore_asset,
                 dust_sats: self.params.dust_sats,
                 map_width: self.world.manifest.map_width,
             },
@@ -1860,10 +2039,27 @@ impl WoodlandApp {
             mutation,
         )?;
         let success = prepared.success;
+        let material = prepared.material;
         let player_logs_before = state.record.asset_amount(self.world.log_asset).unwrap_or(0);
         let player_xp_balance_before = state.record.asset_amount(self.world.xp_asset).unwrap_or(0);
+        let player_stone_before = state
+            .record
+            .asset_amount(self.world.stone_asset)
+            .unwrap_or(0);
+        let player_iron_ore_before = state
+            .record
+            .asset_amount(self.world.iron_ore_asset)
+            .unwrap_or(0);
         let tree_logs_before = tree.record.asset_amount(self.world.log_asset).unwrap_or(0);
         let tree_xp_balance_before = tree.record.asset_amount(self.world.xp_asset).unwrap_or(0);
+        let tree_stone_before = tree
+            .record
+            .asset_amount(self.world.stone_asset)
+            .unwrap_or(0);
+        let tree_iron_ore_before = tree
+            .record
+            .asset_amount(self.world.iron_ore_asset)
+            .unwrap_or(0);
 
         let expected_ark = prepared.ark_tx.clone();
         let expected_checkpoints = prepared.checkpoint_txs.clone();
@@ -1877,6 +2073,7 @@ impl WoodlandApp {
             self.persist_pending_chop(PendingChop::new(
                 tree_id,
                 success,
+                material,
                 state.record.outpoint,
                 tree.record.outpoint,
                 &expected_ark,
@@ -1902,7 +2099,7 @@ impl WoodlandApp {
                     let submission_detail = format!("{submission_error:#}");
                     txbuild::sleep_ms(500).await;
                     return match self.resume_pending_chop_inner().await {
-                        Ok(true) => Ok(success),
+                        Ok(true) => Ok((success, material)),
                         Ok(false) => Err(anyhow!(
                             "chop conflicted while recovering from submission failure: {submission_detail}"
                         )),
@@ -1957,12 +2154,28 @@ impl WoodlandApp {
             state_logs_after: state_record.asset_amount(self.world.log_asset).unwrap_or(0),
             state_xp_balance_before: player_xp_balance_before,
             state_xp_balance_after: state_record.asset_amount(self.world.xp_asset).unwrap_or(0),
+            state_stone_before: player_stone_before,
+            state_stone_after: state_record
+                .asset_amount(self.world.stone_asset)
+                .unwrap_or(0),
+            state_iron_ore_before: player_iron_ore_before,
+            state_iron_ore_after: state_record
+                .asset_amount(self.world.iron_ore_asset)
+                .unwrap_or(0),
             tree_markers_before: 1,
             tree_markers_after: tree_record.asset_amount(self.world.tree_asset).unwrap_or(0),
             tree_logs_before,
             tree_logs_after: tree_record.asset_amount(self.world.log_asset).unwrap_or(0),
             tree_xp_balance_before,
             tree_xp_balance_after: tree_record.asset_amount(self.world.xp_asset).unwrap_or(0),
+            tree_stone_before,
+            tree_stone_after: tree_record
+                .asset_amount(self.world.stone_asset)
+                .unwrap_or(0),
+            tree_iron_ore_before,
+            tree_iron_ore_after: tree_record
+                .asset_amount(self.world.iron_ore_asset)
+                .unwrap_or(0),
             state_value_before: state.record.amount_sats,
             state_value_after: state_record.amount_sats,
             tree_value_before: tree.record.amount_sats,
@@ -1990,7 +2203,7 @@ impl WoodlandApp {
         if matches!(mutation, ChopMutation::None) {
             self.clear_pending_chop()?;
         }
-        Ok(success)
+        Ok((success, material))
     }
 }
 
@@ -2007,7 +2220,7 @@ fn validate_initial_tree_record(
         })
         || record.script != world.contract.vtxo.script_pubkey()
         || record.amount_sats != world.manifest.dust_sats
-        || record.assets.len() != 3
+        || record.assets.len() != 5
     {
         return Err(anyhow!(
             "initial tree {} record does not match its deployment",
@@ -2026,6 +2239,18 @@ fn validate_initial_tree_record(
         world.xp_asset,
         world.manifest.xp_per_tree,
         "tree XP reserve",
+    )?;
+    require_asset_amount(
+        record,
+        world.stone_asset,
+        world.manifest.stone_reserve_per_tree,
+        "tree STONE reserve",
+    )?;
+    require_asset_amount(
+        record,
+        world.iron_ore_asset,
+        world.manifest.iron_ore_reserve_per_tree,
+        "tree IRON ORE reserve",
     )
 }
 
@@ -2033,16 +2258,43 @@ fn validate_tree_local_state(record: &VtxoRecord, world: &World, health: TreeHea
     if record.script != world.contract.vtxo.script_pubkey()
         || record.amount_sats != world.manifest.dust_sats
         || record.asset_amount(world.tree_asset).unwrap_or(0) != 1
+        || [
+            world.tree_asset,
+            world.log_asset,
+            world.xp_asset,
+            world.stone_asset,
+            world.iron_ore_asset,
+        ]
+        .iter()
+        .any(|asset_id| {
+            record
+                .assets
+                .iter()
+                .filter(|asset| asset.asset_id == *asset_id)
+                .count()
+                > 1
+        })
         || record.assets.iter().any(|asset| {
-            ![world.tree_asset, world.log_asset, world.xp_asset].contains(&asset.asset_id)
+            ![
+                world.tree_asset,
+                world.log_asset,
+                world.xp_asset,
+                world.stone_asset,
+                world.iron_ore_asset,
+            ]
+            .contains(&asset.asset_id)
         })
     {
         return Err(anyhow!("tree record has invalid backing or foreign assets"));
     }
     let logs = record.asset_amount(world.log_asset).unwrap_or(0);
     let xp = record.asset_amount(world.xp_asset).unwrap_or(0);
+    let stone = record.asset_amount(world.stone_asset).unwrap_or(0);
+    let iron_ore = record.asset_amount(world.iron_ore_asset).unwrap_or(0);
     if logs > world.manifest.log_reserve_per_tree
         || xp > world.manifest.xp_per_tree
+        || stone > world.manifest.stone_reserve_per_tree
+        || iron_ore > world.manifest.iron_ore_reserve_per_tree
         || logs != xp
         || health.value() > logs
     {
@@ -2080,6 +2332,14 @@ async fn load_current_tree_records(
                     Asset {
                         asset_id: world.xp_asset,
                         amount: world.manifest.xp_per_tree,
+                    },
+                    Asset {
+                        asset_id: world.stone_asset,
+                        amount: world.manifest.stone_reserve_per_tree,
+                    },
+                    Asset {
+                        asset_id: world.iron_ore_asset,
+                        amount: world.manifest.iron_ore_reserve_per_tree,
                     },
                 ],
                 created_at: None,
@@ -2206,20 +2466,38 @@ fn select_tree_records(
             .iter()
             .filter(|asset| asset.asset_id == world.xp_asset)
             .count();
+        let stone_entries = record
+            .assets
+            .iter()
+            .filter(|asset| asset.asset_id == world.stone_asset)
+            .count();
+        let iron_ore_entries = record
+            .assets
+            .iter()
+            .filter(|asset| asset.asset_id == world.iron_ore_asset)
+            .count();
         let logs = record.asset_amount(world.log_asset).unwrap_or(0);
         let xp_balance = record.asset_amount(world.xp_asset).unwrap_or(0);
+        let stone = record.asset_amount(world.stone_asset).unwrap_or(0);
+        let iron_ore = record.asset_amount(world.iron_ore_asset).unwrap_or(0);
         if record.amount_sats != dust_sats
             || tree_entries != 1
             || log_entries > 1
             || xp_entries > 1
+            || stone_entries > 1
+            || iron_ore_entries > 1
             || record.asset_amount(world.tree_asset) != Some(1)
             || logs > world.manifest.log_reserve_per_tree
             || xp_balance > world.manifest.xp_per_tree
+            || stone > world.manifest.stone_reserve_per_tree
+            || iron_ore > world.manifest.iron_ore_reserve_per_tree
             || logs != xp_balance
             || !record.assets.iter().all(|asset| {
                 asset.asset_id == world.tree_asset
                     || asset.asset_id == world.log_asset
                     || asset.asset_id == world.xp_asset
+                    || asset.asset_id == world.stone_asset
+                    || asset.asset_id == world.iron_ore_asset
             })
         {
             return Err(anyhow!("indexed tree record violates the world manifest"));

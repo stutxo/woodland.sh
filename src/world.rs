@@ -19,17 +19,21 @@ use std::str::FromStr;
 pub(crate) const GAME_ID: &str = "woodland.sh";
 pub(crate) const PROTOCOL_VERSION: u32 = 3;
 pub(crate) const RULESET_ID: &str = "woodland.sh/forest/v3";
-/// No-vault world: all fixed-supply assets live on 420 recursive trees and
-/// funded stumps regrow in one permissionless renewal batch.
+/// No-vault world: every fixed-issuance resource starts on 420 recursive
+/// trees, and funded stumps regrow in one permissionless renewal batch.
 pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 3;
 pub(crate) const PROTOCOL_DUST_SATS: u64 = 330;
 pub(crate) const ACTIVE_LOGS_PER_TREE: u64 = 10;
 pub(crate) const LOG_RESERVE_PER_TREE: u64 = 50_000;
 pub(crate) const XP_PER_TREE: u64 = 50_000;
+pub(crate) const STONE_RESERVE_PER_TREE: u64 = 50_000;
+pub(crate) const IRON_ORE_RESERVE_PER_TREE: u64 = 50_000;
 pub(crate) const TREE_COUNT: usize = 420;
-/// Fixed LOG and XP supply, distributed completely across the initial trees.
+/// Genesis issuance caps, distributed completely across the initial trees.
 pub(crate) const LOG_SUPPLY: u64 = 21_000_000;
 pub(crate) const XP_SUPPLY: u64 = 21_000_000;
+pub(crate) const STONE_SUPPLY: u64 = 21_000_000;
+pub(crate) const IRON_ORE_SUPPLY: u64 = 21_000_000;
 pub(crate) const MAP_WIDTH: u16 = 425;
 pub(crate) const MAP_HEIGHT: u16 = 425;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -155,9 +159,13 @@ pub struct WorldManifest {
     pub tree_asset: String,
     pub log_asset: String,
     pub xp_asset: String,
+    pub stone_asset: String,
+    pub iron_ore_asset: String,
     pub active_logs_per_tree: u64,
     pub log_reserve_per_tree: u64,
     pub xp_per_tree: u64,
+    pub stone_reserve_per_tree: u64,
+    pub iron_ore_reserve_per_tree: u64,
     /// User-facing Woodcutting XP represented by each soulbound XP asset unit.
     pub woodcutting_xp_per_log: u64,
     pub player_level_curve: String,
@@ -166,6 +174,11 @@ pub struct WorldManifest {
     pub level_log_drop_bonus_basis_points: u64,
     pub level_log_drop_xp_thresholds: [u64; 5],
     pub max_level_log_drop_basis_points: u64,
+    pub max_log_drop_basis_points: u64,
+    pub stone_drop_basis_points: u64,
+    pub iron_ore_drop_basis_points: u64,
+    pub iron_ore_unlock_level: u64,
+    pub axe_recipes: [crate::player::AxeRecipe; 3],
     pub luck_window_basis_points: u64,
     pub initial_luck_credit: u64,
     pub tree_script: String,
@@ -198,6 +211,8 @@ pub struct ValidatedWorld {
     pub tree_asset: AssetId,
     pub log_asset: AssetId,
     pub xp_asset: AssetId,
+    pub stone_asset: AssetId,
+    pub iron_ore_asset: AssetId,
     pub genesis_txid: Txid,
     pub trees: Vec<ValidatedTree>,
     pub deployer_signer: bitcoin::XOnlyPublicKey,
@@ -222,6 +237,8 @@ impl WorldManifest {
         tree_asset: AssetId,
         log_asset: AssetId,
         xp_asset: AssetId,
+        stone_asset: AssetId,
+        iron_ore_asset: AssetId,
         contract: &TreeContract,
         genesis_txid: Txid,
         deployments: &[(TreeState, Txid)],
@@ -247,9 +264,13 @@ impl WorldManifest {
             tree_asset: tree_asset.to_string(),
             log_asset: log_asset.to_string(),
             xp_asset: xp_asset.to_string(),
+            stone_asset: stone_asset.to_string(),
+            iron_ore_asset: iron_ore_asset.to_string(),
             active_logs_per_tree: ACTIVE_LOGS_PER_TREE,
             log_reserve_per_tree: LOG_RESERVE_PER_TREE,
             xp_per_tree: XP_PER_TREE,
+            stone_reserve_per_tree: STONE_RESERVE_PER_TREE,
+            iron_ore_reserve_per_tree: IRON_ORE_RESERVE_PER_TREE,
             woodcutting_xp_per_log: crate::player::WOODCUTTING_XP_PER_LOG,
             player_level_curve: crate::player::PLAYER_LEVEL_CURVE.to_string(),
             max_player_level: crate::player::MAX_PLAYER_LEVEL,
@@ -257,6 +278,11 @@ impl WorldManifest {
             level_log_drop_bonus_basis_points: crate::player::LEVEL_LOG_DROP_BONUS_BASIS_POINTS,
             level_log_drop_xp_thresholds: crate::player::LEVEL_LOG_DROP_XP_THRESHOLDS,
             max_level_log_drop_basis_points: crate::player::MAX_LEVEL_LOG_DROP_BASIS_POINTS,
+            max_log_drop_basis_points: crate::player::MAX_LOG_DROP_BASIS_POINTS,
+            stone_drop_basis_points: crate::player::STONE_DROP_BASIS_POINTS,
+            iron_ore_drop_basis_points: crate::player::IRON_ORE_DROP_BASIS_POINTS,
+            iron_ore_unlock_level: crate::player::IRON_ORE_UNLOCK_LEVEL,
+            axe_recipes: crate::player::AXE_RECIPES,
             luck_window_basis_points: crate::player::LUCK_WINDOW_BASIS_POINTS,
             initial_luck_credit: crate::player::INITIAL_LUCK_CREDIT,
             tree_script: contract.vtxo.script_pubkey().to_hex_string(),
@@ -432,6 +458,8 @@ impl WorldManifest {
             || self.active_logs_per_tree != tree::LOGS_PER_TREE
             || self.log_reserve_per_tree != LOG_RESERVE_PER_TREE
             || self.xp_per_tree != XP_PER_TREE
+            || self.stone_reserve_per_tree != STONE_RESERVE_PER_TREE
+            || self.iron_ore_reserve_per_tree != IRON_ORE_RESERVE_PER_TREE
             || self.woodcutting_xp_per_log != crate::player::WOODCUTTING_XP_PER_LOG
             || self.player_level_curve != crate::player::PLAYER_LEVEL_CURVE
             || self.max_player_level != crate::player::MAX_PLAYER_LEVEL
@@ -441,6 +469,11 @@ impl WorldManifest {
             || self.level_log_drop_xp_thresholds != crate::player::LEVEL_LOG_DROP_XP_THRESHOLDS
             || self.max_level_log_drop_basis_points
                 != crate::player::MAX_LEVEL_LOG_DROP_BASIS_POINTS
+            || self.max_log_drop_basis_points != crate::player::MAX_LOG_DROP_BASIS_POINTS
+            || self.stone_drop_basis_points != crate::player::STONE_DROP_BASIS_POINTS
+            || self.iron_ore_drop_basis_points != crate::player::IRON_ORE_DROP_BASIS_POINTS
+            || self.iron_ore_unlock_level != crate::player::IRON_ORE_UNLOCK_LEVEL
+            || self.axe_recipes != crate::player::AXE_RECIPES
             || self.luck_window_basis_points != crate::player::LUCK_WINDOW_BASIS_POINTS
             || self.initial_luck_credit != crate::player::INITIAL_LUCK_CREDIT
             || self.trees.len() != TREE_COUNT
@@ -454,14 +487,22 @@ impl WorldManifest {
             .ok_or_else(|| anyhow!("invalid LOG asset ID in world manifest"))?;
         let xp_asset = txbuild::parse_asset_id_pub(&self.xp_asset)
             .ok_or_else(|| anyhow!("invalid XP asset ID in world manifest"))?;
+        let stone_asset = txbuild::parse_asset_id_pub(&self.stone_asset)
+            .ok_or_else(|| anyhow!("invalid STONE asset ID in world manifest"))?;
+        let iron_ore_asset = txbuild::parse_asset_id_pub(&self.iron_ore_asset)
+            .ok_or_else(|| anyhow!("invalid IRON ORE asset ID in world manifest"))?;
         let genesis_txid =
             Txid::from_str(&self.genesis_txid).context("parse world genesis transaction ID")?;
         if tree_asset.txid != genesis_txid
             || log_asset.txid != genesis_txid
             || xp_asset.txid != genesis_txid
+            || stone_asset.txid != genesis_txid
+            || iron_ore_asset.txid != genesis_txid
             || tree_asset.group_index != 0
             || log_asset.group_index != 1
             || xp_asset.group_index != 2
+            || stone_asset.group_index != 3
+            || iron_ore_asset.group_index != 4
         {
             return Err(anyhow!(
                 "world asset IDs do not match the canonical genesis"
@@ -506,6 +547,8 @@ impl WorldManifest {
             tree_asset,
             log_asset,
             xp_asset,
+            stone_asset,
+            iron_ore_asset,
             params.dust_sats,
         )?;
         if self.tree_script != contract.vtxo.script_pubkey().to_hex_string()
@@ -521,6 +564,8 @@ impl WorldManifest {
             tree_asset,
             log_asset,
             xp_asset,
+            stone_asset,
+            iron_ore_asset,
             genesis_txid,
             trees,
             deployer_signer,
@@ -608,6 +653,14 @@ fn expected_asset_metadata(
         encoded.extend_from_slice(value.as_bytes());
     }
     encoded
+}
+
+fn indexed_supply_is_valid(current: u64, genesis: u64, burnable: bool) -> bool {
+    if burnable {
+        current <= genesis
+    } else {
+        current == genesis
+    }
 }
 
 impl ValidatedWorld {
@@ -707,22 +760,24 @@ impl ValidatedWorld {
     }
 
     pub async fn verify_indexed_assets(&self, rest: &crate::arkade::ArkadeRest) -> Result<()> {
-        for (asset_id, label, expected_supply) in [
-            (self.tree_asset, "TREE", self.trees.len() as u64),
-            (self.log_asset, "LOG", LOG_SUPPLY),
-            (self.xp_asset, "XP", XP_SUPPLY),
+        for (asset_id, label, genesis_supply, burnable) in [
+            (self.tree_asset, "TREE", self.trees.len() as u64, false),
+            (self.log_asset, "LOG", LOG_SUPPLY, true),
+            (self.xp_asset, "XP", XP_SUPPLY, false),
+            (self.stone_asset, "STONE", STONE_SUPPLY, true),
+            (self.iron_ore_asset, "IRON ORE", IRON_ORE_SUPPLY, true),
         ] {
             let details = rest
                 .get_asset_details(asset_id)
                 .await
                 .with_context(|| format!("verify indexed {label} asset"))?;
             if details.control_asset.is_some()
-                || details.supply != expected_supply
+                || !indexed_supply_is_valid(details.supply, genesis_supply, burnable)
                 || details.metadata
                     != expected_asset_metadata(label, self.deployer_signer, self.rollover_signer)
             {
                 return Err(anyhow!(
-                    "indexed {label} asset does not match the fixed-supply world genesis"
+                    "indexed {label} asset does not match the fixed-issuance world genesis"
                 ));
             }
         }
@@ -787,6 +842,14 @@ mod tests {
             txid: genesis_txid,
             group_index: 2,
         };
+        let stone_asset = AssetId {
+            txid: genesis_txid,
+            group_index: 3,
+        };
+        let iron_ore_asset = AssetId {
+            txid: genesis_txid,
+            group_index: 4,
+        };
         let contract = tree::build_tree_contract(
             &secp,
             operator,
@@ -797,6 +860,8 @@ mod tests {
             tree_asset,
             log_asset,
             xp_asset,
+            stone_asset,
+            iron_ore_asset,
             params.dust_sats,
         )
         .unwrap();
@@ -819,6 +884,8 @@ mod tests {
             tree_asset,
             log_asset,
             xp_asset,
+            stone_asset,
+            iron_ore_asset,
             &contract,
             genesis_txid,
             &deployments,
@@ -834,11 +901,16 @@ mod tests {
         assert!(json.contains("\"manifestSignature\""));
         assert!(json.contains("\"xpAsset\""));
         assert!(json.contains("\"xpPerTree\""));
+        assert!(json.contains("\"stoneAsset\""));
+        assert!(json.contains("\"ironOreAsset\""));
+        assert!(json.contains("\"axeRecipes\""));
         assert!(json.contains("\"woodcuttingXpPerLog\""));
         let parsed = WorldManifest::from_json(&json).unwrap();
         let world = parsed.validate(&secp, &params, &emulator).unwrap();
         assert_eq!(world.trees.len(), TREE_COUNT);
         assert_eq!(world.trees[0].state, tree_states()[0]);
+        assert_eq!(world.stone_asset.to_string(), parsed.stone_asset);
+        assert_eq!(world.iron_ore_asset.to_string(), parsed.iron_ore_asset);
         assert_eq!(world.xp_asset.to_string(), parsed.xp_asset);
         assert_eq!(parsed.arkade_service_url, "http://127.0.0.1:7070");
         assert_eq!(parsed.emulator_url, "http://127.0.0.1:7073");
@@ -858,6 +930,25 @@ mod tests {
             parsed.max_level_log_drop_basis_points,
             crate::player::MAX_LEVEL_LOG_DROP_BASIS_POINTS
         );
+        assert_eq!(
+            parsed.max_log_drop_basis_points,
+            crate::player::MAX_LOG_DROP_BASIS_POINTS
+        );
+        assert_eq!(
+            parsed.stone_drop_basis_points,
+            crate::player::STONE_DROP_BASIS_POINTS
+        );
+        assert_eq!(
+            parsed.iron_ore_drop_basis_points,
+            crate::player::IRON_ORE_DROP_BASIS_POINTS
+        );
+        assert_eq!(
+            parsed.iron_ore_unlock_level,
+            crate::player::IRON_ORE_UNLOCK_LEVEL
+        );
+        assert_eq!(parsed.axe_recipes, crate::player::AXE_RECIPES);
+        assert_eq!(parsed.stone_reserve_per_tree, STONE_RESERVE_PER_TREE);
+        assert_eq!(parsed.iron_ore_reserve_per_tree, IRON_ORE_RESERVE_PER_TREE);
         assert_eq!(
             parsed.luck_window_basis_points,
             crate::player::LUCK_WINDOW_BASIS_POINTS
@@ -965,11 +1056,18 @@ mod tests {
             |manifest: &mut WorldManifest| manifest.level_log_drop_bonus_basis_points += 1,
             |manifest: &mut WorldManifest| manifest.level_log_drop_xp_thresholds[0] -= 1,
             |manifest: &mut WorldManifest| manifest.max_level_log_drop_basis_points += 1,
+            |manifest: &mut WorldManifest| manifest.max_log_drop_basis_points += 1,
+            |manifest: &mut WorldManifest| manifest.stone_drop_basis_points += 1,
+            |manifest: &mut WorldManifest| manifest.iron_ore_drop_basis_points += 1,
+            |manifest: &mut WorldManifest| manifest.iron_ore_unlock_level += 1,
+            |manifest: &mut WorldManifest| manifest.axe_recipes[0].log_cost += 1,
             |manifest: &mut WorldManifest| manifest.luck_window_basis_points += 1,
             |manifest: &mut WorldManifest| manifest.initial_luck_credit += 1,
             |manifest: &mut WorldManifest| manifest.max_player_level += 1,
             |manifest: &mut WorldManifest| manifest.log_reserve_per_tree += 1,
             |manifest: &mut WorldManifest| manifest.xp_per_tree += 1,
+            |manifest: &mut WorldManifest| manifest.stone_reserve_per_tree += 1,
+            |manifest: &mut WorldManifest| manifest.iron_ore_reserve_per_tree += 1,
             |manifest: &mut WorldManifest| manifest.woodcutting_xp_per_log += 1,
         ] {
             let mut changed = manifest.clone();
@@ -985,5 +1083,24 @@ mod tests {
         let (_, _, _, mut manifest) = fixture();
         manifest.xp_asset = manifest.log_asset.clone();
         assert!(manifest.validate(&secp, &params, &emulator).is_err());
+        let (_, _, _, mut manifest) = fixture();
+        manifest.stone_asset = manifest.log_asset.clone();
+        assert!(manifest.validate(&secp, &params, &emulator).is_err());
+        let (_, _, _, mut manifest) = fixture();
+        manifest.iron_ore_asset = manifest.stone_asset.clone();
+        assert!(manifest.validate(&secp, &params, &emulator).is_err());
+    }
+
+    #[test]
+    fn indexed_supply_validation_distinguishes_burns_from_issuance() {
+        assert!(indexed_supply_is_valid(LOG_SUPPLY - 1, LOG_SUPPLY, true));
+        assert!(indexed_supply_is_valid(STONE_SUPPLY, STONE_SUPPLY, true));
+        assert!(!indexed_supply_is_valid(
+            IRON_ORE_SUPPLY + 1,
+            IRON_ORE_SUPPLY,
+            true,
+        ));
+        assert!(indexed_supply_is_valid(XP_SUPPLY, XP_SUPPLY, false));
+        assert!(!indexed_supply_is_valid(XP_SUPPLY - 1, XP_SUPPLY, false));
     }
 }

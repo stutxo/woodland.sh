@@ -205,6 +205,7 @@ pub struct ChopTransition {
     pub next_state: TreeState,
     pub previous_player_luck: crate::player::PlayerLuck,
     pub next_player_luck: crate::player::PlayerLuck,
+    pub player_axe: crate::player::AxeTier,
     pub previous_health: TreeHealth,
     pub next_health: TreeHealth,
     pub player_xp_before: u64,
@@ -220,6 +221,14 @@ pub struct ChopTransition {
     pub player_logs_after: u64,
     pub player_xp_balance_before: u64,
     pub player_xp_balance_after: u64,
+    pub tree_stone_before: u64,
+    pub tree_stone_after: u64,
+    pub tree_iron_ore_before: u64,
+    pub tree_iron_ore_after: u64,
+    pub player_stone_before: u64,
+    pub player_stone_after: u64,
+    pub player_iron_ore_before: u64,
+    pub player_iron_ore_after: u64,
     pub player_value_before: u64,
     pub player_value_after: u64,
     pub tree_value_before: u64,
@@ -240,12 +249,17 @@ impl ChopTransition {
         {
             return Err(anyhow!("cannot chop a depleted tree"));
         }
-        let (expected_luck, expected_success) =
-            self.previous_player_luck.advance(self.player_xp_before);
+        let (expected_luck, expected_success) = self
+            .previous_player_luck
+            .advance(self.player_xp_before, self.player_axe);
         if self.next_player_luck != expected_luck || self.success != expected_success {
             return Err(anyhow!("tree chop luck transition is invalid"));
         }
         let reward = u64::from(self.success);
+        let material =
+            crate::player::material_drop(expected_luck.roll, self.player_xp_before, self.success);
+        let stone_reward = u64::from(material == crate::player::MaterialDrop::Stone);
+        let iron_ore_reward = u64::from(material == crate::player::MaterialDrop::IronOre);
         if self.player_xp_before != self.player_xp_balance_before
             || self.player_xp_balance_after
                 != self
@@ -291,6 +305,29 @@ impl ChopTransition {
                     .ok_or_else(|| anyhow!("player XP balance overflow"))?
         {
             return Err(anyhow!("XP asset balances do not match the chop reward"));
+        }
+        if self.tree_stone_after
+            != self
+                .tree_stone_before
+                .checked_sub(stone_reward)
+                .ok_or_else(|| anyhow!("tree STONE balance underflow"))?
+            || self.player_stone_after
+                != self
+                    .player_stone_before
+                    .checked_add(stone_reward)
+                    .ok_or_else(|| anyhow!("player STONE balance overflow"))?
+            || self.tree_iron_ore_after
+                != self
+                    .tree_iron_ore_before
+                    .checked_sub(iron_ore_reward)
+                    .ok_or_else(|| anyhow!("tree IRON ORE balance underflow"))?
+            || self.player_iron_ore_after
+                != self
+                    .player_iron_ore_before
+                    .checked_add(iron_ore_reward)
+                    .ok_or_else(|| anyhow!("player IRON ORE balance overflow"))?
+        {
+            return Err(anyhow!("material balances do not match the chop roll"));
         }
         if self.dust_sats == 0
             || self.player_value_before != self.dust_sats
@@ -339,15 +376,19 @@ pub fn build_tree_contract<C: Verification>(
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
     dust_sats: u64,
 ) -> Result<TreeContract> {
-    if [tree_asset, log_asset, xp_asset]
+    if [tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset]
         .into_iter()
         .collect::<std::collections::HashSet<_>>()
         .len()
-        != 3
+        != 5
     {
-        return Err(anyhow!("TREE, LOG, and XP asset IDs must differ"));
+        return Err(anyhow!(
+            "TREE, LOG, XP, STONE, and IRON ORE asset IDs must differ"
+        ));
     }
     if [operator_pk, emulator_pk, rollover_pk]
         .into_iter()
@@ -359,10 +400,28 @@ pub fn build_tree_contract<C: Verification>(
     }
     script_int(tree_value_sats(dust_sats), "tree value")?;
 
-    let chop_arkade_script = tree_covenant_script(tree_asset, log_asset, xp_asset, dust_sats)?;
-    let regrowth_arkade_script = tree_regrowth_covenant_script(tree_asset, log_asset, xp_asset)?;
-    let maintenance_arkade_script =
-        tree_maintenance_covenant_script(tree_asset, log_asset, xp_asset)?;
+    let chop_arkade_script = tree_covenant_script(
+        tree_asset,
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+        dust_sats,
+    )?;
+    let regrowth_arkade_script = tree_regrowth_covenant_script(
+        tree_asset,
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+    )?;
+    let maintenance_arkade_script = tree_maintenance_covenant_script(
+        tree_asset,
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+    )?;
     let nums: bitcoin::PublicKey = ark_core::UNSPENDABLE_KEY
         .parse()
         .context("parse Arkade NUMS key")?;
@@ -439,15 +498,15 @@ pub fn build_tree_contract<C: Verification>(
 
 /// Build the tree half of the atomic PLAYER/TREE chop.
 ///
-/// The tree transfers LOG and soulbound XP into owner-authorized player state.
-/// The XP asset balance is the only progression value.
+/// The tree transfers LOG, soulbound XP, and rare crafting materials into
+/// owner-authorized player state. XP and axe packets determine progression.
 ///
 /// Canonical shape:
 ///
 /// ```text
 /// vin 0 player | vin 1 tree
 /// vout 0 player | vout 1 tree | vout 2 extension | vout 3 anchor
-/// groups 0..3 PLAYER_ID | TREE | LOG | XP
+/// groups 0..5 PLAYER_ID | TREE | LOG | XP | STONE | IRON ORE
 /// ```
 ///
 /// This half owns the global game rule: tree identity, player-bound luck
@@ -458,15 +517,19 @@ pub fn tree_covenant_script(
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
     dust_sats: u64,
 ) -> Result<ScriptBuf> {
-    if [tree_asset, log_asset, xp_asset]
+    if [tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset]
         .into_iter()
         .collect::<std::collections::HashSet<_>>()
         .len()
-        != 3
+        != 5
     {
-        return Err(anyhow!("TREE, LOG, and XP asset IDs must differ"));
+        return Err(anyhow!(
+            "TREE, LOG, XP, STONE, and IRON ORE asset IDs must differ"
+        ));
     }
     if dust_sats == 0 {
         return Err(anyhow!("tree dust must be non-zero"));
@@ -478,7 +541,7 @@ pub fn tree_covenant_script(
     let builder = push_chop_shape(Builder::new(), TREE_INPUT_INDEX, &anchor_program)?
         .push_int(TREE_INPUT_INDEX as i64)
         .push_opcode(op::INSPECTINASSETCOUNT)
-        .push_int(3)
+        .push_int(5)
         .push_opcode(OP_EQUALVERIFY)
         // The player input must execute an Arkade covenant, while its own
         // personalized leaf pins this exact shared tree.
@@ -492,12 +555,17 @@ pub fn tree_covenant_script(
         (tree_asset, TREE_ASSET_GROUP_INDEX as i64),
         (log_asset, LOG_ASSET_GROUP_INDEX as i64),
         (xp_asset, XP_ASSET_GROUP_INDEX as i64),
+        (stone_asset, crate::protocol::STONE_ASSET_GROUP_INDEX as i64),
+        (
+            iron_ore_asset,
+            crate::protocol::IRON_ORE_ASSET_GROUP_INDEX as i64,
+        ),
     ] {
         builder = push_asset_group_index(builder, asset)
             .push_int(group_index)
             .push_opcode(OP_EQUALVERIFY);
     }
-    for asset in [tree_asset, log_asset, xp_asset] {
+    for asset in [tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset] {
         builder = push_transfer_group_shell(builder, asset);
     }
 
@@ -554,7 +622,13 @@ pub fn tree_covenant_script(
         .push_opcode(OP_ADD)
         .push_opcode(OP_EQUALVERIFY);
 
-    let builder = push_canonical_player_asset_counts(builder, log_asset, xp_asset);
+    let builder = push_canonical_player_asset_counts(
+        builder,
+        log_asset,
+        xp_asset,
+        stone_asset,
+        iron_ore_asset,
+    );
 
     // The TREE marker remains unique.
     let builder = push_input_asset_lookup(builder, TREE_INPUT_INDEX, tree_asset)
@@ -616,12 +690,67 @@ pub fn tree_covenant_script(
         .push_opcode(OP_DROP);
     let builder = push_optional_output_asset_lookup(builder, PLAYER_STATE_OUTPUT_INDEX, xp_asset)
         .push_opcode(OP_DROP);
-    Ok(builder
+    let builder = builder
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
+        .push_opcode(OP_ROT)
+        .push_opcode(OP_ADD)
+        .push_opcode(OP_EQUALVERIFY);
+
+    // The material bucket is independent of the LOG roll but can only pay on
+    // a successful LOG. Codes are 0 none, 1 STONE, 2 IRON ORE.
+    let builder =
+        crate::player::push_material_drop_code(builder, PLAYER_STATE_INPUT_INDEX, xp_asset);
+    let builder = builder
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_ELSE)
+        .push_opcode(OP_DROP)
+        .push_int(0)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_TOALTSTACK)
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
+        .push_int(1)
+        .push_opcode(OP_EQUAL);
+    let builder = push_tree_to_player_asset_delta(builder, stone_asset);
+    let builder = builder
+        .push_opcode(OP_FROMALTSTACK)
+        .push_int(2)
+        .push_opcode(OP_EQUAL);
+    Ok(push_tree_to_player_asset_delta(builder, iron_ore_asset)
+        .push_int(1)
+        .into_script())
+}
+
+/// Consume a zero-or-one reward bit and enforce an exact tree-to-player
+/// transfer of the selected asset.
+fn push_tree_to_player_asset_delta(builder: Builder, asset: AssetId) -> Builder {
+    let builder = builder.push_opcode(OP_TOALTSTACK);
+    let builder = push_input_asset_lookup(builder, TREE_INPUT_INDEX, asset)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_DUP)
+        .push_int(0)
+        .push_opcode(OP_GREATERTHAN)
+        .push_opcode(OP_VERIFY);
+    let builder = push_optional_output_asset_lookup(builder, TREE_OUTPUT_INDEX, asset)
+        .push_opcode(OP_DROP)
+        .push_opcode(OP_FROMALTSTACK)
+        .push_opcode(OP_DUP)
+        .push_opcode(OP_TOALTSTACK)
+        .push_opcode(OP_ADD)
+        .push_opcode(OP_EQUALVERIFY);
+    let builder = push_optional_input_asset_lookup(builder, PLAYER_STATE_INPUT_INDEX, asset)
+        .push_opcode(OP_DROP);
+    push_optional_output_asset_lookup(builder, PLAYER_STATE_OUTPUT_INDEX, asset)
+        .push_opcode(OP_DROP)
         .push_opcode(OP_FROMALTSTACK)
         .push_opcode(OP_ROT)
         .push_opcode(OP_ADD)
-        .push_opcode(OP_EQUAL)
-        .into_script())
+        .push_opcode(OP_EQUALVERIFY)
 }
 
 /// Permissionless renewal for one funded stump. Active trees and reserve-empty
@@ -630,8 +759,10 @@ pub fn tree_regrowth_covenant_script(
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
 ) -> Result<ScriptBuf> {
-    let builder = tree_renewal_base(tree_asset, log_asset, xp_asset)?;
+    let builder = tree_renewal_base(tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset)?;
     let builder = push_health_packet_value(builder, Some(RENEWAL_STATE_INPUT_INDEX))
         .push_int(0)
         .push_opcode(OP_EQUALVERIFY);
@@ -653,8 +784,10 @@ pub fn tree_maintenance_covenant_script(
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
 ) -> Result<ScriptBuf> {
-    let builder = tree_renewal_base(tree_asset, log_asset, xp_asset)?;
+    let builder = tree_renewal_base(tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset)?;
     let builder = push_health_packet_value(builder, Some(RENEWAL_STATE_INPUT_INDEX));
     let builder = push_health_packet_value(builder, None).push_opcode(OP_EQUALVERIFY);
     Ok(builder.push_int(1).into_script())
@@ -664,14 +797,18 @@ fn tree_renewal_base(
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
 ) -> Result<Builder> {
-    if [tree_asset, log_asset, xp_asset]
+    if [tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset]
         .into_iter()
         .collect::<std::collections::HashSet<_>>()
         .len()
-        != 3
+        != 5
     {
-        return Err(anyhow!("TREE, LOG, and XP asset IDs must differ"));
+        return Err(anyhow!(
+            "TREE, LOG, XP, STONE, and IRON ORE asset IDs must differ"
+        ));
     }
     let builder = push_renewal_shape(Builder::new())?;
     let builder = push_equal_input_output_scripts(
@@ -689,6 +826,8 @@ fn tree_renewal_base(
     let builder = push_transfer_group_shell(builder, tree_asset);
     let builder = push_optional_transfer_group_shell(builder, log_asset);
     let builder = push_optional_transfer_group_shell(builder, xp_asset);
+    let builder = push_optional_transfer_group_shell(builder, stone_asset);
+    let builder = push_optional_transfer_group_shell(builder, iron_ore_asset);
 
     let builder = push_input_asset_lookup(builder, RENEWAL_STATE_INPUT_INDEX, tree_asset)
         .push_int(1)
@@ -710,6 +849,23 @@ fn tree_renewal_base(
 
     let builder = push_optional_input_asset_lookup(builder, RENEWAL_STATE_INPUT_INDEX, xp_asset);
     let builder = push_optional_output_asset_lookup(builder, RENEWAL_STATE_OUTPUT_INDEX, xp_asset);
+    let builder = builder
+        .push_opcode(OP_ROT)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_EQUALVERIFY);
+
+    let builder = push_optional_input_asset_lookup(builder, RENEWAL_STATE_INPUT_INDEX, stone_asset);
+    let builder =
+        push_optional_output_asset_lookup(builder, RENEWAL_STATE_OUTPUT_INDEX, stone_asset);
+    let builder = builder
+        .push_opcode(OP_ROT)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_EQUALVERIFY);
+
+    let builder =
+        push_optional_input_asset_lookup(builder, RENEWAL_STATE_INPUT_INDEX, iron_ore_asset);
+    let builder =
+        push_optional_output_asset_lookup(builder, RENEWAL_STATE_OUTPUT_INDEX, iron_ore_asset);
     Ok(builder
         .push_opcode(OP_ROT)
         .push_opcode(OP_EQUALVERIFY)
@@ -984,29 +1140,37 @@ pub(crate) fn push_player_marker_group(
         .push_opcode(OP_EQUALVERIFY)
 }
 
-/// Require player state to contain its mandatory PLAYER_ID plus at most one LOG
-/// and one XP holding. Both reciprocal chop covenants use this exact sequence so
-/// their view of canonical player inventory cannot drift.
+/// Require player state to contain its mandatory PLAYER_ID plus at most one of
+/// each canonical inventory asset.
 pub(crate) fn push_canonical_player_asset_counts(
     builder: Builder,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
 ) -> Builder {
-    let builder = push_optional_input_asset_lookup(builder, PLAYER_STATE_INPUT_INDEX, log_asset)
-        .push_opcode(OP_NIP);
-    let builder = push_optional_input_asset_lookup(builder, PLAYER_STATE_INPUT_INDEX, xp_asset)
-        .push_opcode(OP_NIP)
-        .push_opcode(OP_ADD)
+    let mut builder =
+        push_optional_input_asset_lookup(builder, PLAYER_STATE_INPUT_INDEX, log_asset)
+            .push_opcode(OP_NIP);
+    for asset in [xp_asset, stone_asset, iron_ore_asset] {
+        builder = push_optional_input_asset_lookup(builder, PLAYER_STATE_INPUT_INDEX, asset)
+            .push_opcode(OP_NIP)
+            .push_opcode(OP_ADD);
+    }
+    builder = builder
         .push_int(1)
         .push_opcode(OP_ADD)
         .push_int(PLAYER_STATE_INPUT_INDEX as i64)
         .push_opcode(op::INSPECTINASSETCOUNT)
         .push_opcode(OP_EQUALVERIFY);
-    let builder = push_optional_output_asset_lookup(builder, PLAYER_STATE_OUTPUT_INDEX, log_asset)
+    builder = push_optional_output_asset_lookup(builder, PLAYER_STATE_OUTPUT_INDEX, log_asset)
         .push_opcode(OP_NIP);
-    push_optional_output_asset_lookup(builder, PLAYER_STATE_OUTPUT_INDEX, xp_asset)
-        .push_opcode(OP_NIP)
-        .push_opcode(OP_ADD)
+    for asset in [xp_asset, stone_asset, iron_ore_asset] {
+        builder = push_optional_output_asset_lookup(builder, PLAYER_STATE_OUTPUT_INDEX, asset)
+            .push_opcode(OP_NIP)
+            .push_opcode(OP_ADD);
+    }
+    builder
         .push_int(1)
         .push_opcode(OP_ADD)
         .push_int(i64::from(PLAYER_STATE_OUTPUT_INDEX))
@@ -1014,17 +1178,20 @@ pub(crate) fn push_canonical_player_asset_counts(
         .push_opcode(OP_EQUALVERIFY)
 }
 
-/// Prove that group zero is the PLAYER_ID and every remaining renewal group
-/// is one of the two optional player inventory assets.
+/// Prove that group zero is the PLAYER_ID and every remaining renewal group is
+/// one canonical optional player inventory asset.
 pub(crate) fn push_player_renewal_group_set(
     builder: Builder,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
 ) -> Builder {
-    let builder = push_optional_transfer_group_shell_counted(builder.push_int(1), log_asset)
-        .push_opcode(OP_ADD);
-    push_optional_transfer_group_shell_counted(builder, xp_asset)
-        .push_opcode(OP_ADD)
+    let mut builder = builder.push_int(1);
+    for asset in [log_asset, xp_asset, stone_asset, iron_ore_asset] {
+        builder = push_optional_transfer_group_shell_counted(builder, asset).push_opcode(OP_ADD);
+    }
+    builder
         .push_opcode(op::INSPECTNUMASSETGROUPS)
         .push_opcode(OP_EQUALVERIFY)
 }
@@ -1246,11 +1413,12 @@ mod tests {
     ) -> (crate::player::PlayerLuck, crate::player::PlayerLuck) {
         let mut previous = crate::player::PlayerLuck::initial(&player_script(7)).unwrap();
         previous.credit = crate::player::PlayerLuckCredit::new(
-            crate::player::CHOP_ROLL_BASIS_POINTS - crate::player::log_drop_basis_points(player_xp),
+            crate::player::CHOP_ROLL_BASIS_POINTS
+                - crate::player::log_drop_basis_points(player_xp, crate::player::AxeTier::None),
         )
         .unwrap();
         loop {
-            let (next, success) = previous.advance(player_xp);
+            let (next, success) = previous.advance(player_xp, crate::player::AxeTier::None);
             if success == expected_success {
                 return (previous, next);
             }
@@ -1303,11 +1471,15 @@ mod tests {
     #[test]
     fn successful_chop_moves_xp_and_log_to_player() {
         let (previous_player_luck, next_player_luck) = luck_for(0, true);
+        let material = crate::player::material_drop(next_player_luck.roll, 0, true);
+        let stone_reward = u64::from(material == crate::player::MaterialDrop::Stone);
+        let iron_ore_reward = u64::from(material == crate::player::MaterialDrop::IronOre);
         let valid = ChopTransition {
             previous_state: state(),
             next_state: state(),
             previous_player_luck,
             next_player_luck,
+            player_axe: crate::player::AxeTier::None,
             previous_health: TreeHealth::new(5).unwrap(),
             next_health: TreeHealth::new(4).unwrap(),
             player_xp_before: 0,
@@ -1321,6 +1493,14 @@ mod tests {
             player_logs_after: 10,
             player_xp_balance_before: 0,
             player_xp_balance_after: 1,
+            tree_stone_before: 5,
+            tree_stone_after: 5 - stone_reward,
+            tree_iron_ore_before: 5,
+            tree_iron_ore_after: 5 - iron_ore_reward,
+            player_stone_before: 2,
+            player_stone_after: 2 + stone_reward,
+            player_iron_ore_before: 1,
+            player_iron_ore_after: 1 + iron_ore_reward,
             player_value_before: 330,
             player_value_after: 330,
             tree_value_before: 330,
@@ -1352,6 +1532,7 @@ mod tests {
             next_state: state(),
             previous_player_luck,
             next_player_luck,
+            player_axe: crate::player::AxeTier::None,
             previous_health: TreeHealth::new(5).unwrap(),
             next_health: TreeHealth::new(5).unwrap(),
             player_xp_before: 0,
@@ -1365,6 +1546,14 @@ mod tests {
             player_logs_after: 9,
             player_xp_balance_before: 0,
             player_xp_balance_after: 0,
+            tree_stone_before: 5,
+            tree_stone_after: 5,
+            tree_iron_ore_before: 5,
+            tree_iron_ore_after: 5,
+            player_stone_before: 2,
+            player_stone_after: 2,
+            player_iron_ore_before: 1,
+            player_iron_ore_after: 1,
             player_value_before: 330,
             player_value_after: 330,
             tree_value_before: 330,
@@ -1407,7 +1596,7 @@ mod tests {
             (u64::MAX, 3_000),
         ] {
             assert_eq!(
-                crate::player::log_drop_basis_points(xp_balance),
+                crate::player::log_drop_basis_points(xp_balance, crate::player::AxeTier::None,),
                 basis_points,
                 "XP asset balance {xp_balance}"
             );
@@ -1430,8 +1619,10 @@ mod tests {
         let tree = asset(1, 0);
         let log = asset(1, 1);
         let xp = asset(1, 2);
-        let regrowth = tree_regrowth_covenant_script(tree, log, xp).unwrap();
-        let maintenance = tree_maintenance_covenant_script(tree, log, xp).unwrap();
+        let regrowth =
+            tree_regrowth_covenant_script(tree, log, xp, asset(2, 3), asset(2, 4)).unwrap();
+        let maintenance =
+            tree_maintenance_covenant_script(tree, log, xp, asset(2, 3), asset(2, 4)).unwrap();
         assert_ne!(regrowth, maintenance);
         for script in [&regrowth, &maintenance] {
             assert!(!ark_script::to_asm(script)
@@ -1449,6 +1640,8 @@ mod tests {
             health: TreeHealth,
             logs: u64,
             xp_balance: u64,
+            stone: u64,
+            iron_ore: u64,
             regrowths: u64,
         }
 
@@ -1457,6 +1650,8 @@ mod tests {
             state: crate::player::PlayerState,
             logs: u64,
             xp_balance: u64,
+            stone: u64,
+            iron_ore: u64,
         }
 
         for seed in 1_u64..=32 {
@@ -1467,9 +1662,12 @@ mod tests {
                             (index % 250 + 1) as u8,
                         ))
                         .unwrap(),
+                        axe: crate::player::AxeTier::None,
                     },
                     logs: 0,
                     xp_balance: 0,
+                    stone: 0,
+                    iron_ore: 0,
                 })
                 .collect::<Vec<_>>();
             let mut trees = (0_u32..10)
@@ -1482,6 +1680,8 @@ mod tests {
                     health: TreeHealth::new(LOGS_PER_TREE).unwrap(),
                     logs: 100,
                     xp_balance: 100,
+                    stone: 100,
+                    iron_ore: 100,
                     regrowths: 0,
                 })
                 .collect::<Vec<_>>();
@@ -1526,12 +1726,22 @@ mod tests {
                 let previous_health = tree.health;
                 let previous_logs = tree.logs;
                 let previous_tree_xp_balance = tree.xp_balance;
+                let previous_tree_stone = tree.stone;
+                let previous_tree_iron_ore = tree.iron_ore;
                 let previous_player_state = player.state;
                 let previous_player_logs = player.logs;
                 let previous_player_xp_balance = player.xp_balance;
+                let previous_player_stone = player.stone;
+                let previous_player_iron_ore = player.iron_ore;
                 let previous_xp = previous_player_xp_balance;
-                let (next_player_luck, success) = previous_player_state.luck.advance(previous_xp);
+                let (next_player_luck, success) = previous_player_state
+                    .luck
+                    .advance(previous_xp, crate::player::AxeTier::None);
                 let reward = u64::from(success);
+                let material =
+                    crate::player::material_drop(next_player_luck.roll, previous_xp, success);
+                let stone_reward = u64::from(material == crate::player::MaterialDrop::Stone);
+                let iron_ore_reward = u64::from(material == crate::player::MaterialDrop::IronOre);
                 let next_health =
                     TreeHealth::new(previous_health.value().checked_sub(reward).unwrap()).unwrap();
                 let next_logs = previous_logs.checked_sub(reward).unwrap();
@@ -1539,8 +1749,16 @@ mod tests {
                 let next_player_logs = previous_player_logs.checked_add(reward).unwrap();
                 let next_player_xp_balance =
                     previous_player_xp_balance.checked_add(reward).unwrap();
+                let next_tree_stone = previous_tree_stone.checked_sub(stone_reward).unwrap();
+                let next_tree_iron_ore =
+                    previous_tree_iron_ore.checked_sub(iron_ore_reward).unwrap();
+                let next_player_stone = previous_player_stone.checked_add(stone_reward).unwrap();
+                let next_player_iron_ore = previous_player_iron_ore
+                    .checked_add(iron_ore_reward)
+                    .unwrap();
                 let next_player_state = crate::player::PlayerState {
                     luck: next_player_luck,
+                    axe: crate::player::AxeTier::None,
                 };
 
                 ChopTransition {
@@ -1548,6 +1766,7 @@ mod tests {
                     next_state: tree.state,
                     previous_player_luck: previous_player_state.luck,
                     next_player_luck,
+                    player_axe: previous_player_state.axe,
                     previous_health,
                     next_health,
                     player_xp_before: previous_xp,
@@ -1563,6 +1782,14 @@ mod tests {
                     player_logs_after: next_player_logs,
                     player_xp_balance_before: previous_player_xp_balance,
                     player_xp_balance_after: next_player_xp_balance,
+                    tree_stone_before: previous_tree_stone,
+                    tree_stone_after: next_tree_stone,
+                    tree_iron_ore_before: previous_tree_iron_ore,
+                    tree_iron_ore_after: next_tree_iron_ore,
+                    player_stone_before: previous_player_stone,
+                    player_stone_after: next_player_stone,
+                    player_iron_ore_before: previous_player_iron_ore,
+                    player_iron_ore_after: next_player_iron_ore,
                     player_value_before: 330,
                     player_value_after: 330,
                     tree_value_before: 330,
@@ -1583,12 +1810,20 @@ mod tests {
                     state_logs_after: next_player_logs,
                     state_xp_balance_before: previous_player_xp_balance,
                     state_xp_balance_after: next_player_xp_balance,
+                    state_stone_before: previous_player_stone,
+                    state_stone_after: next_player_stone,
+                    state_iron_ore_before: previous_player_iron_ore,
+                    state_iron_ore_after: next_player_iron_ore,
                     tree_markers_before: 1,
                     tree_markers_after: 1,
                     tree_logs_before: previous_logs,
                     tree_logs_after: next_logs,
                     tree_xp_balance_before: previous_tree_xp_balance,
                     tree_xp_balance_after: next_tree_xp_balance,
+                    tree_stone_before: previous_tree_stone,
+                    tree_stone_after: next_tree_stone,
+                    tree_iron_ore_before: previous_tree_iron_ore,
+                    tree_iron_ore_after: next_tree_iron_ore,
                     state_value_before: 330,
                     state_value_after: 330,
                     tree_value_before: 330,
@@ -1601,9 +1836,13 @@ mod tests {
                 tree.health = next_health;
                 tree.logs = next_logs;
                 tree.xp_balance = next_tree_xp_balance;
+                tree.stone = next_tree_stone;
+                tree.iron_ore = next_tree_iron_ore;
                 player.state = next_player_state;
                 player.logs = next_player_logs;
                 player.xp_balance = next_player_xp_balance;
+                player.stone = next_player_stone;
+                player.iron_ore = next_player_iron_ore;
                 attempts += 1;
                 assert!(attempts < 20_000, "schedule {seed} did not terminate");
             }
@@ -1640,6 +1879,16 @@ mod tests {
                     + players.iter().map(|player| player.xp_balance).sum::<u64>(),
                 1_000
             );
+            assert_eq!(
+                trees.iter().map(|tree| tree.stone).sum::<u64>()
+                    + players.iter().map(|player| player.stone).sum::<u64>(),
+                1_000
+            );
+            assert_eq!(
+                trees.iter().map(|tree| tree.iron_ore).sum::<u64>()
+                    + players.iter().map(|player| player.iron_ore).sum::<u64>(),
+                1_000
+            );
         }
     }
 
@@ -1648,9 +1897,13 @@ mod tests {
         let tree = asset(1, 0);
         let log = asset(1, 1);
         let xp_balance = asset(1, 2);
-        let chop = tree_covenant_script(tree, log, xp_balance, 330).unwrap();
-        let regrowth = tree_regrowth_covenant_script(tree, log, xp_balance).unwrap();
-        let maintenance = tree_maintenance_covenant_script(tree, log, xp_balance).unwrap();
+        let chop =
+            tree_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4), 330).unwrap();
+        let regrowth =
+            tree_regrowth_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4)).unwrap();
+        let maintenance =
+            tree_maintenance_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4))
+                .unwrap();
         for script in [&chop, &regrowth, &maintenance] {
             assert!(script.len() <= 10_000);
             assert!(!ark_script::to_asm(script)
@@ -1664,6 +1917,26 @@ mod tests {
         assert!(chop_asm.contains("OP_NUM2BIN"));
         assert!(chop_asm.contains("OP_MOD"));
         assert!(chop_asm.contains("OP_SUB") || chop_asm.contains("OP_ADD"));
+        let material_unlock = Builder::new()
+            .push_int((crate::player::IRON_ORE_UNLOCK_XP_BALANCE - 1) as i64)
+            .push_opcode(OP_GREATERTHAN)
+            .push_opcode(OP_IF)
+            .into_script();
+        assert!(chop
+            .as_bytes()
+            .windows(material_unlock.len())
+            .any(|window| window == material_unlock.as_bytes()));
+        let early_material_unlock = Builder::new()
+            .push_int(1)
+            .push_opcode(OP_ADD)
+            .push_int((crate::player::IRON_ORE_UNLOCK_XP_BALANCE - 1) as i64)
+            .push_opcode(OP_GREATERTHAN)
+            .push_opcode(OP_IF)
+            .into_script();
+        assert!(!chop
+            .as_bytes()
+            .windows(early_material_unlock.len())
+            .any(|window| window == early_material_unlock.as_bytes()));
 
         let secp = Secp256k1::new();
         let operator = xonly(&secp, 3);
@@ -1679,6 +1952,8 @@ mod tests {
             tree,
             log,
             xp_balance,
+            asset(2, 3),
+            asset(2, 4),
             330,
         )
         .unwrap();
@@ -1722,9 +1997,13 @@ mod tests {
         let emulator = xonly(&secp, 4);
         let rollover = xonly(&secp, 5);
         let (tree, log, xp_balance) = (asset(1, 0), asset(1, 1), asset(1, 2));
-        let chop = tree_covenant_script(tree, log, xp_balance, 330).unwrap();
-        let regrowth = tree_regrowth_covenant_script(tree, log, xp_balance).unwrap();
-        let maintenance = tree_maintenance_covenant_script(tree, log, xp_balance).unwrap();
+        let chop =
+            tree_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4), 330).unwrap();
+        let regrowth =
+            tree_regrowth_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4)).unwrap();
+        let maintenance =
+            tree_maintenance_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4))
+                .unwrap();
         // An operator key equal to a script-tweaked emulator key could
         // satisfy the emulator position without executing the covenant.
         for script in [&chop, &regrowth, &maintenance] {
@@ -1739,6 +2018,8 @@ mod tests {
                 tree,
                 log,
                 xp_balance,
+                asset(2, 3),
+                asset(2, 4),
                 330,
             )
             .err()

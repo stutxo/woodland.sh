@@ -15,13 +15,15 @@ A player deposits exactly 330 sats, issues one uncontrolled marker in that same
 transaction, and sends both into an owner-specific recursive player contract.
 There is no allocator, invitation, protocol registry, player cap, or extra transaction.
 
-One genesis transaction creates three uncontrolled, fixed-supply assets:
+One genesis transaction creates five uncontrolled, fixed-supply assets:
 
 | Genesis group | Asset | Supply | Initial allocation |
 | --- | --- | ---: | --- |
 | 0 | TREE | 420 | one per tree |
 | 1 | LOG | 21,000,000 | 50,000 in each tree-local reserve |
 | 2 | XP asset units | 21,000,000 | 50,000 in each tree-local reserve |
+| 3 | STONE | 21,000,000 | 50,000 in each tree-local reserve |
+| 4 | IRON ORE | 21,000,000 | 50,000 in each tree-local reserve |
 
 Genesis metadata commits `game=woodland.sh`, `protocol=3`,
 `ruleset=woodland.sh/forest/v3`, the asset name, and the exact deployer and
@@ -31,33 +33,59 @@ reissuance.
 With Arkade dust `D = 330 sats`:
 
 ```text
-player state: D sats + 1 PLAYER_ID + player roll + luck credit
-              + optional LOG + optional XP asset units
-initial tree: 1 TREE + 50,000 LOG + 50,000 XP asset units + health 10
-              + fixed D (330 sats)
+player state: D sats + 1 PLAYER_ID + player roll + luck credit + axe tier
+              + optional LOG, XP asset units, STONE, and IRON ORE
+initial tree: 1 TREE + 50,000 each of LOG, XP asset units, STONE,
+              and IRON ORE + health 10 + fixed D (330 sats)
 ```
 
 XP has one canonical representation: the soulbound XP asset balance held by
 recursive player state. A successful swing transfers one LOG and one XP asset
 unit from the selected tree into player state; that unit deterministically
-represents 25 user-facing Woodcutting XP. A miss transfers nothing. Total LOG
-and XP asset supply remain 21,000,000 each, representing 525,000,000
-Woodcutting XP for the season.
+represents 25 user-facing Woodcutting XP. A miss transfers nothing. Genesis
+issues 21,000,000 LOG and XP units each, with 525,000,000 Woodcutting XP for the
+season. No asset can be reissued; axe recipes burn exact LOG/material amounts.
+
+Each successful LOG also evaluates an independent material bucket derived as
+`SHA256("woodland.sh/material-roll/v1" || next_player_roll) mod 10,000`.
+Before level 10, buckets 0–999 move one STONE. From level 10, buckets 0–199
+move one IRON ORE and 200–1,199 move one STONE. A miss never moves a material,
+and the disjoint ranges permit at most one material per swing.
 
 The first three LOGs produce 75 Woodcutting XP; the fourth reaches 100 and
 therefore level 2. Level 10 begins at the forty-seventh earned XP asset unit.
 
 Base LOG chance is 20%, rising by two percentage points at levels 10, 20, 30,
 40, and 50 of the reachable `woodland-xp-v1` curve
-(1,154 / 4,470 / 13,363 / 37,224 / 101,333 XP) to a 30% cap. Reward entropy
-belongs to the player lineage, not the selected tree, so changing targets
-cannot search for a better next outcome. A bounded luck-credit accumulator
-keeps realized rewards within two LOG of accumulated expected value, permits
-at most two consecutive successes, and limits the base rate to ten consecutive
-misses (at least one reward per eleven swings). The roll remains public and
-predictable; this is variance control, not hidden randomness. XP is soulbound.
-LOG is liquid and the protocol can withdraw it to any destination. The alpha
-browser intentionally leaves withdrawal to marketplaces and custom clients.
+(1,154 / 4,470 / 13,363 / 37,224 / 101,333 XP) to a 30% level cap. The
+equipped axe adds 2% / 5% / 8% for Wooden / Stone / Iron, for an absolute 38%
+cap. Reward entropy belongs to the player lineage, not the selected tree, so
+changing targets cannot search for a better next outcome. A bounded luck-credit
+accumulator keeps realized rewards within two LOG of accumulated expected
+value, permits at most two consecutive successes, and limits the base rate to
+ten consecutive misses (at least one reward per eleven swings). The roll
+remains public and predictable; this is variance control, not hidden
+randomness. XP, materials, and the equipped axe are soulbound. LOG is liquid
+and the protocol can withdraw it to any destination. The alpha browser
+intentionally leaves withdrawal to marketplaces and custom clients.
+
+## Axe Crafting
+
+Player state begins with axe packet type 9 set to `None`. An owner-authorized
+craft is a one-input/three-output recursive self-send: player state in; player
+state, merged extension, and canonical anchor out. The player covenant requires
+the exact next tier, preserves PLAYER_ID, XP, roll, luck, sats, and every
+unspent inventory asset, and burns exactly:
+
+| Axe | Required level | Recipe | LOG chance bonus |
+| --- | ---: | --- | ---: |
+| Wooden | 1 | 1 LOG | 2% |
+| Stone | 5 | 2 LOG + 2 STONE | 5% |
+| Iron | 15 | 5 LOG + 2 IRON ORE | 8% |
+
+There is no downgrade, skipped tier, unequip path, or client-selected recipe.
+Crafting requires owner, Arkade operator, and script-tweaked emulator
+signatures.
 
 ## Atomic Swing
 
@@ -66,36 +94,39 @@ Every swing spends and recreates exactly two gameplay VTXOs:
 ```text
 inputs:  player state, selected tree
 outputs: player state, selected tree, merged extension, canonical anchor
-groups:  PLAYER_ID, TREE, LOG, XP
+groups:  PLAYER_ID, TREE, LOG, XP, STONE, IRON ORE
 ```
 
 Group zero moves the player's exact one-unit PLAYER_ID from player input zero to
-player output zero. Groups one through three are the world's TREE, LOG, and XP.
+player output zero. Groups one through five are the world's TREE, LOG, XP,
+STONE, and IRON ORE.
 Together, the reciprocal Arkade covenants enforce the two-input/four-output
 shape, scripts, values, packet continuity, group order, empty transfer
 metadata/control fields, and anchor. Both covenants additionally enforce:
 
 - exactly one TREE marker;
 - player roll advancement `Rnext = SHA256(Rprevious)`;
-- input-XP-asset-dependent 20–30% threshold and bounded luck-credit transition;
-- health, LOG, and XP deltas equal to the same reward bit.
+- input-XP-asset and axe-dependent 20–38% threshold plus bounded luck credit;
+- health, LOG, and XP deltas equal to the same reward bit;
+- STONE and IRON ORE deltas equal to the successful swing's material bucket.
 
 The player tapleaf requires player, Arkade operator, and script-tweaked emulator
 signatures. The shared tree tapleaf requires operator and tweaked emulator.
 
 ## Stumps and One-Batch Regrowth
 
-Each tree owns its entire 50,000 LOG and 50,000-unit XP asset reserve, which
-represents 1,250,000 Woodcutting XP. There is no shared supply vault and no
-restock path. Ten successful drops reduce health from ten to zero while moving
-exactly ten LOG and ten XP asset units — 250 Woodcutting XP — into player state.
+Each tree owns its entire 50,000-unit LOG, XP asset, STONE, and IRON ORE
+reserves. Its XP reserve represents 1,250,000 Woodcutting XP. There is no shared
+supply vault and no restock path. Ten successful drops reduce health from ten
+to zero while moving exactly ten LOG and ten XP asset units — 250 Woodcutting
+XP — plus any selected materials into player state.
 
 A funded stump regrows to health ten in one fresh tree-renewal batch. Its TREE
-marker, coordinate, script, sats, and remaining local LOG/XP reserve are
-preserved exactly. Any caller may submit this covenant path; no player key,
-timer, block-height witness, or project-held lifecycle key participates. A
-terminal stump whose local reserve has reached zero cannot regrow or draw
-supply from another tree.
+marker, coordinate, script, sats, and remaining local LOG/XP/STONE/IRON ORE
+reserves are preserved exactly. Any caller may submit this covenant path; no
+player key, timer, block-height witness, or project-held lifecycle key
+participates. A terminal stump whose local reserve has reached zero cannot
+regrow or draw supply from another tree.
 
 ## Activation and Renewal
 
@@ -104,16 +135,17 @@ Activation is permissionless and browser-owned:
 1. derive the player's ordinary Arkade address;
 2. receive one exact 330-sat VTXO from any Arkade wallet;
 3. issue one uncontrolled `PLAYER_ID` into the personalized player state while
-   attaching a roll derived from the player contract's P2TR witness program and
-   8,000 luck credit;
+   attaching a roll derived from the player contract's P2TR witness program,
+   8,000 luck credit, and axe tier `None`;
 4. derive its AssetId from the activation txid and persist that exact ID before
    submission;
 5. index only state carrying that one-unit marker.
 
 For the direct issuance-to-state transaction above, every player covenant leaf
 recognizes the first recursive spend because the PLAYER_ID issuance txid equals
-the state input txid. It requires the script-derived roll and 8,000 credit, so
-renewal or withdrawal cannot launder a malformed direct activation.
+the state input txid. It requires the script-derived roll, 8,000 credit, and
+axe tier `None`, so renewal, withdrawal, or crafting cannot launder a malformed
+direct activation.
 
 The covenant cannot inspect ancestry from before a marker entered player state.
 A malicious owner can route a newly issued marker through an unconstrained
@@ -135,9 +167,10 @@ Player state has two exact-state batch-renewal paths:
 Every renewal carries PLAYER_ID group zero, so zero-XP state still has an Asset
 V1 packet. If arkd's current or scheduled intent policy charges a fee, renewal
 adds one clean, asset-free wallet VTXO and returns exact same-script change;
-state sats and assets remain untouched. The browser registers the intent,
-follows Arkade's batch event stream, contributes tree nonces/signatures,
-obtains emulator forfeit signatures, and validates the new expiry itself.
+state sats, PLAYER_ID, roll, luck, axe, and all four inventory assets remain
+untouched. The browser registers the intent, follows Arkade's batch event
+stream, contributes tree nonces/signatures, obtains emulator forfeit
+signatures, and validates the new expiry itself.
 
 Tree lifecycle uses two disjoint leaves. Funded-stump regrowth is permissionless
 apart from the Arkade operator and tweaked emulator closure, and may only change
@@ -152,7 +185,7 @@ immediately; it holds no player keys and proxies no player traffic.
 The protocol-critical review surface is intentionally small:
 
 - `src/protocol.rs`: canonical transaction, output, packet, and asset indexes;
-- `src/player.rs`: player state encoding, chop and withdrawal covenants, and signer verification;
+- `src/player.rs`: player state encoding, chop, withdrawal, and crafting covenants plus signer verification;
 - `src/tree.rs`: shared chop, funded-stump regrowth, and guarded maintenance covenants and host mirrors;
 - `src/world.rs`: mandatory manifest validation and contract reconstruction;
 - `src/renewal.rs`: exact-self-send intent construction and approval checks;

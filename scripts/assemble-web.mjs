@@ -13,12 +13,26 @@ const manifestPath = path.resolve(rawManifestPath);
 const outputPath = path.resolve(rawOutputPath);
 const manifestText = await readFile(manifestPath, 'utf8');
 const manifest = JSON.parse(manifestText);
+const expectedAxeRecipes = [
+  { axe: 'wooden', requiredLevel: 1, logCost: 1, stoneCost: 0, ironOreCost: 0 },
+  { axe: 'stone', requiredLevel: 5, logCost: 2, stoneCost: 2, ironOreCost: 0 },
+  { axe: 'iron', requiredLevel: 15, logCost: 5, stoneCost: 0, ironOreCost: 2 },
+];
 if (
   manifest.schemaVersion !== 3
   || manifest.protocolVersion !== 3
   || manifest.gameId !== 'woodland.sh'
   || manifest.rulesetId !== 'woodland.sh/forest/v3'
   || manifest.woodcuttingXpPerLog !== 25
+  || !/^[0-9a-f]{68}$/.test(manifest.stoneAsset || '')
+  || !/^[0-9a-f]{68}$/.test(manifest.ironOreAsset || '')
+  || manifest.stoneReservePerTree !== 50_000
+  || manifest.ironOreReservePerTree !== 50_000
+  || manifest.stoneDropBasisPoints !== 1_000
+  || manifest.ironOreDropBasisPoints !== 200
+  || manifest.ironOreUnlockLevel !== 10
+  || manifest.maxLogDropBasisPoints !== 3_800
+  || JSON.stringify(manifest.axeRecipes) !== JSON.stringify(expectedAxeRecipes)
   || !/^[0-9a-f]{64}$/.test(manifest.deployerSigner || '')
   || !/^[0-9a-f]{128}$/.test(manifest.manifestSignature || '')
 ) {

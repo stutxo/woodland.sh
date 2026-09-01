@@ -23,6 +23,12 @@ const walletSats = element('wallet-sats');
 const forestHealth = element('forest-health');
 const playerLogs = element('player-logs');
 const logSlot = element('log-slot');
+const playerStone = element('player-stone');
+const stoneSlot = element('stone-slot');
+const playerIronOre = element('player-iron-ore');
+const ironOreSlot = element('iron-ore-slot');
+const playerAxe = element('player-axe');
+const axeSlot = element('axe-slot');
 const playerState = element('player-state');
 const playerSession = element('player-session');
 const xpBacking = element('xp-backing');
@@ -51,6 +57,8 @@ const hudPosition = element('hud-position');
 const mapHint = element('map-hint');
 const refreshButton = element('refresh');
 const renewButton = element('renew-player');
+const craftAxeButton = element('craft-axe');
+const axeRecipe = element('axe-recipe');
 const activateButton = element('activate');
 const resetProfileButton = element('reset-profile');
 const resetButton = element('reset');
@@ -81,6 +89,12 @@ const DIRECTIONS = [[0, -1], [-1, 0], [1, 0], [0, 1]];
 const TREE_GLYPH = '🌲';
 const TILE_SIZE = 20;
 const MAX_PATH_NODES = 262_144;
+const AXE_NAMES = Object.freeze({
+  none: 'No Axe',
+  wooden: 'Wooden Axe',
+  stone: 'Stone Axe',
+  iron: 'Iron Axe',
+});
 const player = { x: 3, y: 17 };
 
 let app;
@@ -139,6 +153,20 @@ function withApp(action) {
 function appendLog(message) {
   const time = new Date().toLocaleTimeString();
   log.textContent = `[${time}] ${message}\n${log.textContent}`.slice(0, 8000);
+}
+
+function axeName(tier) {
+  return AXE_NAMES[tier] || 'Unknown Axe';
+}
+
+function axeRecipeSummary(recipe) {
+  if (!recipe) return 'Highest axe tier crafted';
+  const costs = [
+    recipe.logCost ? `${recipe.logCost} LOG` : '',
+    recipe.stoneCost ? `${recipe.stoneCost} STONE` : '',
+    recipe.ironOreCost ? `${recipe.ironOreCost} IRON ORE` : '',
+  ].filter(Boolean);
+  return `Level ${recipe.requiredLevel} · ${costs.join(' + ')}`;
 }
 
 function setBusy(value, message = '') {
@@ -981,6 +1009,20 @@ function render() {
   playerLogs.textContent = String(logCount);
   logSlot.classList.toggle('empty', logCount === 0);
   logSlot.setAttribute('aria-label', `${logCount} LOG in inventory`);
+  const stoneCount = state.playerStone || 0;
+  playerStone.textContent = String(stoneCount);
+  stoneSlot.classList.toggle('empty', stoneCount === 0);
+  stoneSlot.setAttribute('aria-label', `${stoneCount} STONE in inventory`);
+  const ironOreCount = state.playerIronOre || 0;
+  playerIronOre.textContent = String(ironOreCount);
+  ironOreSlot.classList.toggle('empty', ironOreCount === 0);
+  ironOreSlot.setAttribute('aria-label', `${ironOreCount} IRON ORE in inventory`);
+  const currentAxeName = axeName(state.playerAxe);
+  playerAxe.textContent = state.playerAxe === 'none'
+    ? 'None'
+    : currentAxeName.replace(' Axe', '');
+  axeSlot.classList.toggle('empty', state.playerAxe === 'none');
+  axeSlot.setAttribute('aria-label', `${currentAxeName} equipped`);
 
   const stumps = worldTrees().filter((candidate) => candidate.health === 0 && !candidate.depleted);
   const depleted = worldTrees().filter((candidate) => candidate.depleted);
@@ -999,6 +1041,19 @@ function render() {
   restoreBackupButton.title = state.pendingChopTxid
     ? 'Wait for the pending swing to reconcile before switching keys.'
     : '';
+  const nextRecipe = state.nextAxeRecipe;
+  axeRecipe.textContent = axeRecipeSummary(nextRecipe);
+  craftAxeButton.textContent = nextRecipe
+    ? `Craft ${axeName(nextRecipe.axe)}`
+    : 'Highest axe crafted';
+  craftAxeButton.disabled = walking
+    || busy
+    || !playerActive
+    || !state.craftAxeReady
+    || Boolean(state.pendingChopTxid);
+  craftAxeButton.title = !playerActive
+    ? 'Create a player before crafting.'
+    : axeRecipeSummary(nextRecipe);
   const rolloverDue = state.playerStateExpiresInSeconds != null
     && state.playerRolloverMarginSeconds != null
     && state.playerStateExpiresInSeconds < state.playerRolloverMarginSeconds;
@@ -1016,10 +1071,14 @@ function render() {
       : `${tree.health} active`;
     element('tree-reserve').textContent = `${tree.logReserveRemaining} LOG`;
     element('tree-xp').textContent = `${tree.xpRemaining} Woodcutting XP`;
+    element('tree-stone').textContent = `${tree.stoneRemaining} STONE`;
+    element('tree-iron-ore').textContent = `${tree.ironOreRemaining} IRON ORE`;
     element('player-asset').textContent = state.playerAsset || 'not issued';
     element('tree-asset').textContent = state.treeAsset;
     element('log-asset').textContent = state.logAsset;
     element('xp-asset').textContent = state.xpAsset;
+    element('stone-asset').textContent = state.stoneAsset;
+    element('iron-ore-asset').textContent = state.ironOreAsset;
     element('tree-value').textContent = `${tree.valueSats} sats fixed`;
     element('tree-outpoint').textContent = tree.treeOutpoint;
     element('last-chop').textContent = tree.lastAttemptTxid || 'none';
@@ -1297,6 +1356,7 @@ async function waitForChopCadence(startedAt) {
 async function chopUntilLog(treeId) {
   let swings = 0;
   let success = false;
+  let material = 'none';
   const runStartedAt = performance.now();
   chopping = true;
   stopChopping = false;
@@ -1322,6 +1382,7 @@ async function chopUntilLog(treeId) {
       adoptState(nextState);
       swings += 1;
       success = state.lastAttempt?.success === true;
+      material = state.lastAttempt?.material || 'none';
       if (success) flashTree(treeId, 'log', LOG_FLASH_MS, false);
       render();
       if (!success) await waitForChopCadence(submittedAt);
@@ -1333,6 +1394,7 @@ async function chopUntilLog(treeId) {
       treeId,
       swings,
       success,
+      material,
       cancelled: stopChopping && !success,
       durationMs: Math.round(performance.now() - runStartedAt),
     };
@@ -1366,7 +1428,12 @@ function attemptChop() {
     () => {
       if (lastChopRun?.success) {
         const suffix = lastChopRun.swings === 1 ? 'swing' : 'swings';
-        return `You get a LOG and ${state.woodcuttingXpPerLog} Woodcutting XP after ${lastChopRun.swings} ${suffix}.`;
+        const materialMessage = lastChopRun.material === 'stone'
+          ? ' You also find STONE.'
+          : lastChopRun.material === 'ironOre'
+            ? ' You also find IRON ORE.'
+            : '';
+        return `You get a LOG and ${state.woodcuttingXpPerLog} Woodcutting XP after ${lastChopRun.swings} ${suffix}.${materialMessage}`;
       }
       if (lastChopRun?.cancelled) {
         return `Stopped after ${lastChopRun.swings} accepted swing${lastChopRun.swings === 1 ? '' : 's'}.`;
@@ -1389,6 +1456,16 @@ chatForm.addEventListener('submit', (event) => {
   if (message) void submitChat(message);
 });
 
+
+craftAxeButton.addEventListener('click', () => {
+  const recipe = state?.nextAxeRecipe;
+  if (!recipe) return;
+  run(
+    `Crafting ${axeName(recipe.axe)} under the player covenant...`,
+    () => withApp(() => app.craftAxe()),
+    () => `${axeName(state.playerAxe)} crafted and equipped.`,
+  );
+});
 
 renewButton.addEventListener('click', () => {
   run(
@@ -1461,6 +1538,8 @@ async function boot() {
       health: manifest.activeLogsPerTree,
       logReserveRemaining: manifest.logReservePerTree,
       xpRemaining: manifest.xpPerTree * manifest.woodcuttingXpPerLog,
+      stoneRemaining: manifest.stoneReservePerTree,
+      ironOreRemaining: manifest.ironOreReservePerTree,
       valueSats: manifest.dustSats,
       treeOutpoint: `${deploymentTxid}:0`,
       deploymentTxid,
@@ -1536,6 +1615,11 @@ async function boot() {
     };
     globalThis.__WOODLAND_E2E_WITHDRAW_LOG = async (amount) => {
       adoptState(await withApp(() => app.withdrawLog(amount)));
+      render();
+      return state;
+    };
+    globalThis.__WOODLAND_E2E_CRAFT_AXE = async () => {
+      adoptState(await withApp(() => app.craftAxe()));
       render();
       return state;
     };

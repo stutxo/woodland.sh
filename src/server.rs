@@ -421,6 +421,8 @@ fn player_contract(verifier: &Verifier, owner: XOnlyPublicKey) -> Result<PlayerC
         verifier.world.tree_asset,
         verifier.world.log_asset,
         verifier.world.xp_asset,
+        verifier.world.stone_asset,
+        verifier.world.iron_ore_asset,
         verifier.params.dust_sats,
         &verifier.world.contract.vtxo.script_pubkey(),
     )

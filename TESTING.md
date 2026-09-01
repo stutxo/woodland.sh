@@ -41,9 +41,9 @@ node scripts/test-assemble-web.mjs
 The regtest wrapper builds unmodified arkd commit
 `c7c3184f5cd416e231023f717489a5b0550960cc`, including the upstream atomic
 offchain-spend fix. Protocol v3 uses ordinary Asset V1 validity. TREE, LOG, XP,
-and each PLAYER_ID have no control asset; a fresh issuance creates a different
-AssetId rather than reissuing an existing one. No custom arkd or emulator patch
-or policy proxy is part of the protocol.
+STONE, IRON ORE, and each PLAYER_ID have no control asset; a fresh issuance
+creates a different AssetId rather than reissuing an existing one. No custom
+arkd or emulator patch or policy proxy is part of the protocol.
 
 ## Functional Profiles
 
@@ -58,10 +58,11 @@ Bitcoin/indexers/stock arkd/emulator, deploy a fresh signed schema 3 world,
 build the web bundle, and serve the bundle plus `/v1/*` API from one native
 Axum origin. Browser and renewal stages then run before teardown.
 
-Smoke proves the complete path quickly. Full exercises player-bound luck,
-bounded reward streaks, harvesting, lifecycle renewal, LOG withdrawal,
-recovery, adversarial mutations, and four-player concurrency. The dedicated
-`regrowth` profile exercises complete one-batch stump regrowth.
+Smoke proves the complete path quickly, including one covenant-enforced Wooden
+Axe craft. Full exercises player-bound luck, bounded reward streaks, material
+drops, harvesting, axe crafting, lifecycle renewal, LOG withdrawal, recovery,
+adversarial mutations, and four-player concurrency. The dedicated `regrowth`
+profile exercises complete one-batch stump regrowth.
 Both mobile and desktop checks require the player overlay to remain exactly
 centered across every sampled frame while only the Canvas camera changes. Tests
 also require viewport-only tile rendering, zero per-tile DOM nodes, real canvas
@@ -84,17 +85,18 @@ A clean deployment verifies:
 
 - signed schema 3, protocol 3, and ruleset `woodland.sh/forest/v3`;
 - canonical BIP340 manifest authentication under the declared deployer;
-- one genesis txid with TREE group 0, LOG group 1, and XP group 2;
-- supplies 420, 21,000,000, and 21,000,000;
-- signed `woodcuttingXpPerLog = 25`;
+- one genesis txid with TREE/LOG/XP/STONE/IRON ORE groups 0/1/2/3/4;
+- supplies 420 and 21,000,000 for each of the four inventory assets;
+- signed rates: 25 XP per LOG, 20–30% level rate, 38% absolute axe rate,
+  10% STONE, 2% IRON ORE from level 10, and exact three-tier axe recipes;
 - metadata `game=woodland.sh`, `protocol=3`, exact ruleset and label, and exact
   deployer and rollover signers;
 - exact `treeScript`, `treeChopArkadeScript`, `treeRegrowthArkadeScript`, and
   `treeMaintenanceArkadeScript` commitments;
 - no retired-tree or vault fields;
 - no control asset;
-- exactly 420 tree VTXOs with one TREE, 50,000 LOG, 50,000 XP asset units,
-  health ten, and 330 sats;
+- exactly 420 tree VTXOs with one TREE, 50,000 units each of LOG, XP, STONE,
+  and IRON ORE, health ten, and 330 sats;
 - total world funding 138,600 sats;
 - no shared vault, player reserve, or allocator signer.
 
@@ -104,28 +106,33 @@ The browser stage verifies:
 
 - direct CORS calls to Arkade and the stock emulator, with no Woodland proxy;
 - one exact 330-sat deposit issues a unique PLAYER_ID and activates player state
-  with canonical roll and initial luck credit entirely client-side;
+  with canonical roll, initial luck credit, and axe tier `None` entirely
+  client-side;
 - the profile persists the exact transaction-derived AssetId;
-- every live tree exposes the same next outcome for one player, while different
-  players retain independent outcomes;
+- every live tree exposes the same next LOG/material outcome for one player,
+  while different players retain independent outcomes;
 - every swing satisfies
   `next credit + 10,000*drop = previous credit + rate`, keeps credit within
   0–20,000, and respects the ten-miss/two-success protection bounds;
-- zero-XP and nonzero-XP owner renewals preserve PLAYER_ID and extend expiry
-  without a player API;
+- every material delta matches the independent roll bucket, occurs only with a
+  LOG, and moves at most one of STONE or IRON ORE;
+- zero-XP and nonzero-XP owner renewals preserve PLAYER_ID, all four inventory
+  assets, and axe while extending expiry without a player API;
 - fee-policy tests require a clean asset-free funding VTXO, maximum
   current/scheduled fee selection, exact same-contract change, and unchanged
   recursive state;
-- player state holds harvested LOG and earned soulbound XP asset units;
+- player state holds harvested LOG and earned soulbound XP/material units;
 - user-facing Woodcutting XP is exactly `25 ×` the held XP asset balance;
 - levels 2 and 3 appear after four and seven successful LOGs;
-- LOG and XP assets remain conserved across trees and players after every
-  transition;
+- per-asset tree/player accounting and indexed issued supplies remain exact
+  after every transition;
 - `seasonXpRemaining` reports on-tree Woodcutting XP (525,000,000 at genesis);
-- an owner LOG withdrawal through the `withdrawLog` API moves LOG out while
-  XP, PLAYER_ID, sats, roll, and luck credit remain, and an over-balance
-  withdrawal is rejected client-side;
-- click-to-walk/chop updates rendered map, bag, stats, and effects;
+- a Wooden Axe craft burns exactly one LOG, preserves progression and the tree,
+  raises LOG chance by 200 basis points, and rejects the level-locked Stone Axe;
+- an owner LOG withdrawal through the `withdrawLog` API moves LOG out while XP,
+  materials, axe, PLAYER_ID, sats, roll, and luck credit remain, and an
+  over-balance withdrawal is rejected client-side;
+- click-to-walk/chop updates rendered map, bag, tool, recipe, stats, and effects;
 - state recovery after reload preserves the player key, PLAYER_ID, and lineage.
 
 Set `WOODLAND_E2E_REQUIRE_RENEWAL_FEE=1` with a nonzero
@@ -138,22 +145,23 @@ also support intentionally fee-free local overrides.
 Mutation probes require emulator rejection without indexed outpoint changes for:
 
 - wrong player-roll successor or luck-credit successor;
-- missing or extra XP/LOG asset delta;
+- missing or extra XP/LOG delta or wrong STONE/IRON ORE delta;
 - malformed health or luck-credit encoding;
 - TREE inflation;
 - swapped or foreign asset groups;
 - PLAYER_ID or inventory transfer metadata, and control-asset references;
 - extra output, wrong anchor, or funded extension;
-- stale expected tree, player-state, or drop preconditions.
+- stale expected tree, player-state, or LOG preconditions.
 
 Tree lifecycle tests require distinct leaves and signer sets: permissionless
 funded-stump regrowth resets health to ten; rollover-authorized maintenance
 preserves active or terminal health exactly. Both conserve local reserves and
 use the zero-locktime transaction shape rebuilt by stock arkd.
 
-Native tests additionally cover exact signature sets, previous-transaction
-binding, checkpoint mapping, mandatory-marker renewal, decoy-marker rejection,
-malformed graph chunks, nonce/signature ordering, and forfeit combination.
+Native tests additionally cover exact signature sets, axe packet mutation,
+craft tier/recipe enforcement, previous-transaction binding, checkpoint
+mapping, mandatory-marker renewal, decoy-marker rejection, malformed graph
+chunks, nonce/signature ordering, and forfeit combination.
 
 ## One-Batch Regrowth
 
@@ -165,17 +173,18 @@ The dedicated profile uses the canonical world without reserve overrides:
 
 One Firefox player harvests exactly ten successful drops from a pristine tree,
 reaching 250 Woodcutting XP and level 3 while producing health zero, 49,990
-local LOG, and 49,990 local XP asset units. A second Firefox browser remains
-inactive and carries only a clean ordinary-wallet VTXO for arkd intent fees. It
-clicks the stump and completes one permissionless renewal batch, proving that
-active player state and player-key covenant authorization are unnecessary. The
-harness mines no delay blocks.
+local LOG, 49,990 local XP asset units, and deterministic material deltas. A
+second Firefox browser remains inactive and carries only a clean ordinary-wallet
+VTXO for arkd intent fees. It clicks the stump and completes one permissionless
+renewal batch, proving that active player state and player-key covenant
+authorization are unnecessary. The harness mines no delay blocks.
 
 Immutable state, TREE, 330 sats, coordinate, script, player-bound entropy, and
-the 49,990-unit local reserve remain unchanged. Indexer assertions require the
-old stump spent, the new health-ten tree live, and fixed TREE/LOG/XP supplies of
-420/21,000,000/21,000,000. The report records the observed batch latency at
-`regtest/_build/regrowth-report.json`.
+all post-harvest local reserves remain unchanged by regrowth. Indexer assertions
+require the old stump spent, the new health-ten tree live, and fixed issued
+TREE/LOG/XP/STONE/IRON ORE supplies of
+420/21,000,000/21,000,000/21,000,000/21,000,000. The report records the
+observed batch latency at `regtest/_build/regrowth-report.json`.
 
 For a prepared remote-compatible world, the funding executable is called for
 both the activation VTXO and the inactive regrower's fee VTXO, as
@@ -208,10 +217,11 @@ of being discarded.
 Smoke starts two browser wallets; full starts four. Each receives 330 sats,
 issues a distinct PLAYER_ID, activates, automatically registers, rejects forged
 registration and location, exchanges authenticated presence and chat, and
-appears with independently verified XP/LOG state. Regtest also forces one signed
-delegated renewal and verifies revocation. Players then chop disjoint trees
-concurrently; a same-tree race must produce one winning state transition. There
-is no shared activation reserve or finite ticket supply.
+appears with independently verified XP/LOG/STONE/IRON ORE and axe state.
+Regtest also forces one signed delegated renewal and verifies revocation.
+Players then chop disjoint trees concurrently; a same-tree race must produce
+one winning state transition. There is no shared activation reserve or finite
+ticket supply.
 
 The multiplayer stage injects one emulator submission failure after journaling,
 then requires exact-PSBT recovery, rotated state/tree outpoints, and no remaining
@@ -229,12 +239,14 @@ races every player against the same tree outpoint for 30 rounds:
 ```
 
 Every round requires exactly one committed player/tree transition, converged
-tree state, no pending chops, conserved manifest-declared LOG/XP across all
-players and trees, and exact indexed TREE/LOG/XP supplies. The runner determines
-the winner from reconciled outpoints rather than a possibly ambiguous submission
-response. Convergence refreshes exercise the same exact-transaction pending
-recovery as the browser polling loop; this matters when an Ark batch disappears
-after exposing a transient indexed successor. Independent browser refreshes can
+tree state, no pending chops, exact manifest-declared per-asset accounting
+across all players and trees, and exact indexed TREE/LOG/XP/STONE/IRON ORE
+issued supplies. The runner determines the winner from reconciled outpoints
+rather than a possibly ambiguous submission response. Convergence refreshes
+exercise the same exact-transaction pending recovery as the browser polling
+loop; this matters when an Ark batch disappears after exposing a transient
+indexed successor.
+Independent browser refreshes can
 also straddle legitimate active-tree maintenance.
 The JSON report records
 client-reported acceptances, recovered unknown outcomes, convergence retries,
@@ -376,14 +388,14 @@ different profiles instead of repeating one load shape:
 
 Grouped rounds require exactly one player/tree transaction per target tree.
 Additional player outpoint transitions are accepted only when the PLAYER_ID,
-XP, LOG, luck credit, and level are unchanged; the report counts these as
-independent expiry renewals. Each convergence probe refreshes the full fixed
-viewport, while pending journals exercise exact transaction recovery. Browser
-reloads must restore the same PLAYER_ID from storage, recover any pending state,
-re-register with the server, and converge with browsers that stayed online. The
-harness reapplies its fixed soak viewport after every WebDriver reload so
-pending-tree reconciliation observes the same target set. Every profile still
-verifies global TREE/LOG/XP supplies.
+XP, LOG, STONE, IRON ORE, axe, luck credit, and level are unchanged; the report
+counts these as independent expiry renewals. Each convergence probe refreshes
+the full fixed viewport, while pending journals exercise exact transaction
+recovery. Browser reloads must restore the same PLAYER_ID from storage, recover
+any pending state, re-register with the server, and converge with browsers that
+stayed online. The harness reapplies its fixed soak viewport after every
+WebDriver reload so pending-tree reconciliation observes the same target set.
+Every profile still verifies global TREE/LOG/XP/STONE/IRON ORE issued supplies.
 
 The default duration is four hours and the default plan is
 `full,burst,chaos,fanout,reload,renewal,regrowth`. Duration and plan remain

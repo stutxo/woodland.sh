@@ -3,8 +3,8 @@
 //! The reference browser is one consumer of the protocol modules; this client
 //! is the headless equivalent for bots and alternative frontends. It holds no
 //! framework and no hidden state: connect with a world manifest and player
-//! keys, then drive [`WoodlandClient::activate`], [`WoodlandClient::chop`],
-//! [`WoodlandClient::regrow`], and [`WoodlandClient::renew_player`].
+//! keys, then drive activation, chopping, axe crafting, regrowth, and renewal
+//! through [`WoodlandClient`].
 //! Persistence of the player key, PLAYER_ID, and any submission journal is the caller's choice.
 
 use crate::arkade::{ArkadeRest, EmulatorParams, EmulatorRest, ServerParams, VtxoRecord};
@@ -31,6 +31,8 @@ pub struct PlayerSnapshot {
     previous_tx: Transaction,
     pub logs: u64,
     pub xp_balance: u64,
+    pub stone: u64,
+    pub iron_ore: u64,
 }
 
 impl PlayerSnapshot {
@@ -51,6 +53,8 @@ pub struct TreeSnapshot {
     pub record: VtxoRecord,
     /// Current LOG reserve; one successful swing moves one unit to the player.
     pub logs: u64,
+    pub stone_reserve: u64,
+    pub iron_ore_reserve: u64,
     /// Current XP reserve; tracks LOG one-for-one.
     pub xp_reserve: u64,
     previous_tx: Transaction,
@@ -61,9 +65,18 @@ pub struct TreeSnapshot {
 pub struct ChopOutcome {
     pub tree_id: u32,
     pub success: bool,
+    pub material: player::MaterialDrop,
     pub txid: Txid,
     pub player_outpoint: OutPoint,
     pub tree_outpoint: OutPoint,
+}
+
+/// What a settled covenant-enforced axe upgrade produced.
+#[derive(Clone, Copy, Debug)]
+pub struct CraftOutcome {
+    pub axe: player::AxeTier,
+    pub txid: Txid,
+    pub player_outpoint: OutPoint,
 }
 
 pub struct WoodlandClient {
@@ -110,6 +123,8 @@ impl WoodlandClient {
             world.tree_asset,
             world.log_asset,
             world.xp_asset,
+            world.stone_asset,
+            world.iron_ore_asset,
             params.dust_sats,
             &world.contract.vtxo.script_pubkey(),
         )?;
@@ -187,12 +202,16 @@ impl WoodlandClient {
             .ok_or_else(|| anyhow!("player creating transaction has no state packets"))?;
         let logs = record.asset_amount(self.world.log_asset).unwrap_or(0);
         let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
+        let stone = record.asset_amount(self.world.stone_asset).unwrap_or(0);
+        let iron_ore = record.asset_amount(self.world.iron_ore_asset).unwrap_or(0);
         Ok(Some(PlayerSnapshot {
             state,
             record,
             previous_tx,
             logs,
             xp_balance,
+            stone,
+            iron_ore,
         }))
     }
 
@@ -286,17 +305,23 @@ impl WoodlandClient {
         }
         let logs = record.asset_amount(self.world.log_asset).unwrap_or(0);
         let xp_reserve = record.asset_amount(self.world.xp_asset).unwrap_or(0);
+        let stone_reserve = record.asset_amount(self.world.stone_asset).unwrap_or(0);
+        let iron_ore_reserve = record.asset_amount(self.world.iron_ore_asset).unwrap_or(0);
         if record.amount_sats != self.manifest.dust_sats
             || record.script != self.world.contract.vtxo.script_pubkey()
             || record.asset_amount(self.world.tree_asset) != Some(1)
             || logs > self.manifest.log_reserve_per_tree
             || xp_reserve > self.manifest.xp_per_tree
+            || stone_reserve > self.manifest.stone_reserve_per_tree
+            || iron_ore_reserve > self.manifest.iron_ore_reserve_per_tree
             || logs != xp_reserve
             || health.value() > logs
             || !record.assets.iter().all(|asset| {
                 asset.asset_id == self.world.tree_asset
                     || asset.asset_id == self.world.log_asset
                     || asset.asset_id == self.world.xp_asset
+                    || asset.asset_id == self.world.stone_asset
+                    || asset.asset_id == self.world.iron_ore_asset
             })
         {
             return Err(anyhow!("tree record has invalid local reserves"));
@@ -307,6 +332,8 @@ impl WoodlandClient {
             record,
             logs,
             xp_reserve,
+            stone_reserve,
+            iron_ore_reserve,
             previous_tx,
         })
     }
@@ -372,7 +399,10 @@ impl WoodlandClient {
         let initial_luck = player::PlayerLuck::initial(&self.contract.vtxo.script_pubkey())?;
         player::attach_player_state_packets(
             &mut activation.ark_tx,
-            PlayerState { luck: initial_luck },
+            PlayerState {
+                luck: initial_luck,
+                axe: player::AxeTier::None,
+            },
         )?;
         if activation.ark_tx.unsigned_tx.output.len() != protocol::ACTIVATION_OUTPUT_COUNT {
             return Err(anyhow!("activation transaction has an invalid shape"));
@@ -433,6 +463,8 @@ impl WoodlandClient {
                 tree_asset: self.world.tree_asset,
                 log_asset: self.world.log_asset,
                 xp_asset: self.world.xp_asset,
+                stone_asset: self.world.stone_asset,
+                iron_ore_asset: self.world.iron_ore_asset,
                 dust_sats: self.params.dust_sats,
                 map_width: self.manifest.map_width,
             },
@@ -483,6 +515,7 @@ impl WoodlandClient {
                         return Ok(ChopOutcome {
                             tree_id,
                             success: prepared.success,
+                            material: prepared.material,
                             txid,
                             player_outpoint: expected_player,
                             tree_outpoint: expected_tree,
@@ -516,9 +549,71 @@ impl WoodlandClient {
         Ok(ChopOutcome {
             tree_id,
             success: prepared.success,
+            material: prepared.material,
             txid,
             player_outpoint: expected_player,
             tree_outpoint: expected_tree,
+        })
+    }
+
+    /// Burn the exact next-tier recipe under the recursive player covenant.
+    /// XP, PLAYER_ID, roll, luck, sats, and unspent inventory remain in state.
+    pub async fn craft_axe(&mut self) -> Result<CraftOutcome> {
+        let player = self
+            .sync_player()
+            .await?
+            .ok_or_else(|| anyhow!("activate the player before crafting an axe"))?;
+        let player_asset = self
+            .player_asset
+            .ok_or_else(|| anyhow!("activate the player before crafting an axe"))?;
+        let prepared = crate::chop::prepare_craft(
+            &self.keys,
+            &self.info(),
+            &self.contract,
+            player_asset,
+            &player.record,
+            &player.previous_tx,
+            player.state,
+        )?;
+        let txid = prepared.ark_tx.unsigned_tx.compute_txid();
+        let player_outpoint = OutPoint {
+            txid,
+            vout: u32::from(protocol::CRAFT_STATE_OUTPUT_INDEX),
+        };
+        let (returned_ark, _) = self
+            .emulator
+            .submit_tx(&prepared.ark_tx, &prepared.checkpoint_txs)
+            .await
+            .context("submit axe crafting transaction to emulator")?;
+        if returned_ark.unsigned_tx != prepared.ark_tx.unsigned_tx {
+            return Err(anyhow!(
+                "emulator changed the submitted axe crafting transaction"
+            ));
+        }
+        self.wait_for_vtxo(
+            &self.contract.vtxo.script_pubkey().to_hex_string(),
+            player_outpoint,
+        )
+        .await?;
+        let settled = self
+            .sync_player()
+            .await?
+            .ok_or_else(|| anyhow!("crafted player state was not discovered"))?;
+        let recipe = prepared.recipe;
+        if settled.record.outpoint != player_outpoint
+            || settled.state.axe != recipe.axe
+            || settled.state.luck != player.state.luck
+            || settled.logs != player.logs - recipe.log_cost
+            || settled.xp_balance != player.xp_balance
+            || settled.stone != player.stone - recipe.stone_cost
+            || settled.iron_ore != player.iron_ore - recipe.iron_ore_cost
+        {
+            return Err(anyhow!("settled axe crafting state is invalid"));
+        }
+        Ok(CraftOutcome {
+            axe: recipe.axe,
+            txid,
+            player_outpoint,
         })
     }
 
@@ -606,6 +701,7 @@ impl WoodlandClient {
         Ok(ChopOutcome {
             tree_id: 0,
             success: true,
+            material: player::MaterialDrop::None,
             txid,
             player_outpoint: state_outpoint,
             tree_outpoint: state_outpoint,
@@ -629,6 +725,8 @@ impl WoodlandClient {
             self.world.tree_asset,
             self.world.log_asset,
             self.world.xp_asset,
+            self.world.stone_asset,
+            self.world.iron_ore_asset,
             self.params.dust_sats,
             0,
         )?;

@@ -16,9 +16,9 @@ use crate::arkade::{now_unix, VtxoRecord};
 use crate::keys::Keys;
 use crate::player::{PlayerContract, PlayerState};
 use crate::protocol::{
-    PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_ROLL_PACKET_TYPE, RENEWAL_FEE_INPUT_INDEX,
-    RENEWAL_INPUT_COUNT, RENEWAL_STATE_INPUT_INDEX, RENEWAL_STATE_OUTPUT_INDEX,
-    TREE_HEALTH_PACKET_TYPE, TREE_STATE_PACKET_TYPE,
+    PLAYER_AXE_PACKET_TYPE, PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_ROLL_PACKET_TYPE,
+    RENEWAL_FEE_INPUT_INDEX, RENEWAL_INPUT_COUNT, RENEWAL_STATE_INPUT_INDEX,
+    RENEWAL_STATE_OUTPUT_INDEX, TREE_HEALTH_PACKET_TYPE, TREE_STATE_PACKET_TYPE,
 };
 use crate::tree::{TreeContract, TreeState};
 use anyhow::{anyhow, Context, Result};
@@ -127,6 +127,8 @@ pub fn prepare_tree(
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
+    stone_asset: AssetId,
+    iron_ore_asset: AssetId,
     dust_sats: u64,
     expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
@@ -139,8 +141,10 @@ pub fn prepare_tree(
     let tree_count = asset_amount(&assets, tree_asset);
     let log_count = asset_amount(&assets, log_asset);
     let xp_count = asset_amount(&assets, xp_asset);
+    let stone_count = asset_amount(&assets, stone_asset);
+    let iron_ore_count = asset_amount(&assets, iron_ore_asset);
     let other_assets = assets.iter().any(|asset| {
-        asset.asset_id != tree_asset && asset.asset_id != log_asset && asset.asset_id != xp_asset
+        ![tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset].contains(&asset.asset_id)
     });
     let funded_stump = raw_health.value() == 0 && log_count > 0;
     let (health, spend_script, arkade_script) = if funded_stump {
@@ -171,6 +175,12 @@ pub fn prepare_tree(
     }
     if xp_count > 0 {
         groups.push(renewal_group(xp_asset, xp_count));
+    }
+    if stone_count > 0 {
+        groups.push(renewal_group(stone_asset, stone_count));
+    }
+    if iron_ore_count > 0 {
+        groups.push(renewal_group(iron_ore_asset, iron_ore_count));
     }
     build(
         record,
@@ -239,21 +249,29 @@ fn prepare_player_for_path(
     // Mirror the tree guard: fail loudly here rather than build an intent the
     // emulator always rejects, which would silently strand the VTXO.
     let other_assets = assets.iter().any(|asset| {
-        asset.asset_id != player_asset
-            && asset.asset_id != contract.log_asset
-            && asset.asset_id != contract.xp_asset
+        ![
+            player_asset,
+            contract.log_asset,
+            contract.xp_asset,
+            contract.stone_asset,
+            contract.iron_ore_asset,
+        ]
+        .contains(&asset.asset_id)
     });
     if other_assets {
         return Err(anyhow!("indexed player VTXO holdings are not canonical"));
     }
-    let log_count = asset_amount(&assets, contract.log_asset);
-    let xp_count = asset_amount(&assets, contract.xp_asset);
     let mut groups = vec![renewal_group(player_asset, 1)];
-    if log_count > 0 {
-        groups.push(renewal_group(contract.log_asset, log_count));
-    }
-    if xp_count > 0 {
-        groups.push(renewal_group(contract.xp_asset, xp_count));
+    for asset_id in [
+        contract.log_asset,
+        contract.xp_asset,
+        contract.stone_asset,
+        contract.iron_ore_asset,
+    ] {
+        let count = asset_amount(&assets, asset_id);
+        if count > 0 {
+            groups.push(renewal_group(asset_id, count));
+        }
     }
     let (spend_script, arkade_script) = if watchtower {
         (
@@ -279,6 +297,7 @@ fn prepare_player_for_path(
                 PLAYER_LUCK_CREDIT_PACKET_TYPE,
                 state.luck.credit.encode().to_vec(),
             ),
+            (PLAYER_AXE_PACKET_TYPE, state.axe.encode().to_vec()),
         ],
         expiry_margin_secs,
     )
@@ -1122,6 +1141,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
         )
         .unwrap();
@@ -1141,6 +1162,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             &tree.vtxo.script_pubkey(),
         )
@@ -1170,6 +1193,8 @@ mod tests {
         if reserve > 0 {
             groups.push(assigned_group(asset(2, 1), reserve));
             groups.push(assigned_group(asset(2, 2), reserve));
+            groups.push(assigned_group(asset(2, 3), reserve));
+            groups.push(assigned_group(asset(2, 4), reserve));
         }
         ark_core::asset::packet::add_asset_packet_to_psbt(&mut psbt, &AssetPacket { groups })
             .unwrap();
@@ -1189,6 +1214,7 @@ mod tests {
     fn player_state(contract: &PlayerContract) -> PlayerState {
         PlayerState {
             luck: crate::player::PlayerLuck::initial(&contract.vtxo.script_pubkey()).unwrap(),
+            axe: crate::player::AxeTier::None,
         }
     }
 
@@ -1215,6 +1241,8 @@ mod tests {
         if xp_balance > 0 {
             groups.push(assigned_group(contract.log_asset, 2));
             groups.push(assigned_group(contract.xp_asset, xp_balance));
+            groups.push(assigned_group(contract.stone_asset, 2));
+            groups.push(assigned_group(contract.iron_ore_asset, 1));
         }
         ark_core::asset::packet::add_asset_packet_to_psbt(&mut psbt, &AssetPacket { groups })
             .unwrap();
@@ -1239,6 +1267,8 @@ mod tests {
                 indexed(asset(2, 0), 1),
                 indexed(asset(2, 1), 5),
                 indexed(asset(2, 2), 5),
+                indexed(asset(2, 3), 5),
+                indexed(asset(2, 4), 5),
             ],
         );
 
@@ -1252,11 +1282,13 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .expect("canonical tree record");
-        assert_eq!(prepared.input.assets().len(), 3);
+        assert_eq!(prepared.input.assets().len(), 5);
 
         let mut wrong_amount = good.clone();
         wrong_amount.amount_sats = 331;
@@ -1267,6 +1299,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
@@ -1281,6 +1315,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
@@ -1295,6 +1331,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
@@ -1309,6 +1347,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
@@ -1323,6 +1363,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
@@ -1336,6 +1378,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             0,
         )
@@ -1349,6 +1393,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             0,
         )
@@ -1372,6 +1418,8 @@ mod tests {
                 indexed(asset(2, 0), 1),
                 indexed(asset(2, 1), 5),
                 indexed(asset(2, 2), 5),
+                indexed(asset(2, 3), 5),
+                indexed(asset(2, 4), 5),
             ],
         );
         good.outpoint.txid = previous.compute_txid();
@@ -1382,6 +1430,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
@@ -1430,6 +1480,8 @@ mod tests {
                 indexed(asset(2, 0), 1),
                 indexed(asset(2, 1), 5),
                 indexed(asset(2, 2), 5),
+                indexed(asset(2, 3), 5),
+                indexed(asset(2, 4), 5),
             ],
         );
         indexed_tree.outpoint.txid = previous.compute_txid();
@@ -1441,6 +1493,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
@@ -1492,6 +1546,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
@@ -1530,6 +1586,8 @@ mod tests {
                 indexed(asset(2, 0), 1),
                 indexed(asset(2, 1), 5),
                 indexed(asset(2, 2), 5),
+                indexed(asset(2, 3), 5),
+                indexed(asset(2, 4), 5),
             ],
         );
         indexed_tree.outpoint.txid = previous.compute_txid();
@@ -1540,6 +1598,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
@@ -1583,6 +1643,8 @@ mod tests {
                 indexed(player_asset, 1),
                 indexed(contract.log_asset, 2),
                 indexed(contract.xp_asset, 83),
+                indexed(contract.stone_asset, 2),
+                indexed(contract.iron_ore_asset, 1),
             ],
         );
         good.outpoint.txid = previous.compute_txid();
@@ -1594,7 +1656,7 @@ mod tests {
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .unwrap();
-        assert_eq!(prepared.groups.len(), 3);
+        assert_eq!(prepared.groups.len(), 5);
         assert_eq!(prepared.input.spend_info().0, contract.renewal_spend_script);
         assert_eq!(
             prepared.state_packets,
@@ -1604,6 +1666,7 @@ mod tests {
                     PLAYER_LUCK_CREDIT_PACKET_TYPE,
                     state.luck.credit.encode().to_vec()
                 ),
+                (PLAYER_AXE_PACKET_TYPE, state.axe.encode().to_vec()),
             ]
         );
 
@@ -1709,6 +1772,8 @@ mod tests {
                 indexed(asset(2, 0), 1),
                 indexed(asset(2, 1), 5),
                 indexed(asset(2, 2), 5),
+                indexed(asset(2, 3), 5),
+                indexed(asset(2, 4), 5),
             ],
         );
         indexed_tree.outpoint.txid = previous.compute_txid();
@@ -1719,6 +1784,8 @@ mod tests {
             asset(2, 0),
             asset(2, 1),
             asset(2, 2),
+            asset(2, 3),
+            asset(2, 4),
             330,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )

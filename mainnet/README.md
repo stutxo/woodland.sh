@@ -115,9 +115,9 @@ The Arkade service must include upstream arkd commit
 `c7c3184f5cd416e231023f717489a5b0550960cc` or its equivalent offchain
 cache/DB projection fix. Older builds can accept concurrent spends of one VTXO
 after finalization removes its live reservation but before DB projection marks
-it spent. The Woodland contention soak reproduced permanent TREE, LOG, and XP
-supply inflation on the older pinned build. Verify this fix independently in
-the provider's exact version before funding.
+it spent. The Woodland contention soak reproduced permanent TREE and inventory
+asset supply inflation on the older pinned build. Verify this fix independently
+in the provider's exact version before funding.
 
 `WOODLAND_EMULATOR_URL` must be the public HTTPS endpoint of the independently
 verified stock Arkade Script emulator. Its `/v1/info` signer and version must
@@ -134,8 +134,9 @@ Follow the deployment sequence in the repository `README.md`:
 4. run `woodland-operator ensure` until complete;
 5. require `woodland-operator status` to report `ready`;
 6. verify the BIP340 manifest signature, exact deployer/rollover genesis
-   metadata, signed `woodcuttingXpPerLog = 25`, and exactly 420 tree VTXOs,
-   each with 50,000 LOG/XP asset units, health ten, and fixed total supplies;
+   metadata, TREE/LOG/XP/STONE/IRON ORE groups 0/1/2/3/4, all signed drop rates
+   and axe recipes, and exactly 420 tree VTXOs, each with 50,000 LOG, XP, STONE,
+   and IRON ORE units, health ten, and fixed issued supplies;
 7. back up and commit the public manifest.
 
 After verification, remove `WOODLAND_DEPLOYER_SECRET` from online systems. If
