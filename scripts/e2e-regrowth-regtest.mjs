@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Regrowth E2E: ten successful drops turn a pristine tree into a funded
-// stump. A separate unfunded, inactive browser permissionlessly renews it in
-// one fresh Ark batch without minting assets or changing identity.
+// stump. A separate inactive browser, funded only for arkd intent fees,
+// permissionlessly regrows it in one fresh Ark batch without minting assets or
+// changing identity.
 import { execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -36,6 +37,7 @@ const LOG_RESERVE_PER_TREE = 50_000;
 const INDEXED_LOG_SUPPLY = 21_000_000;
 const INDEXED_XP_SUPPLY = 21_000_000;
 const FUND_COMMAND = process.env.WOODLAND_REGROWTH_FUND_COMMAND;
+const REQUIRE_RENEWAL_FEE = process.env.WOODLAND_E2E_REQUIRE_RENEWAL_FEE === '1';
 const reportPath = path.resolve(
   ROOT,
   process.env.WOODLAND_REGROWTH_REPORT || 'regtest/_build/regrowth-report.json',
@@ -48,6 +50,18 @@ function setting(name, fallback, minimum, maximum) {
     throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
   }
   return value;
+}
+
+function fundAddress(address, sats) {
+  const args = FUND_COMMAND
+    ? [address, String(sats)]
+    : ['fund', address, String(sats)];
+  execFileSync(FUND_COMMAND || path.join(ROOT, 'scripts/regtest.sh'), args, {
+    cwd: ROOT,
+    stdio: 'pipe',
+    encoding: 'utf8',
+    timeout: 120_000,
+  });
 }
 
 async function createBrowser(driverUrl, label) {
@@ -183,8 +197,13 @@ try {
   });
   assert.equal(manifestResponse.ok, true, `world manifest returned ${manifestResponse.status}`);
   const manifest = await manifestResponse.json();
-  assert.equal(manifest.schemaVersion, 2, 'world manifest must be schema 2');
-  assert.equal(manifest.protocolVersion, 2, 'world manifest must declare protocol v2');
+  assert.equal(manifest.schemaVersion, 3, 'world manifest must be schema 3');
+  assert.equal(manifest.protocolVersion, 3, 'world manifest must declare protocol v3');
+  assert.equal(manifest.rulesetId, 'woodland.sh/forest/v3');
+  assert.match(manifest.deployerSigner, /^[0-9a-f]{64}$/);
+  assert.match(manifest.manifestSignature, /^[0-9a-f]{128}$/);
+  assert.ok(manifest.treeRegrowthArkadeScript);
+  assert.ok(manifest.treeMaintenanceArkadeScript);
   assert.equal(manifest.trees.length, TREE_COUNT, 'world must contain exactly 420 trees');
   assert.equal(manifest.activeLogsPerTree, ACTIVE_LOGS_PER_TREE);
   assert.equal(manifest.logReservePerTree, LOG_RESERVE_PER_TREE);
@@ -242,20 +261,23 @@ try {
   )));
 
   const initial = await chopper.inspect();
-  const fundArgs = FUND_COMMAND
-    ? [initial.state.address, String(initial.state.fundingRequiredSats)]
-    : ['fund', initial.state.address, String(initial.state.fundingRequiredSats)];
-  execFileSync(FUND_COMMAND || path.join(ROOT, 'scripts/regtest.sh'), fundArgs, {
-    cwd: ROOT,
-    stdio: 'pipe',
-    encoding: 'utf8',
-    timeout: 120_000,
-  });
-  await chopper.refreshWorld();
+  const initialRegrower = await regrower.inspect();
+  fundAddress(initial.state.address, initial.state.fundingRequiredSats);
+  fundAddress(initialRegrower.state.address, 350);
+  await Promise.all([chopper.refreshWorld(), regrower.refreshWorld()]);
   await waitFor(
     'chopper activation funding',
     chopper.inspect,
     (view) => view.state?.activationReady === true,
+    OPERATION_TIMEOUT_MS,
+  );
+  await waitFor(
+    'regrower renewal fee funding',
+    regrower.inspect,
+    (view) => view.state?.playerActive === false
+      && view.state.walletVtxos?.some(
+        (vtxo) => vtxo.amountSats === 350 && (vtxo.assets || []).length === 0,
+      ),
     OPERATION_TIMEOUT_MS,
   );
   await chopper.execute(`document.getElementById('activate').click();`);
@@ -289,7 +311,7 @@ try {
   let drops = 0;
   let naturalChops = false;
 
-  assert.equal((await regrower.inspect()).state.playerAsset, null, 'regrower must remain unfunded');
+  assert.equal((await regrower.inspect()).state.playerAsset, null, 'regrower must remain inactive');
   while (target.health > 0) {
     rounds += 1;
     assert.ok(rounds <= MAX_ROUNDS, `stumping tree exceeded ${MAX_ROUNDS} rounds`);
@@ -341,6 +363,21 @@ try {
   assert.equal(regrown.xpRemaining, target.xpRemaining, 'regrowth minted XP');
   assert.equal(regrown.depleted, false);
   assert.notEqual(regrown.treeOutpoint, stumpOutpoint, 'regrowth must rotate the lineage');
+  const regrowerFeeChange = finalRegrower.walletVtxos.filter(
+    (vtxo) => (vtxo.assets || []).length === 0,
+  );
+  assert.equal(regrowerFeeChange.length, 1, 'regrowth must return one clean fee change VTXO');
+  assert.ok(
+    regrowerFeeChange[0].amountSats >= finalRegrower.dustSats
+      && regrowerFeeChange[0].amountSats <= 350,
+    'regrowth must preserve spendable fee change',
+  );
+  if (REQUIRE_RENEWAL_FEE) {
+    assert.ok(
+      regrowerFeeChange[0].amountSats < 350,
+      'regrowth must pay the configured intent fee',
+    );
+  }
   assert.equal(
     finalChopper.playerLogs,
     ACTIVE_LOGS_PER_TREE,

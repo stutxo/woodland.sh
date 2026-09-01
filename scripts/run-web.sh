@@ -47,7 +47,7 @@ cargo build --locked --features server --bin woodland-operator --bin woodland-se
 WOODLAND_SERVER_URL=self WOODLAND_WASM_FEATURES=regtest-e2e "$ROOT/scripts/build-web.sh"
 unset WOODLAND_DEPLOYER_SECRET
 
-env -u WOODLAND_ROLLOVER_SECRET "$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" &
+"$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" &
 WATCHER_PID=$!
 "$ROOT/target/debug/woodland-server" &
 SERVER_PID=$!

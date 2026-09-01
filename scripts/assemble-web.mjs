@@ -13,8 +13,15 @@ const manifestPath = path.resolve(rawManifestPath);
 const outputPath = path.resolve(rawOutputPath);
 const manifestText = await readFile(manifestPath, 'utf8');
 const manifest = JSON.parse(manifestText);
-if (manifest.schemaVersion !== 2 || manifest.protocolVersion !== 2 || manifest.gameId !== 'woodland.sh') {
-  throw new Error('web bundle requires a woodland.sh protocol v2 schema 2 manifest');
+if (
+  manifest.schemaVersion !== 3
+  || manifest.protocolVersion !== 3
+  || manifest.gameId !== 'woodland.sh'
+  || manifest.rulesetId !== 'woodland.sh/forest/v3'
+  || !/^[0-9a-f]{64}$/.test(manifest.deployerSigner || '')
+  || !/^[0-9a-f]{128}$/.test(manifest.manifestSignature || '')
+) {
+  throw new Error('web bundle requires a signed woodland.sh protocol v3 schema 3 manifest');
 }
 
 const arkade = new URL(manifest.arkadeServiceUrl);

@@ -26,6 +26,7 @@ const WEB_URL = EXTERNAL_WEB_URL || `http://127.0.0.1:${WEB_PORT}`;
 const DRIVER_URL = `http://127.0.0.1:${DRIVER_PORT}`;
 const TARGET_HITS = FULL_E2E ? 5 : 1;
 const ARKD = 'http://127.0.0.1:7070';
+const REQUIRE_RENEWAL_FEE = process.env.WOODLAND_E2E_REQUIRE_RENEWAL_FEE === '1';
 
 async function request(method, pathName, body) {
   return webdriverRequest(DRIVER_URL, method, pathName, body);
@@ -61,6 +62,24 @@ function walletAssetTotal(state, assetId) {
       0,
     ),
     0,
+  );
+}
+
+function cleanWalletVtxos(state) {
+  return (state.walletVtxos || []).filter((vtxo) => (vtxo.assets || []).length === 0);
+}
+
+function assertRenewalFeeWallet(state, label) {
+  const clean = cleanWalletVtxos(state);
+  assert.equal(clean.length, 1, `${label}: expected one clean renewal-fee VTXO`);
+  assert.ok(
+    clean[0].amountSats >= state.dustSats,
+    `${label}: renewal-fee change fell below dust`,
+  );
+  assert.equal(
+    state.walletSats,
+    state.dustSats + clean[0].amountSats,
+    `${label}: unexpected wallet value`,
   );
 }
 
@@ -333,6 +352,8 @@ async function main() {
       }
     };
     const assertPlayerRenewed = async (before, label) => {
+      const fundingBefore = cleanWalletVtxos(before.state);
+      assert.equal(fundingBefore.length, 1, `${label}: missing renewal-fee funding`);
       const treeOutpoints = before.state.trees.map((tree) => tree.treeOutpoint);
       const result = await executeAsync(`
         const done = arguments[arguments.length - 1];
@@ -342,6 +363,28 @@ async function main() {
       `);
       assert.equal(result.error, undefined, `${label}: ${result.error}`);
       const after = await inspect();
+      const fundingAfter = cleanWalletVtxos(after.state);
+      assert.equal(fundingAfter.length, 1, `${label}: missing renewal-fee change`);
+      if (REQUIRE_RENEWAL_FEE) {
+        assert.ok(
+          fundingAfter[0].amountSats < fundingBefore[0].amountSats,
+          `${label}: configured intent fee was not paid`,
+        );
+      } else {
+        assert.ok(
+          fundingAfter[0].amountSats <= fundingBefore[0].amountSats,
+          `${label}: renewal fee change increased`,
+        );
+      }
+      assert.ok(
+        fundingAfter[0].amountSats >= after.state.dustSats,
+        `${label}: renewal-fee change fell below dust`,
+      );
+      assert.equal(
+        before.state.walletSats - after.state.walletSats,
+        fundingBefore[0].amountSats - fundingAfter[0].amountSats,
+        `${label}: renewal changed value outside the fee wallet`,
+      );
       assert.notEqual(after.state.playerStateOutpoint, before.state.playerStateOutpoint, label);
       assert.ok(
         after.state.playerStateExpiresInSeconds > before.state.playerStateExpiresInSeconds,
@@ -416,10 +459,15 @@ async function main() {
     // protocol/API coverage for a future marketplace or third-party client.
     const runWithdrawStage = async (before, label) => {
       assert.ok(before.state.playerLogs >= 1, `${label}: withdraw needs at least 1 LOG`);
+      const walletOutpointsBefore = new Set(
+        before.state.walletVtxos.map((vtxo) => vtxo.outpoint),
+      );
       assert.equal(
-        before.state.walletVtxos.length,
-        0,
-        `${label}: withdraw funding needs an empty wallet`,
+        before.state.walletVtxos.some(
+          (vtxo) => vtxo.amountSats === 330 && (vtxo.assets || []).length === 0,
+        ),
+        false,
+        `${label}: exact withdrawal funding already exists`,
       );
       execFileSync(
         path.join(ROOT, 'scripts/regtest.sh'),
@@ -431,9 +479,11 @@ async function main() {
         `${label} withdraw funding`,
         inspect,
         (value) => !value.busy
-          && value.state?.walletVtxos?.length === 1
-          && value.state.walletVtxos[0].amountSats === 330
-          && (value.state.walletVtxos[0].assets || []).length === 0
+          && value.state?.walletVtxos?.some(
+            (vtxo) => !walletOutpointsBefore.has(vtxo.outpoint)
+              && vtxo.amountSats === 330
+              && (vtxo.assets || []).length === 0,
+          )
           && value.state.walletSats === before.state.walletSats + 330,
         180_000,
       );
@@ -558,8 +608,11 @@ async function main() {
     assertLogSupply(initial.state, totalLogs, 'initial world');
     assertXpAccounting(initial.state, totalXp, 'initial world');
     assertTreeValue(initial.state, 'initial world');
-    assert.equal(manifest.schemaVersion, 2, 'world manifest must be schema 2');
-    assert.equal(manifest.protocolVersion, 2, 'world manifest must declare protocol v2');
+    assert.equal(manifest.schemaVersion, 3, 'world manifest must be schema 3');
+    assert.equal(manifest.protocolVersion, 3, 'world manifest must declare protocol v3');
+    assert.equal(manifest.rulesetId, 'woodland.sh/forest/v3');
+    assert.match(manifest.deployerSigner, /^[0-9a-f]{64}$/);
+    assert.match(manifest.manifestSignature, /^[0-9a-f]{128}$/);
     assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');
     assert.equal(manifest.baseLogDropBasisPoints, 2_000);
     assert.equal(manifest.levelLogDropBonusBasisPoints, 200);
@@ -749,9 +802,25 @@ async function main() {
     assert.equal(responsiveWalk.walk.steps, 1);
     assert.ok(responsiveWalk.walk.durationMs >= 80, JSON.stringify(responsiveWalk.walk));
     assert.ok(responsiveWalk.walk.durationMs < 300, JSON.stringify(responsiveWalk.walk));
+    execFileSync(
+      path.join(ROOT, 'scripts/regtest.sh'),
+      ['fund', deployed.state.address, '350'],
+      { cwd: ROOT, stdio: 'pipe', encoding: 'utf8' },
+    );
+    await click('refresh');
+    deployed = await waitFor(
+      'player renewal fee funding',
+      inspect,
+      (value) => !value.busy
+        && value.state?.walletVtxos?.some(
+          (vtxo) => vtxo.amountSats === 350 && (vtxo.assets || []).length === 0,
+        )
+        && value.state.walletSats === deployed.state.walletSats + 350,
+      180_000,
+    );
     deployed = await assertPlayerRenewed(deployed, 'zero-XP player renewal');
     const playerStateBeforeBrowserReload = deployed.state.playerStateOutpoint;
-    const fixedSats = deployed.state.trees.reduce(
+    let fixedSats = deployed.state.trees.reduce(
       (sum, tree) => sum + tree.valueSats,
       deployed.state.walletSats,
     );
@@ -856,9 +925,7 @@ async function main() {
       ['asset-metadata', 'transfer metadata mutation must be rejected'],
       ['player-marker-metadata', 'PLAYER_ID transfer metadata must be rejected'],
       ['asset-control', 'transfer control-asset mutation must be rejected'],
-      ['noncanonical-xp-zero', 'negative-zero XP encoding must be rejected'],
       ['double-tree-marker', 'TREE marker inflation must be rejected'],
-      ['wrong-player-position', 'player position mutation during chop must be rejected'],
       ['extra-output', 'extra chop output must be rejected'],
       ['wrong-anchor', 'wrong anchor script must be rejected'],
       ['fund-extension', 'nonzero extension value must be rejected'],
@@ -952,7 +1019,7 @@ async function main() {
       for (const tree of chopped.state.trees.filter((tree) => tree.treeId !== firstTree.treeId)) {
         assert.equal(tree.treeOutpoint, initialOutpoints.get(tree.treeId));
       }
-      assert.equal(chopped.state.walletSats, chopped.state.dustSats);
+      assertRenewalFeeWallet(chopped.state, `swing ${attempts}`);
       assert.equal(current.valueSats, chopped.state.fullTreeValueSats);
       assertLogSupply(chopped.state, totalLogs, `swing ${attempts}`);
       assertXpAccounting(chopped.state, totalXp, `swing ${attempts}`);
@@ -971,6 +1038,10 @@ async function main() {
       assert.equal(checkedNonzeroXpMutation, true, 'nonzero-XP mutation probe did not run');
     }
     chopped = await assertPlayerRenewed(chopped, 'nonzero-XP player renewal');
+    fixedSats = chopped.state.trees.reduce(
+      (sum, tree) => sum + tree.valueSats,
+      chopped.state.walletSats,
+    );
     if (!FULL_E2E) {
       assert.equal(chopped.state.playerXp, 1);
       assert.equal(chopped.state.playerLogs, 1);
@@ -1082,7 +1153,7 @@ async function main() {
     for (const tree of chopped.state.trees.filter((tree) => tree.treeId !== secondTree.treeId)) {
       assert.equal(tree.treeOutpoint, beforeSecondOutpoints.get(tree.treeId));
     }
-    assert.equal(chopped.state.walletSats, 330);
+    assertRenewalFeeWallet(chopped.state, 'second tree chop');
     assertLogSupply(chopped.state, totalLogs, 'second tree chop');
     assertXpAccounting(chopped.state, totalXp, 'second tree chop');
     assertTreeValue(chopped.state, 'second tree chop');

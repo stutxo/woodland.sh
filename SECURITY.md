@@ -2,16 +2,16 @@
 
 ## Supported versions
 
-Security fixes target protocol v2 and the latest source.
+Security fixes target protocol v3 and the latest source.
 
 | Version | Supported |
 | --- | --- |
-| v2 | Yes |
+| v3 | Yes |
 
 ## Project status
 
-woodland.sh v2 has an experimental mainnet deployment path. The repository ships
-no live deployment manifest. Mainnet availability is not a claim of
+woodland.sh v3 has an experimental mainnet deployment path. The repository
+ships no live deployment manifest. Mainnet availability is not a claim of
 production-grade browser custody or an independent security audit. Documented
 trust assumptions and known boundaries are part of the protocol design rather
 than guarantees provided by this policy.
@@ -45,27 +45,33 @@ best-effort basis; this project does not promise a response or remediation SLA.
 
 Security-sensitive areas include:
 
-- Arkade Script bypasses in player chop, tree chop, tree renewal/regrowth,
-  player renewal, or LOG withdrawal.
+- Arkade Script bypasses in player chop, tree chop, tree regrowth or
+  maintenance, player renewal, or LOG withdrawal.
 - TREE, LOG, XP, or PLAYER_ID inflation, substitution, assignment, control,
   metadata, or conservation failures.
-- Soulbound-XP bypasses: any path that moves XP out of player state, detaches
-  the numeric XP packet from the XP asset balance, or smuggles XP through the
-  withdrawal or renewal leaves.
+- Soulbound-XP bypasses: any path that moves XP out of player state, derives
+  progression from anything but its XP asset balance, or smuggles XP through
+  the withdrawal or renewal leaves.
 - Tree-local reserve or regrowth failures: minted or redirected LOG/XP,
-  changed identity or sats, an active tree incorrectly resetting health, a
-  funded stump failing to regrow in one batch, or a terminal stump becoming
+  changed immutable state or sats, an active tree incorrectly resetting health,
+  a funded stump failing to regrow in one batch, or a terminal stump becoming
   active.
+- Maintenance-authority failures: bypass of the rollover signer or any
+  maintenance change to health, assets, script, state, or sats.
+- Renewal-fee failures: state value funding fees, asset-bearing fee inputs,
+  incorrect current/scheduled policy selection, sub-minimum change, or fee-input
+  signer bypass.
 - Withdraw-leaf LOG leakage: sats, PLAYER_ID, XP, or more LOG than declared
   leaving player state, or a destination funded by anything but the wallet
   dust input.
 - PLAYER_ID/profile confusion, competing lineage selection, activation retry
   divergence, or bypass of canonical initial player roll and luck credit.
-- Forged player identity, position, XP, health, roll, credit, or reward transitions.
+- Forged tree state, health, player roll, luck credit, or reward transitions.
 - Incorrect Taproot signer closures, emulator tweaks, PSBT response checks,
   checkpoint signatures, batch graph validation, or forfeit handling.
-- Manifest validation, signer or service pinning, creating-transaction binding,
-  or indexed-asset reconstruction failures.
+- Manifest signature, deployer or rollover binding, signer or service pinning,
+  creating-transaction binding, genesis metadata, or indexed-asset
+  reconstruction failures.
 - Stock-emulator endpoint failures: signer/version substitution, incorrect
   Arkade Script execution, request tampering, or serving an origin outside the
   configured policy.
@@ -92,13 +98,15 @@ custody are known boundaries documented in [`README.md`](README.md),
 prevents choosing a favorable tree but does not make permissionless identities
 unique. An intermediate marker output can select any starting roll and credit
 within the corridor; the recursive rate budget and streak bounds remain enforced.
-Tree renewal and one-batch regrowth are permissionless covenant paths — no
-project-held lifecycle key gates them — and the operator watcher is a
-convenience, not a trust root.
+Funded-stump regrowth is permissionless apart from its operator and tweaked
+emulator closure; no project-held lifecycle key gates it. Active-tree and
+terminal-stump maintenance additionally requires the low-authority rollover
+signer and preserves state exactly.
 
-Service-endpoint authentication rests on HTTPS and the manifest's URL, signer,
-and forfeit pins; arkd's per-boot ephemeral batch-operator key cannot be pinned,
-so an attacker who defeats those channels could disrupt or strand renewal
-batches but cannot redirect the pinned sweep key, forfeit payout, or covenant
-outputs. The pinned stock emulator remains a trust boundary for Arkade Script
-execution.
+Service-endpoint identity is committed by the deployer-signed manifest,
+including URL, signer, forfeit, ruleset, asset, and script pins. HTTPS still
+authenticates and protects each live connection. arkd's per-boot ephemeral
+batch-operator key cannot be pinned, so an attacker who defeats those channels
+could disrupt or strand renewal batches but cannot redirect the pinned sweep
+key, forfeit payout, or covenant outputs. The pinned stock emulator remains a
+trust boundary for Arkade Script execution.

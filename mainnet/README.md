@@ -27,9 +27,10 @@ rollover:    m/1464815428'/1'/0'/1'
 ```
 
 Role `0'` derives the deployer child from the deployment root. Role `1'` derives
-the rollover child from the independent operations root. Tree renewal and
-one-batch regrowth are permissionless covenant leaves, so no additional
-project-held lifecycle key exists.
+the rollover child from the independent operations root. Funded-stump regrowth
+is permissionless; exact-state tree maintenance and optional delegated player
+renewal use the lower-authority rollover child. No additional project-held
+lifecycle key exists.
 
 The paths and `public.json` are public. The mnemonic and derived secret files are
 not. Do not add a memory-only BIP39 passphrase; this utility intentionally does
@@ -47,7 +48,7 @@ Build and run the utility on an offline Linux machine from a reviewed checkout:
 ```bash
 cargo build --release --locked --features keygen --bin woodland-keygen
 umask 077
-./target/release/woodland-keygen generate /media/offline/woodland-mainnet-v2
+./target/release/woodland-keygen generate /media/offline/woodland-mainnet-v3
 ```
 
 The command refuses to overwrite an existing destination and creates:
@@ -56,7 +57,8 @@ The command refuses to overwrite an existing destination and creates:
 deployment-root.txt  24-word deployment root
 operations-root.txt  24-word operations root
 deployment.env       derived deployer child only
-operations.env       derived rollover child for the optional player watchtower
+operations.env       derived rollover child for tree maintenance and optional
+                     player watchtower renewal
 public.json          fingerprints, paths, and x-only public keys
 README.txt           handling reminder
 ```
@@ -101,12 +103,13 @@ Copy `deployment.env.example` to an ignored file with mode `0600`. Fill service
 pins independently, then copy in both child secrets from `deployment.env`
 and `operations.env` generated during the ceremony.
 
-The deployment machine temporarily needs both children because the final
-manifest commits the rollover public key. It never needs either root mnemonic.
-The manifest also commits the Arkade service's forfeit public key and forfeit
-address at genesis; renewal clients reject any batch or payout that
-does not match them, so treat a changed forfeit identity on the service as a
-new deployment requiring a new manifest, not a resumable one.
+The deployment machine temporarily needs both children because the deployer
+signs every manifest field and genesis metadata commits both public keys. It
+never needs either root mnemonic. The manifest also commits the Arkade
+service's forfeit public key and address; renewal clients reject any batch or
+payout that does not match them. Treat a changed forfeit identity on the
+service as a new deployment requiring a new signed manifest, not a resumable
+one.
 
 The Arkade service must include upstream arkd commit
 `c7c3184f5cd416e231023f717489a5b0550960cc` or its equivalent offchain
@@ -124,21 +127,22 @@ signer between clients and that endpoint.
 Follow the deployment sequence in the repository `README.md`:
 
 1. run `woodland-operator status` before funding;
-2. require the proposed manifest to report schema 2 and protocol 2;
+2. require the proposed manifest to report signed schema 3, protocol 3, and
+   ruleset `woodland.sh/forest/v3`;
 3. fund clean VTXOs at the reported address whose total exactly equals the
    reported amount (138,600 sats at 330-sat dust);
 4. run `woodland-operator ensure` until complete;
 5. require `woodland-operator status` to report `ready`;
-6. verify exactly 420 tree VTXOs, each with 50,000 LOG/XP, health ten, and fixed
-   total asset supplies;
+6. verify the BIP340 manifest signature, exact deployer/rollover genesis
+   metadata, and exactly 420 tree VTXOs, each with 50,000 LOG/XP, health ten,
+   and fixed total asset supplies;
 7. back up and commit the public manifest.
 
 After verification, remove `WOODLAND_DEPLOYER_SECRET` from online systems. If
-the deployer has no spendable VTXO or change, its deployment root may be archived
-or destroyed. Copy `WOODLAND_ROLLOVER_SECRET` only to an optional game-server
-host when delegated player renewal is enabled; otherwise keep it offline. It has
-no ongoing use on the deployment machine or tree watcher. Keep the operations
-root offline permanently.
+the deployer has no spendable VTXO or change, its deployment root may be
+archived or destroyed. Install `WOODLAND_ROLLOVER_SECRET` only on the protected
+renewal watcher and, when delegated player renewal is enabled, the optional game
+server. Keep the operations root offline permanently.
 
 ## Stock emulator host
 
@@ -182,11 +186,12 @@ Use:
 /etc/woodland/mainnet.env             root:woodland  0640
 ```
 
-Populate `mainnet.env` from `operations.env.example`; do not copy in either
-generated child secret or either root. The tree watcher receives no private key.
-Tree renewal and regrowth are permissionless `{operator, emulator}` covenant
-self-sends. Active renewal preserves health. One fresh batch regrows a funded
-zero-health stump to health ten; a zero-reserve stump remains terminal.
+Populate `mainnet.env` from `operations.env.example` and copy in only the
+generated rollover child; do not copy either root or the deployer child. The
+tree watcher needs this lower-authority key for exact-state maintenance.
+Funded-stump regrowth remains permissionless under the `{operator, emulator}`
+closure. One fresh batch regrows a funded zero-health stump to health ten; a
+zero-reserve stump remains terminal.
 
 Enable the watcher:
 
@@ -202,16 +207,36 @@ Require the log line:
 woodland.sh renewal watcher ready
 ```
 
-Non-funded tree lineages renew when remaining lifetime drops below half the
-observed batch lifetime, clamped to a maximum of 12 hours. Funded stumps are
-selected immediately and regrow in that one renewal batch. Trees deployed in
-the same session expire close together, so expect correlated renewal waves; the
-watcher renews up to eight trees concurrently and reports a `missingExpiry`
-count whenever the indexer omits a live tree's expiry. Any nonzero count,
-renewal failure, or persistent emulator failure warrants immediate attention:
-an expired tree is swept by the Arkade service and cannot be recovered. A forced
-rollover bypasses earliness and safety-margin checks but never expiry or
-local-reserve invariants.
+Non-funded tree lineages enter rollover-authorized maintenance when remaining
+lifetime drops below half the observed batch lifetime, clamped to a maximum of
+12 hours. Funded stumps are selected immediately and use the permissionless
+regrowth leaf. Trees deployed in the same session expire close together, so
+expect correlated renewal waves. The watcher renews up to eight trees
+concurrently under a zero-fee policy, and serializes fee-funded renewals so each
+round can spend the preceding round's exact wallet change. It reports a
+`missingExpiry` count whenever the indexer omits a live tree's expiry.
+
+When arkd's current or scheduled intent policy charges fees, keep clean
+asset-free VTXOs on the ordinary Arkade contract derived from the rollover
+child and the pinned service parameters. Each renewal consumes one such VTXO,
+pays the maximum applicable fee, and returns exact same-contract change.
+
+With `/etc/woodland/mainnet.env` loaded in a restricted root or `woodland`
+shell, derive the exact fee-wallet address:
+
+```bash
+(set -a; . /etc/woodland/mainnet.env; \
+  exec /opt/woodland/woodland-operator renewal-address \
+    /etc/woodland/woodland-world.json)
+```
+
+Fund only that printed address. Never infer it from the signer alone: the Arkade
+service parameters are part of the contract.
+
+Any nonzero `missingExpiry`, missing fee funding, renewal failure, or persistent
+emulator failure warrants immediate attention: an expired tree is swept by the
+Arkade service and cannot be recovered. A forced rollover bypasses earliness and
+safety-margin checks but never expiry, signer, or local-reserve invariants.
 
 Registration failures and abandoned pre-forfeit joins are cleaned up by a
 signed ownership proof before the watcher retries, including queued intents
@@ -225,7 +250,8 @@ sudo WOODLAND_FORCE_ROLLOVER=1 /opt/woodland/woodland-operator renew /etc/woodla
 
 Run one active watcher. Additional operators should remain passive standbys;
 concurrent watchers can race the same tree outpoints. Monitor process uptime,
-reconnect errors, Arkade and emulator `/v1/info`, and tree renewal failures.
+reconnect errors, Arkade and emulator `/v1/info`, fee funding, and tree
+lifecycle failures.
 
 ## Optional game-server host
 

@@ -14,6 +14,8 @@ const WORLD_MANIFEST = path.resolve(
   configuredSetting('WOODLAND_WORLD_MANIFEST', 'regtest/_build/woodland-world.json'),
 );
 const WEB_ROOT = path.resolve(ROOT, process.env.WOODLAND_WEB_ROOT || 'dist');
+const watcherEnvironment = { ...process.env };
+delete watcherEnvironment.WOODLAND_DEPLOYER_SECRET;
 for (const name of [
   'WOODLAND_DEPLOYER_SECRET',
   'WOODLAND_ROLLOVER_SECRET',
@@ -170,6 +172,7 @@ function startWatcher() {
     {
       cwd: ROOT,
       stdio: ['ignore', 'ignore', 'pipe'],
+      env: watcherEnvironment,
     },
   );
   watcher = child;

@@ -319,25 +319,25 @@ new player + new tree + extension + anchor</pre>
         <div class="about-contracts">
           <section class="about-contract">
             <h3>Player</h3>
-            <p>One owner-specific VTXO per player. It holds 330 sats, one PLAYER_ID, identity, position, roll, luck credit, numeric XP, harvested LOG, and earned XP.</p>
-            <p>Its paths allow chopping, exact renewal by the owner or delegated watchtower, and owner-authorized LOG withdrawal. XP has no withdrawal path and remains bound to that player.</p>
+            <p>One owner-specific VTXO per player. It holds 330 sats, one PLAYER_ID, a recursive roll, bounded luck credit, harvested LOG, and soulbound XP.</p>
+            <p>Its paths allow chopping, exact renewal by the owner or delegated watchtower, and owner-authorized LOG withdrawal. The XP asset is the sole progression value and has no withdrawal path.</p>
           </section>
           <section class="about-contract">
             <h3>Tree</h3>
             <p>Each of exactly 420 trees occupies a separate VTXO using one shared contract template. It holds 330 sats, one TREE marker, coordinates, health, and its remaining local LOG and XP.</p>
-            <p>Every tree starts with 50,000 LOG, 50,000 XP, and ten health. Its only state paths are chopping and permissionless renewal or regrowth; there is no shared supply vault.</p>
+            <p>Every tree starts with 50,000 LOG, 50,000 XP, and ten health. Its state paths are chopping, permissionless funded-stump regrowth, and rollover-authorized exact maintenance; there is no shared supply vault.</p>
           </section>
         </div>
 
         <h2>Why a swing uses two contracts</h2>
-        <p>A swing spends the player and selected tree together. The player covenant verifies identity, owner approval, roll, luck, and XP backing. The tree covenant independently verifies its inventory and the reward movement. Both must approve the same transaction.</p>
+        <p>A swing spends the player and selected tree together. The player covenant verifies owner approval, roll, luck, PLAYER_ID, and soulbound XP. The tree covenant independently verifies its inventory and the reward movement. Both must approve the same transaction.</p>
         <pre class="about-flow" aria-label="Successful and missed swing state changes">success: player LOG/XP +1 · tree LOG/XP -1 · tree health -1
 miss:    assets and health unchanged · player roll/luck advances</pre>
-        <p>This reciprocal check prevents crediting a player without debiting a tree, forging XP, changing identity, or redirecting assets.</p>
+        <p>This reciprocal check prevents crediting a player without debiting a tree, forging progression, or redirecting assets.</p>
 
         <h2>Renewal, regrowth, permission, and trust</h2>
-        <p>Arkade VTXOs have finite batch lifetimes. Renewal consumes a state VTXO and recreates it in one fresh batch. An active tree preserves its health; a funded stump resets from zero to ten health in that same renewal. Anyone can submit tree renewal or regrowth; neither a player key nor a woodland-held lifecycle key is required.</p>
-        <p>“Permissionless” does not mean signature-free or unrestricted. The Arkade operator and script-tweaked stock emulator still approve only the exact self-send allowed by the renewal covenant. Bitcoin Taproot enforces the complete signer closure.</p>
+        <p>Arkade VTXOs have finite batch lifetimes. Funded-stump regrowth resets only health from zero to ten and is permissionless apart from the Arkade operator and script-tweaked emulator closure. Active trees and terminal stumps use exact-state maintenance, which additionally requires the low-authority rollover signer.</p>
+        <p>If arkd charges an intent fee, renewal adds one clean asset-free wallet VTXO and returns same-contract change; gameplay state never funds fees. Bitcoin Taproot enforces each complete signer closure.</p>
 
         <details class="covenant-details">
           <summary>More technical details: the covenant scripts (not required to play)</summary>
@@ -345,7 +345,7 @@ miss:    assets and health unchanged · player roll/luck advances</pre>
             <p class="covenant-note"><strong>Technical caveat.</strong> This section describes protocol implementation, transaction shapes, and signer rules. It is intended for reviewers and curious players; none of it is required to play woodland.sh.</p>
 
             <h2>Script inventory</h2>
-            <p>The game uses five distinct Arkade covenant programs mounted as six usable Taproot leaves. Player renewal is one program mounted twice with different signer sets.</p>
+            <p>The game uses six distinct Arkade covenant programs mounted as seven usable Taproot leaves. Player renewal is one program mounted twice with different signer sets.</p>
             <div class="covenant-table-scroll">
               <table class="covenant-table">
                 <thead>
@@ -353,7 +353,7 @@ miss:    assets and health unchanged · player roll/luck advances</pre>
                 </thead>
                 <tbody>
                   <tr><td>Player</td><td>Chop, renewal, LOG withdrawal</td><td>Chop, owner renewal, watchtower renewal, withdrawal</td></tr>
-                  <tr><td>Tree</td><td>Chop, renewal/regrowth</td><td>Two corresponding leaves</td></tr>
+                  <tr><td>Tree</td><td>Chop, regrowth, maintenance</td><td>Three corresponding leaves</td></tr>
                 </tbody>
               </table>
             </div>
@@ -366,7 +366,7 @@ miss:    assets and health unchanged · player roll/luck advances</pre>
 └─ introspector: emulator key tweaked by the covenant hash
 
 tweaked emulator = emulator + H("ArkScriptHash", covenant)·G</pre>
-            <p>The emulator evaluates the Arkade Script. Bitcoin Taproot enforces the complete signer closure, including the covenant-specific tweaked emulator key. Player leaves add the owner or rollover signer; tree leaves require the Arkade operator and emulator pair.</p>
+            <p>The emulator evaluates the Arkade Script. Bitcoin Taproot enforces the complete signer closure, including the covenant-specific tweaked emulator key. Player leaves add the owner or rollover signer. Tree chop and regrowth use operator plus emulator; tree maintenance also adds rollover.</p>
 
             <h2>How to read the programs</h2>
             <p>The scripts are stack programs made from arithmetic checks and Arkade transaction-introspection opcodes. Most rules end in <code>OP_EQUALVERIFY</code>: a failed comparison immediately rejects the spend.</p>
@@ -388,20 +388,21 @@ INSPECTNUMOUTPUTS      4  EQUALVERIFY</pre>
             <section class="covenant-script">
               <h3>1. Player chop — <code>player_chop_covenant_script</code></h3>
               <p>The player half proves owner-specific state continuity. It requires player input zero, the two-input/four-output swing shape, the same player P2TR and 330 sats, and the manifest-pinned tree P2TR and value at both tree endpoints.</p>
-              <pre class="about-flow" aria-label="Player chop covenant checks">preserve: player P2TR, 330 sats, PLAYER_ID, identity, position
+              <pre class="about-flow" aria-label="Player chop covenant checks">preserve: player P2TR, 330 sats, PLAYER_ID, XP asset
 advance:  roll = SHA256(previous roll), canonical luck credit
-require:  numeric XP equals player-held XP before and after
+derive:   reward threshold from input XP asset balance
 pin:      merged extension, canonical anchor, exact tree contract</pre>
               <p>It validates the canonical reward calculation but leaves the actual health, LOG, and XP deltas to the reciprocal tree script. This keeps owner continuity on the player side and global supply accounting on the tree side.</p>
             </section>
 
             <section class="covenant-script">
               <h3>2. Player renewal — <code>player_renewal_covenant_script</code></h3>
-              <p>This exact-self-send program is used by both the owner-renewal and watchtower-renewal leaves. The Arkade intent proof has a fake message input at index zero, the real player VTXO at index one, the replacement state at output zero, and the merged extension at output one.</p>
+              <p>This exact-state self-send program is used by both the owner-renewal and watchtower-renewal leaves. The base intent proof has a fake message input at index zero, the real player VTXO at index one, replacement state at output zero, and the extension at output one. A fee-bearing proof adds one clean wallet input and same-contract change.</p>
               <pre class="about-flow" aria-label="Player renewal covenant checks">same P2TR and 330 sats
-same identity, position, roll, luck, and XP packets
+same roll and luck packets
 same one-unit PLAYER_ID
 same LOG and XP presence and balances
+optional fee input and change are asset-free with the same P2TR
 no assets in the extension output</pre>
               <p>The owner leaf requires owner, operator, and emulator. The watchtower leaf replaces the owner with the low-authority rollover key. Both execute the same preservation program, so the watchtower cannot chop or withdraw.</p>
             </section>
@@ -413,41 +414,41 @@ no assets in the extension output</pre>
 player XP in                    = player XP out
 destination sat value           = wallet funding input value
 player state value              = 330 sats before and after</pre>
-              <p>Identity, position, roll, luck, numeric XP, XP assets, and PLAYER_ID are preserved exactly. The destination script is intentionally unrestricted because LOG is liquid. The player’s 330 sats never fund the destination.</p>
+              <p>Roll, luck, XP assets, and PLAYER_ID are preserved exactly. The destination script is intentionally unrestricted because LOG is liquid. The player’s 330 sats never fund the destination.</p>
             </section>
 
             <h2>Tree covenant programs</h2>
             <section class="covenant-script">
               <h3>4. Tree chop — <code>tree_covenant_script</code></h3>
-              <p>This is the main game-rule program. It requires tree input one, two inputs, four outputs, and four ordered asset groups: PLAYER_ID, TREE, LOG, and XP. Player and tree scripts, sat values, identities, the extension, and the anchor must all be canonical.</p>
-              <p>The script hashes the previous player roll, converts the new roll into a bucket modulo 10,000, derives probability from input XP, applies bounded luck credit, and leaves one canonical reward bit <code>G</code>.</p>
-              <pre class="about-flow" aria-label="Tree chop covenant equations">player numeric XP out = player numeric XP in + G
-tree health in         = tree health out + G
+              <p>This is the main game-rule program. It requires tree input one, two inputs, four outputs, and four ordered asset groups: PLAYER_ID, TREE, LOG, and XP. Player and tree scripts, sat values, immutable tree state, the extension, and the anchor must all be canonical.</p>
+              <p>The script hashes the previous player roll, converts the new roll into a bucket modulo 10,000, derives probability from the input XP asset balance, applies bounded luck credit, and leaves one canonical reward bit <code>G</code>.</p>
+              <pre class="about-flow" aria-label="Tree chop covenant equations">tree health in         = tree health out + G
 tree LOG in            = tree LOG out + G
 player LOG out         = player LOG in + G
 tree XP in             = tree XP out + G
 player XP out          = player XP in + G</pre>
-              <p>It also requires positive input health, one conserved TREE marker, and equality between player numeric XP and player-held XP assets. A miss has <code>G = 0</code>: assets and health stay fixed while roll and luck still advance.</p>
+              <p>It also requires positive input health and one conserved TREE marker. A miss has <code>G = 0</code>: assets and health stay fixed while roll and luck still advance.</p>
             </section>
 
             <section class="covenant-script">
-              <h3>5. Tree renewal and regrowth — <code>tree_renewal_covenant_script</code></h3>
-              <p>Tree renewal preserves the exact P2TR, sat value, tree identity, TREE marker, and LOG/XP balances while moving the state into one fresh Arkade batch.</p>
-              <pre class="about-flow" aria-label="Tree stump regrowth rule">active tree:
-    preserve health
-funded stump:
+              <h3>5–6. Tree regrowth and maintenance</h3>
+              <p><code>tree_regrowth_covenant_script</code> and <code>tree_maintenance_covenant_script</code> share exact P2TR, sat-value, immutable-state, TREE, LOG, and XP preservation, but their health rules and signer closures are disjoint.</p>
+              <pre class="about-flow" aria-label="Tree lifecycle covenant rules">funded-stump regrowth:
+    input health = 0 and LOG reserve > 0
     output health = 10
-terminal stump with no LOG:
-    preserve health 0; regrowth is unavailable</pre>
-              <p>No timer, height witness, or project-held lifecycle key gates this transition. The covenant derives the only allowed health change from the stump’s own conserved LOG reserve.</p>
+    signers = operator + tweaked emulator
+active or terminal maintenance:
+    output health = input health
+    signers = operator + rollover + tweaked emulator</pre>
+              <p>No timer or height witness gates either transition. Regrowth derives eligibility from the stump’s conserved local LOG reserve; maintenance cannot change any state.</p>
             </section>
 
-            <h2>Canonical numeric encoding</h2>
-            <p>XP, health, and luck credit use fixed-width numeric packets. Each program checks the byte length, converts with <code>BIN2NUM</code>, converts back with <code>NUM2BIN</code>, compares the exact bytes, and rejects negative values. This prevents alternate encodings such as negative zero from representing the same apparent number with different committed bytes.</p>
+            <h2>Canonical packet encoding</h2>
+            <p>Health and luck credit use fixed-width numeric packets. Each program checks byte length and canonical signed-magnitude encoding, rejecting alternate forms such as negative zero. Player progression is not a numeric packet: it is exactly the soulbound XP asset balance. The player roll is a fixed 32-byte packet.</p>
 
             <h2>Activation and manifest checks</h2>
-            <p>Activation is not a separate covenant leaf: it spends an ordinary wallet VTXO and creates the first player state. On the first recursive spend, every player leaf recognizes the direct-activation shape and requires the identity-derived roll, PLAYER_ID group zero, and initial luck credit 8,000.</p>
-            <p>The world manifest carries raw tree script commitments. Clients rebuild the contract from the pinned asset IDs, signer keys, network, dust, and reserve constants, then require every P2TR and Arkade Script byte to match the manifest before accepting the world.</p>
+            <p>Activation is not a separate covenant leaf: it spends an ordinary wallet VTXO and creates the first player state. On the first recursive spend, every player leaf recognizes the direct-activation shape and requires the P2TR-witness-program-derived roll, PLAYER_ID group zero, and initial luck credit 8,000.</p>
+            <p>The signed schema 3 world manifest binds endpoints, service and lifecycle signers, ruleset, asset IDs, layout, and raw tree script commitments to the deployer key. Clients verify its BIP340 signature, rebuild the contract, and require every P2TR and Arkade Script byte to match before using any manifest URL.</p>
           </div>
         </details>
       </div>

@@ -47,6 +47,7 @@ pub struct BatchServices {
     pub pins: WorldPins,
     ark_base: String,
     digest: String,
+    fee_estimators: Vec<ark_fees::Estimator>,
 }
 
 impl BatchServices {
@@ -66,7 +67,7 @@ impl BatchServices {
             .await
             .map_err(|error| anyhow!("read arkd REST info: {error}"))?;
         require_matching_server_params(&info, &params, &pins)?;
-        require_zero_renewal_fees(&info)?;
+        let fee_estimators = build_fee_estimators(&info)?;
         Ok(Self {
             ark,
             emulator,
@@ -74,7 +75,18 @@ impl BatchServices {
             pins,
             ark_base,
             digest: info.digest,
+            fee_estimators,
         })
+    }
+
+    /// Quote the live current/scheduled fee policy fetched by this batch
+    /// connection. Callers use this rather than a boot-time parameter snapshot
+    /// before selecting an ordinary wallet input.
+    pub(crate) fn renewal_requires_fee(
+        &self,
+        prepared: &crate::renewal::RenewalIntent,
+    ) -> Result<bool> {
+        Ok(prepared.estimate_base_fee(&self.fee_estimators)? > 0)
     }
 
     /// Bind, emulator-approve, and settle one prepared renewal intent through
@@ -85,9 +97,34 @@ impl BatchServices {
         &self,
         authorizer_keys: &Keys,
         emulator_pk: bitcoin::XOnlyPublicKey,
-        prepared: crate::renewal::RenewalIntent,
+        mut prepared: crate::renewal::RenewalIntent,
         previous_tx: &bitcoin::Transaction,
+        fee_source: Option<RenewalFeeSource<'_>>,
     ) -> Result<RenewalOutcome> {
+        let base_fee = prepared.estimate_base_fee(&self.fee_estimators)?;
+        if base_fee > 0 {
+            let source = fee_source.ok_or_else(|| {
+                anyhow!(
+                    "renewal requires a clean fee VTXO; the unfunded intent fee is {base_fee} sats"
+                )
+            })?;
+            let fee_sats = prepared.estimate_sponsored_fee(
+                source.record,
+                source.previous_tx,
+                source.vtxo,
+                &self.fee_estimators,
+                self.params.vtxo_min_sats,
+                crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+            )?;
+            prepared = prepared.add_fee_funding(
+                source.record,
+                source.previous_tx,
+                source.vtxo,
+                fee_sats,
+                self.params.vtxo_min_sats,
+                crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+            )?;
+        }
         let cosigner = Keys::generate()?;
         let prepared = crate::renewal::bind(
             authorizer_keys,
@@ -99,6 +136,68 @@ impl BatchServices {
             crate::renewal::approve(authorizer_keys, &self.emulator, emulator_pk, prepared).await?;
         join_batch_with_intent(self, authorizer_keys, &cosigner, emulator_pk, &approved).await
     }
+}
+
+pub struct RenewalFeeSource<'a> {
+    pub record: &'a crate::arkade::VtxoRecord,
+    pub previous_tx: &'a bitcoin::Transaction,
+    pub vtxo: &'a ark_core::Vtxo,
+}
+pub struct RenewalFeeFunding {
+    pub record: crate::arkade::VtxoRecord,
+    pub previous_tx: bitcoin::Transaction,
+    pub vtxo: ark_core::Vtxo,
+}
+
+impl RenewalFeeFunding {
+    pub fn source(&self) -> RenewalFeeSource<'_> {
+        RenewalFeeSource {
+            record: &self.record,
+            previous_tx: &self.previous_tx,
+            vtxo: &self.vtxo,
+        }
+    }
+}
+
+pub async fn find_renewal_fee_funding(
+    rest: &crate::arkade::ArkadeRest,
+    keys: &Keys,
+    params: &ServerParams,
+    excluded: OutPoint,
+) -> Result<Option<RenewalFeeFunding>> {
+    let vtxo = crate::txbuild::player_vtxo(keys, params)?;
+    let script_hex = vtxo.script_pubkey().to_hex_string();
+    let mut candidates = rest.get_vtxos(&script_hex, "spendableOnly").await?;
+    candidates.retain(|record| {
+        record.outpoint != excluded
+            && record.assets.is_empty()
+            && record.amount_sats >= params.vtxo_min_sats
+            && record
+                .ensure_live(
+                    crate::arkade::now_unix(),
+                    crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+                )
+                .is_ok()
+    });
+    let Some(record) = candidates
+        .into_iter()
+        .max_by_key(|record| record.amount_sats)
+    else {
+        return Ok(None);
+    };
+    let previous_tx = rest
+        .get_virtual_txs(&[record.outpoint.txid])
+        .await?
+        .remove(&record.outpoint.txid)
+        .ok_or_else(|| anyhow!("indexer omitted renewal fee input transaction"))?;
+    record
+        .validate_creating_transaction(&previous_tx)
+        .context("validate renewal fee input")?;
+    Ok(Some(RenewalFeeFunding {
+        record,
+        previous_tx,
+        vtxo,
+    }))
 }
 
 pub struct RenewalOutcome {
@@ -450,13 +549,19 @@ async fn join_registered_batch(
 
     let cosigner_pk = cosigner.keypair.public_key();
     let cosigner_xonly = cosigner.owner_pk();
-    let input = renewal.input.clone();
+    let mut inputs = vec![renewal.input.clone()];
+    if let Some(funding_input) = &renewal.funding_input {
+        inputs.push(funding_input.clone());
+    }
+    let state_outpoint = renewal.input.outpoint();
     let arkade_script = &renewal.arkade_script;
-    let input_outpoint = input.outpoint();
-    let topics = vec![
-        input_outpoint.to_string(),
-        cosigner_pk.serialize().to_lower_hex_string(),
-    ];
+    let topics = inputs
+        .iter()
+        .map(|input| input.outpoint().to_string())
+        .chain(std::iter::once(
+            cosigner_pk.serialize().to_lower_hex_string(),
+        ))
+        .collect::<Vec<_>>();
     let response = open_event_stream(&services.ark_base, &topics, &services.digest).await?;
     let mut stream = response.bytes_stream();
 
@@ -707,13 +812,14 @@ async fn join_registered_batch(
                         &chunks,
                         signing_commitment,
                         services.params.dust_sats,
+                        inputs.len(),
                     )?;
                     let connector_graph = TxGraph::new(chunks.clone())
                         .map_err(|error| anyhow!("build connector tree: {error}"))?;
                     let sign_fn = forfeit_sign_fn(rollover_keys);
                     let forfeits = create_and_sign_forfeit_txs(
                         sign_fn,
-                        std::slice::from_ref(&input),
+                        &inputs,
                         &connector_graph.leaves(),
                         &services.pins.forfeit_address,
                         Amount::from_sat(services.params.dust_sats),
@@ -741,6 +847,7 @@ async fn join_registered_batch(
                         approved.signed_forfeits,
                         emulator_pk,
                         arkade_script,
+                        state_outpoint,
                     )?;
                     services
                         .ark
@@ -775,41 +882,38 @@ async fn join_registered_batch(
     }
 }
 
-fn require_zero_renewal_fees(info: &ark_core::server::Info) -> Result<()> {
-    let schedules = [
-        ("current", info.fees.as_ref()),
-        (
-            "scheduled",
-            info.scheduled_session
-                .as_ref()
-                .and_then(|session| session.fees.as_ref()),
-        ),
-    ];
-    for (name, fees) in schedules {
-        let Some(fees) = fees else {
-            continue;
-        };
-        for (kind, expression) in [
-            ("offchain-input", fees.intent_fee.offchain_input.as_deref()),
-            (
-                "offchain-output",
-                fees.intent_fee.offchain_output.as_deref(),
-            ),
-        ] {
-            let Some(expression) = expression else {
-                continue;
-            };
-            let expression = expression.trim();
-            let is_zero_literal =
-                expression.is_empty() || expression.parse::<f64>().is_ok_and(|value| value == 0.0);
-            if !is_zero_literal {
-                return Err(anyhow!(
-                    "woodland.sh renewal requires zero intent fees; arkd's {name} {kind} fee is {expression:?}"
-                ));
-            }
-        }
-    }
-    Ok(())
+fn build_fee_estimators(info: &ark_core::server::Info) -> Result<Vec<ark_fees::Estimator>> {
+    let current = info.fees.as_ref();
+    let scheduled = info
+        .scheduled_session
+        .as_ref()
+        .and_then(|session| session.fees.as_ref());
+    let mut seen = HashSet::new();
+    [current, scheduled]
+        .into_iter()
+        .map(|fees| {
+            let programs = fees
+                .map(|fees| &fees.intent_fee)
+                .cloned()
+                .unwrap_or_default();
+            [
+                programs.offchain_input.unwrap_or_default(),
+                programs.onchain_input.unwrap_or_default(),
+                programs.offchain_output.unwrap_or_default(),
+                programs.onchain_output.unwrap_or_default(),
+            ]
+        })
+        .filter(|programs| seen.insert(programs.clone()))
+        .map(|programs| {
+            ark_fees::Estimator::new(ark_fees::Config {
+                intent_offchain_input_program: programs[0].clone(),
+                intent_onchain_input_program: programs[1].clone(),
+                intent_offchain_output_program: programs[2].clone(),
+                intent_onchain_output_program: programs[3].clone(),
+            })
+            .map_err(|error| anyhow!("compile arkd intent fee policy: {error}"))
+        })
+        .collect()
 }
 
 fn validate_batch_expiry(
@@ -1209,6 +1313,7 @@ fn validate_connector_tree(
     chunks: &[TxGraphChunk],
     commitment: &Psbt,
     dust_sats: u64,
+    expected_leaf_count: usize,
 ) -> Result<()> {
     validate_graph(chunks, commitment, 1, "connector tree")?;
     let mut leaf_count = 0_usize;
@@ -1230,9 +1335,9 @@ fn validate_connector_tree(
             }
         }
     }
-    if leaf_count != 1 {
+    if expected_leaf_count == 0 || leaf_count != expected_leaf_count {
         return Err(anyhow!(
-            "renewal connector subtree must expose exactly one connector leaf"
+            "renewal connector subtree exposes {leaf_count} leaves for {expected_leaf_count} inputs"
         ));
     }
     Ok(())
@@ -1277,14 +1382,16 @@ fn forfeit_sign_fn(
     }
 }
 
-/// Merge locally signed forfeits with the emulator's covenant signatures,
-/// keyed by transaction so positional order is never trusted.
+/// Merge locally signed forfeits with the emulator's covenant signature. The
+/// emulator may omit ordinary wallet fee-input forfeits, which require only
+/// the wallet owner plus arkd.
 fn combine_forfeits(
     rollover_keys: &Keys,
     local: &[Psbt],
     emulator_signed: Vec<String>,
     emulator_pk: bitcoin::XOnlyPublicKey,
     arkade_script: &bitcoin::ScriptBuf,
+    state_outpoint: OutPoint,
 ) -> Result<Vec<Psbt>> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -1302,50 +1409,69 @@ fn combine_forfeits(
         }
     }
 
+    let mut state_seen = false;
     let mut complete = Vec::with_capacity(local.len());
     for ours in local {
         let txid = ours.unsigned_tx.compute_txid();
-        let theirs = emulator_by_txid
-            .remove(&txid)
-            .ok_or_else(|| anyhow!("emulator omitted renewal forfeit {txid}"))?;
-        if ours.unsigned_tx != theirs.unsigned_tx {
-            return Err(anyhow!("emulator changed renewal forfeit {txid}"));
+        let forfeited_outpoint = ours
+            .unsigned_tx
+            .input
+            .get(1)
+            .ok_or_else(|| anyhow!("forfeit {txid} omits its VTXO input"))?
+            .previous_output;
+        let is_state = forfeited_outpoint == state_outpoint;
+        if is_state && std::mem::replace(&mut state_seen, true) {
+            return Err(anyhow!("multiple forfeits spend the renewal state"));
         }
         let mut combined = ours.clone();
-        combined
-            .combine(theirs)
-            .map_err(|error| anyhow!("combine renewal forfeit {txid}: {error}"))?;
-        crate::txbuild::verified_signature_for_key(
-            rollover_keys,
-            ours,
-            &combined,
-            1,
-            tweaked_emulator,
-            "emulator",
-        )?;
-        // The client signs only when its key is a leaf signer; permissionless
-        // leaves (operator + emulator only) take just the emulator signature
-        // and arkd completes its own when it enforces the forfeit.
-        let client_sig_expected = ours.inputs[1]
+        if let Some(theirs) = emulator_by_txid.remove(&txid) {
+            if ours.unsigned_tx != theirs.unsigned_tx {
+                return Err(anyhow!("emulator changed renewal forfeit {txid}"));
+            }
+            combined
+                .combine(theirs)
+                .map_err(|error| anyhow!("combine renewal forfeit {txid}: {error}"))?;
+        } else if is_state {
+            return Err(anyhow!("emulator omitted renewal state forfeit {txid}"));
+        }
+
+        if is_state {
+            crate::txbuild::verified_signature_for_key(
+                rollover_keys,
+                ours,
+                &combined,
+                1,
+                tweaked_emulator,
+                "emulator",
+            )?;
+        }
+        let owner_sig_expected = ours.inputs[1]
             .witness_script
             .as_ref()
             .map(ark_core::script::extract_checksig_pubkeys)
             .is_some_and(|signers| signers.contains(&rollover_keys.owner_pk()));
-        if client_sig_expected {
+        if owner_sig_expected {
             crate::txbuild::verified_signature_for_key(
                 rollover_keys,
                 ours,
                 &combined,
                 1,
                 rollover_keys.owner_pk(),
-                "rollover",
+                if is_state {
+                    "renewal authorizer"
+                } else {
+                    "fee input owner"
+                },
             )?;
         }
-        let expected_sigs = 1 + usize::from(client_sig_expected);
+        let expected_sigs = usize::from(is_state) + usize::from(owner_sig_expected);
         if combined.inputs[1].tap_script_sigs.len() != expected_sigs {
-            return Err(anyhow!("rollover forfeit contains an unexpected signature"));
+            return Err(anyhow!("renewal forfeit contains an unexpected signature"));
         }
         complete.push(combined);
+    }
+    if !state_seen {
+        return Err(anyhow!("connector set omitted the renewal state forfeit"));
     }
     if !emulator_by_txid.is_empty() {
         return Err(anyhow!("emulator returned unexpected forfeits"));
@@ -1651,6 +1777,7 @@ mod tests {
             input_expires_at: i64::MAX,
             leaf_outputs: Vec::new(),
             arkade_script: ScriptBuf::new(),
+            funding_input: None,
         };
         let ark = ark_rest::Client::new(format!("http://{address}")).unwrap();
         let intent_id = register_renewal_intent(
@@ -1917,12 +2044,12 @@ mod tests {
             tx: connector,
             children: HashMap::new(),
         };
-        validate_connector_tree(std::slice::from_ref(&chunk), &commitment, 330).unwrap();
+        validate_connector_tree(std::slice::from_ref(&chunk), &commitment, 330, 1).unwrap();
 
         let mut wrong_root = chunk;
         wrong_root.tx.unsigned_tx.input[0].previous_output.vout = 0;
         wrong_root.txid = Some(wrong_root.tx.unsigned_tx.compute_txid());
-        assert!(validate_connector_tree(&[wrong_root], &commitment, 330).is_err());
+        assert!(validate_connector_tree(&[wrong_root], &commitment, 330, 1).is_err());
     }
 
     #[test]

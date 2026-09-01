@@ -21,6 +21,7 @@ usage: ./scripts/regtest.sh <command> [args]
   start                         build missing images and start minimal base + ark
   start-tree                    start minimal base + ark + script emulator
   renew-world                   run the wrapper's pre-game renewal pass
+  fees                         reapply configured live arkd intent fees
   stop                          stop containers, preserving data
   clean --force                 remove containers and volumes
   build-images [arkd-source]    build stock pinned arkd and arkd-wallet images
@@ -83,16 +84,33 @@ ensure_images() {
 fund_address() {
   local address=$1
   local sats=$2
-  # A preserved faucet wallet may hold only near-expiry VTXOs. Redeem a new
-  # server note first so coin selection gives the recipient fresh lifetime.
   local note
+  local status=0
+  # Test funding must create the requested exact output even when the live
+  # profile charges intent fees. Pause fees only for this serialized faucet
+  # operation, then restore the configured policy before returning.
+  ARK_OFFCHAIN_INPUT_FEE=0.0 \
+    ARK_ONCHAIN_INPUT_FEE=0.0 \
+    ARK_OFFCHAIN_OUTPUT_FEE=0.0 \
+    ARK_ONCHAIN_OUTPUT_FEE=0.0 \
+    node "$REGTEST" fees >/dev/null
+  set +e
   note=$(node "$REGTEST" arkd note --amount "$sats")
-  if [[ ! "$note" =~ ^arknote[[:alnum:]]+$ ]]; then
-    echo "error: failed to create a fresh Ark credit note" >&2
-    exit 1
+  status=$?
+  if [[ $status -eq 0 && "$note" =~ ^arknote[[:alnum:]]+$ ]]; then
+    node "$REGTEST" ark redeem-notes -n "$note" --password secret >/dev/null
+    status=$?
+  else
+    printf 'error: failed to create a fresh Ark credit note\n' >&2
+    status=1
   fi
-  node "$REGTEST" ark redeem-notes -n "$note" --password secret >/dev/null
-  node "$REGTEST" ark send --to "$address" --amount "$sats" --password secret
+  if [[ $status -eq 0 ]]; then
+    node "$REGTEST" ark send --to "$address" --amount "$sats" --password secret
+    status=$?
+  fi
+  set -e
+  node "$REGTEST" fees >/dev/null
+  return "$status"
 }
 
 run_world_bootstrap() {
@@ -230,7 +248,7 @@ command=${1:-}
 shift || true
 
 case "$command" in
-  start|start-tree|renew-world|stop|clean|build-images|fund|balance|vtxos|info|mine|rpc|ark|arkd)
+  start|start-tree|renew-world|fees|stop|clean|build-images|fund|balance|vtxos|info|mine|rpc|ark|arkd)
     if [[ ${ARKADE_REGTEST_LOCKED:-} != 1 ]]; then
       export ARKADE_REGTEST_LOCKED=1
       exec flock --exclusive --close "$LOCK_FILE" "$0" "$command" "$@"
@@ -246,7 +264,7 @@ if [[ "$command" == "clean" ]]; then
 fi
 
 case "$command" in
-  start|start-tree|renew-world|stop|clean|fund|balance|vtxos|info|mine|rpc|ark|arkd)
+  start|start-tree|renew-world|fees|stop|clean|fund|balance|vtxos|info|mine|rpc|ark|arkd)
     assert_stack_ownership
     ;;
 esac
@@ -268,7 +286,19 @@ case "$command" in
     load_existing_bitcoin_wallet
     node "$REGTEST" start --profile emulator
     assert_pinned_images
-    ensure_world
+    ARK_OFFCHAIN_INPUT_FEE=0.0 \
+      ARK_ONCHAIN_INPUT_FEE=0.0 \
+      ARK_OFFCHAIN_OUTPUT_FEE=0.0 \
+      ARK_ONCHAIN_OUTPUT_FEE=0.0 \
+      node "$REGTEST" fees >/dev/null
+    set +e
+    (ensure_world)
+    status=$?
+    set -e
+    node "$REGTEST" fees >/dev/null
+    if [[ $status -ne 0 ]]; then
+      exit "$status"
+    fi
     ;;
   renew-world)
     if [[ ${WOODLAND_RENEWAL_STARTUP:-} != 1 ]]; then
@@ -277,6 +307,10 @@ case "$command" in
     fi
     require_regtest
     run_world_bootstrap renew-once "$WORLD_MANIFEST"
+    ;;
+  fees)
+    require_regtest
+    node "$REGTEST" fees
     ;;
   stop)
     require_regtest

@@ -5,8 +5,9 @@ use crate::keys::Keys;
 use crate::tree;
 use crate::txbuild;
 use crate::world::{
-    tree_states, WorldManifest, ACTIVE_LOGS_PER_TREE, GAME_ID, LOG_RESERVE_PER_TREE,
-    MANIFEST_SCHEMA_VERSION, PROTOCOL_DUST_SATS, PROTOCOL_VERSION, TREE_COUNT, XP_PER_TREE,
+    asset_metadata_entries, tree_states, WorldManifest, ACTIVE_LOGS_PER_TREE, GAME_ID,
+    LOG_RESERVE_PER_TREE, MANIFEST_SCHEMA_VERSION, PROTOCOL_DUST_SATS, PROTOCOL_VERSION,
+    TREE_COUNT, XP_PER_TREE,
 };
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::packet::{AssetGroup, AssetInput, AssetOutput, Packet};
@@ -187,7 +188,7 @@ pub async fn run_cli() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next().ok_or_else(|| {
         anyhow!(
-            "usage: woodland-operator <status|ensure|renew-once|watch> <manifest>\n       woodland-operator renew <manifest> <tree <tree_id>|player <owner_pubkey> <player_asset>>"
+            "usage: woodland-operator <status|ensure|renew-once|watch> <manifest>\n       woodland-operator renewal-address <manifest>\n       woodland-operator renew <manifest> <tree <tree_id>|player <owner_pubkey> <player_asset>>"
         )
     })?;
     let manifest_path = args
@@ -212,6 +213,22 @@ pub async fn run_cli() -> Result<()> {
             let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
             ensure_world(&manifest_path, &deployer, rollover.owner_pk(), &services).await
         }
+        "renewal-address" => {
+            if args.next().is_some() {
+                return Err(anyhow!("unexpected renewal-address argument"));
+            }
+            let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
+            let manifest = read_manifest(&manifest_path)?;
+            let world = manifest.validate(&rollover.secp, &services.params, &services.emulator)?;
+            if rollover.owner_pk() != world.rollover_signer {
+                return Err(anyhow!(
+                    "{ROLLOVER_SECRET_ENV} does not match the manifest rollover signer"
+                ));
+            }
+            let wallet = txbuild::player_vtxo(&rollover, &services.params)?;
+            println!("{}", wallet.to_ark_address().encode());
+            Ok(())
+        }
         "renew" => {
             let target = args.next().ok_or_else(|| {
                 anyhow!(
@@ -221,9 +238,8 @@ pub async fn run_cli() -> Result<()> {
             match (target.as_str(), args.next(), args.next(), args.next()) {
                 ("tree", Some(tree_id), None, None) => {
                     let tree_id = tree_id.parse::<u32>().context("parse tree id")?;
-                    let participant =
-                        Keys::generate().context("generate tree renewal batch participant")?;
-                    renew_tree(&manifest_path, &participant, &services, tree_id).await
+                    let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
+                    renew_tree(&manifest_path, &rollover, &services, tree_id).await
                 }
                 ("player", Some(owner), Some(player_asset), None) => {
                     let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
@@ -252,10 +268,9 @@ pub async fn run_cli() -> Result<()> {
             if args.next().is_some() {
                 return Err(anyhow!("unexpected renew-once argument"));
             }
-            let participant =
-                Keys::generate().context("generate tree renewal batch participant")?;
+            let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
             let (renewed, missing_expiry) =
-                renew_world(&manifest_path, &participant, &services).await?;
+                renew_world(&manifest_path, &rollover, &services).await?;
             println!("{{\"renewed\":{renewed},\"missingExpiry\":{missing_expiry}}}");
             Ok(())
         }
@@ -263,9 +278,8 @@ pub async fn run_cli() -> Result<()> {
             if args.next().is_some() {
                 return Err(anyhow!("unexpected watch argument"));
             }
-            let participant =
-                Keys::generate().context("generate tree renewal batch participant")?;
-            let mut last_error = match renew_world(&manifest_path, &participant, &services).await {
+            let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
+            let mut last_error = match renew_world(&manifest_path, &rollover, &services).await {
                 Ok((initial_renewed, _)) => {
                     if initial_renewed > 0 {
                         eprintln!("woodland.sh rolled over {initial_renewed} tree(s)");
@@ -300,7 +314,7 @@ pub async fn run_cli() -> Result<()> {
                 next_rollover = tokio::time::Instant::now()
                     + std::time::Duration::from_secs(TREE_ROLLOVER_CHECK_SECS);
                 let result =
-                    renew_expiring_trees(&manifest_path, &participant, &current_services).await;
+                    renew_expiring_trees(&manifest_path, &rollover, &current_services).await;
                 match result {
                     Ok((renewed, _)) => {
                         if last_error.take().is_some() {
@@ -381,11 +395,6 @@ async fn connect_services() -> Result<Services> {
     if params.dust_sats != PROTOCOL_DUST_SATS || params.vtxo_min_sats > PROTOCOL_DUST_SATS {
         return Err(anyhow!(
             "woodland.sh requires {PROTOCOL_DUST_SATS}-sat outputs supported by the Arkade service"
-        ));
-    }
-    if !params.zero_offchain_fees {
-        return Err(anyhow!(
-            "woodland.sh requires zero offchain input and output fees"
         ));
     }
     if params.max_op_return_outputs < 1 {
@@ -577,11 +586,11 @@ fn build_plan(
     let genesis_group = |label: &str, amount: u64| AssetGroup {
         asset_id: None,
         control_asset: None,
-        metadata: Some(vec![
-            ("game".to_string(), GAME_ID.to_string()),
-            ("protocol".to_string(), PROTOCOL_VERSION.to_string()),
-            ("asset".to_string(), label.to_string()),
-        ]),
+        metadata: Some(asset_metadata_entries(
+            label,
+            keys.owner_pk(),
+            rollover_signer,
+        )),
         inputs: Vec::new(),
         outputs: vec![AssetOutput {
             output_index: 0,
@@ -617,6 +626,7 @@ fn build_plan(
         &keys.secp,
         services.params.signer_pk,
         services.emulator.signer_pk,
+        rollover_signer,
         services.params.unilateral_exit_delay,
         services.params.network,
         tree_asset,
@@ -832,6 +842,7 @@ fn build_plan(
     let manifest = WorldManifest::new(
         &services.params,
         &services.emulator,
+        keys,
         &services.arkade_url,
         &services.emulator_url,
         rollover_signer,
@@ -841,7 +852,7 @@ fn build_plan(
         &contract,
         genesis_txid,
         &manifest_deployments,
-    );
+    )?;
     Ok(BootstrapPlan {
         manifest,
         deployer_script: deployer.script_pubkey().to_hex_string(),
@@ -1344,10 +1355,18 @@ async fn renew_expiring_trees(
     let mut renewed = 0;
     let mut failures = Vec::new();
     let mut paused_for_arkd_ban = false;
+    // A fee-funded renewal spends and recreates one ordinary wallet VTXO.
+    // Serialize those renewals so concurrent intents cannot select the same
+    // funding outpoint. Zero-fee renewals retain bounded batch concurrency.
+    let renewal_concurrency = if services.params.zero_offchain_fees {
+        RENEWAL_CONCURRENCY
+    } else {
+        1
+    };
     // Keep each correlated expiry wave inside one bounded Ark round. Launching
     // another round after Arkd bans the shared covenant script only amplifies
     // the outage and cannot renew any tree until that temporary ban expires.
-    for chunk in candidates.chunks(RENEWAL_CONCURRENCY) {
+    for chunk in candidates.chunks(renewal_concurrency) {
         attempted += chunk.len();
         let results = stream::iter(chunk.iter().map(|(_, current)| {
             let world = world_ref;
@@ -1365,7 +1384,7 @@ async fn renew_expiring_trees(
                 )
             }
         }))
-        .buffer_unordered(RENEWAL_CONCURRENCY)
+        .buffer_unordered(renewal_concurrency)
         .collect::<Vec<_>>()
         .await;
         for (tree_id, result) in results {
@@ -1565,8 +1584,8 @@ fn read_manifest(path: &Path) -> Result<WorldManifest> {
     WorldManifest::from_json(&json)
 }
 
-/// Emulator-approve and batch-settle one permissionless tree self-send. The
-/// caller key contributes only the ephemeral batch cosigner.
+/// Emulator-approve and batch-settle one exact tree state transition. Funded
+/// stump regrowth is permissionless; maintenance is authorized by rollover.
 async fn run_one_renewal(
     participant_keys: &Keys,
     services: &Services,
@@ -1581,12 +1600,24 @@ async fn run_one_renewal(
         world.pins.clone(),
     )
     .await?;
+    let fee_funding = if batch_services.renewal_requires_fee(&prepared)? {
+        crate::batch::find_renewal_fee_funding(
+            &services.rest,
+            participant_keys,
+            &services.params,
+            prepared.state_outpoint(),
+        )
+        .await?
+    } else {
+        None
+    };
     batch_services
         .settle_renewal(
             participant_keys,
             services.emulator.signer_pk,
             prepared,
             previous_tx,
+            fee_funding.as_ref().map(|funding| funding.source()),
         )
         .await
 }

@@ -94,11 +94,7 @@ async fn main() -> Result<()> {
             None => {
                 let mut trees = client.trees(&[]).await?;
                 trees.retain(|tree| tree.health.value() > 0 && tree.logs > 0);
-                trees.sort_by_key(|tree| {
-                    let position = player.state.position;
-                    u32::from(tree.state.x.abs_diff(position.x))
-                        + u32::from(tree.state.y.abs_diff(position.y))
-                });
+                trees.sort_by_key(|tree| tree.state.tree_id);
                 let Some(nearest) = trees.first() else {
                     println!("no active trees; waiting for renewal or regrowth");
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;

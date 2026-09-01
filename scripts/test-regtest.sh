@@ -110,13 +110,22 @@ if [[ "$PROFILE" == chaos ]]; then
   done
 fi
 "$ROOT/scripts/regtest.sh" start-tree
+if [[ "$PROFILE" != regrowth ]]; then
+  renewal_fee_address=$(
+    "$ROOT/target/debug/woodland-operator" renewal-address "$WOODLAND_WORLD_MANIFEST"
+  )
+  for _ in {1..10}; do
+    "$ROOT/scripts/regtest.sh" fund "$renewal_fee_address" 1000
+  done
+fi
+"$ROOT/scripts/regtest.sh" fees
 WOODLAND_RENEWAL_STARTUP=1 "$ROOT/scripts/regtest.sh" renew-world
 cargo build --locked --features server --bin woodland-server
 rm -f "$WOODLAND_SERVER_DB"
 cp "$WOODLAND_WORLD_MANIFEST" "$ARTIFACT_DIR/world.json"
 WOODLAND_SERVER_URL=self WOODLAND_WASM_FEATURES=regtest-e2e "$ROOT/scripts/build-web.sh"
 if [[ "$PROFILE" != regrowth ]]; then
-  env -u WOODLAND_ROLLOVER_SECRET "$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" >"$WATCHER_LOG" 2>&1 &
+  "$ROOT/target/debug/woodland-operator" watch "$WOODLAND_WORLD_MANIFEST" >"$WATCHER_LOG" 2>&1 &
   WATCHER_PID=$!
 fi
 if curl --fail --silent --max-time 1 "$WOODLAND_SERVER_URL/health.json" >/dev/null 2>&1; then

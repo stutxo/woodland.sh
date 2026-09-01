@@ -123,10 +123,11 @@ const RELEASE_PLAN = Object.freeze([
   'regrowth',
 ]);
 const EXPECTED_WORLD = Object.freeze({
-  schemaVersion: 2,
-  protocolVersion: 2,
+  schemaVersion: 3,
+  protocolVersion: 3,
   network: 'regtest',
   gameId: 'woodland.sh',
+  rulesetId: 'woodland.sh/forest/v3',
   playerLevelCurve: 'woodland-xp-v1',
   maxPlayerLevel: 99,
   baseLogDropBasisPoints: 2_000,
@@ -234,6 +235,7 @@ function manifestSummary(manifest) {
     protocolVersion: manifest.protocolVersion,
     network: manifest.network,
     gameId: manifest.gameId,
+    rulesetId: manifest.rulesetId,
     genesisTxid: manifest.genesisTxid,
     playerLevelCurve: manifest.playerLevelCurve,
     maxPlayerLevel: manifest.maxPlayerLevel,

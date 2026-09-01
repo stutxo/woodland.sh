@@ -281,11 +281,6 @@ impl WoodlandApp {
                 "Arkade service network does not match the world manifest",
             ));
         }
-        if !params.zero_offchain_fees {
-            return Err(JsValue::from_str(
-                "woodland.sh requires zero offchain input and output fees",
-            ));
-        }
         let emulator = EmulatorRest::new(emulator);
         let emulator_params = emulator.get_info().await.map_err(js_err)?;
         let keys = match secret_key.filter(|value| !value.trim().is_empty()) {
@@ -714,7 +709,7 @@ impl WoodlandApp {
         let player_xp = self
             .player_state
             .as_ref()
-            .map(|player| player.state.xp.value())
+            .and_then(|player| player.record.asset_amount(self.world.xp_asset))
             .unwrap_or(0);
         let wallet_sats = self
             .wallet_records
@@ -1080,16 +1075,6 @@ impl WoodlandApp {
                         player_asset.expect("state selection requires PLAYER_ID"),
                     )?;
 
-                    let expected_identity = player::derive_player_identity(
-                        self.keys.owner_pk(),
-                        self.world.genesis_txid,
-                    );
-                    let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
-                    if state.identity != expected_identity || state.xp.value() != xp_balance {
-                        return Err(anyhow!(
-                            "current player state has invalid identity or XP backing"
-                        ));
-                    }
                     Some(LivePlayerState {
                         contract: player_contract,
                         state,
@@ -1209,16 +1194,6 @@ impl WoodlandApp {
                         &player_contract,
                         player_asset.expect("state selection requires PLAYER_ID"),
                     )?;
-                    let expected_identity = player::derive_player_identity(
-                        self.keys.owner_pk(),
-                        self.world.genesis_txid,
-                    );
-                    let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
-                    if state.identity != expected_identity || state.xp.value() != xp_balance {
-                        return Err(anyhow!(
-                            "current player state has invalid identity or XP backing"
-                        ));
-                    }
                     Some(LivePlayerState {
                         contract: player_contract,
                         state,
@@ -1500,19 +1475,10 @@ impl WoodlandApp {
             },
         )
         .map_err(|error| anyhow!("attach PLAYER_ID issuance packet: {error}"))?;
-        let identity =
-            player::derive_player_identity(self.keys.owner_pk(), self.world.genesis_txid);
+        let initial_luck = player::PlayerLuck::initial(&contract.vtxo.script_pubkey())?;
         player::attach_player_state_packets(
             &mut activation.ark_tx,
-            PlayerState {
-                identity,
-                position: player::PlayerPosition {
-                    x: crate::world::PLAYER_SPAWN_X,
-                    y: crate::world::PLAYER_SPAWN_Y,
-                },
-                luck: player::PlayerLuck::initial(identity),
-                xp: player::PlayerXp::new(0),
-            },
+            PlayerState { luck: initial_luck },
         )?;
         if activation.ark_tx.unsigned_tx.output.len() != crate::protocol::ACTIVATION_OUTPUT_COUNT {
             return Err(anyhow!("activation transaction has an invalid shape"));
@@ -1649,12 +1615,24 @@ impl WoodlandApp {
             self.world.manifest.pins(self.params.network)?,
         )
         .await?;
+        let fee_funding = if services.renewal_requires_fee(&prepared)? {
+            crate::batch::find_renewal_fee_funding(
+                &self.rest,
+                &self.keys,
+                &self.params,
+                state.record.outpoint,
+            )
+            .await?
+        } else {
+            None
+        };
         let outcome = services
             .settle_renewal(
                 &self.keys,
                 self.emulator_params.signer_pk,
                 prepared,
                 &state.previous_tx,
+                fee_funding.as_ref().map(|funding| funding.source()),
             )
             .await?;
         let renewed = wait_for_vtxo(
@@ -1710,12 +1688,24 @@ impl WoodlandApp {
             self.world.manifest.pins(self.params.network)?,
         )
         .await?;
+        let fee_funding = if services.renewal_requires_fee(&prepared)? {
+            crate::batch::find_renewal_fee_funding(
+                &self.rest,
+                &self.keys,
+                &self.params,
+                tree.record.outpoint,
+            )
+            .await?
+        } else {
+            None
+        };
         let outcome = services
             .settle_renewal(
                 &self.keys,
                 self.emulator_params.signer_pk,
                 prepared,
                 previous_tx,
+                fee_funding.as_ref().map(|funding| funding.source()),
             )
             .await?;
         wait_for_vtxo(
@@ -1739,7 +1729,7 @@ impl WoodlandApp {
     }
 
     async fn invalid_xp_transition_probe(&mut self, tree_id: u32) -> Result<()> {
-        self.rejected_chop_mutation_probe(tree_id, ChopMutation::InvertXp)
+        self.rejected_chop_mutation_probe(tree_id, ChopMutation::WrongXpDelta)
             .await
     }
 
@@ -1824,7 +1814,8 @@ impl WoodlandApp {
             tree.previous_tx = Some(previous_tx);
         }
         if let Some(expected) = expected {
-            let (_, success) = state.state.luck.advance(state.state.xp.value());
+            let player_xp = state.record.asset_amount(self.world.xp_asset).unwrap_or(0);
+            let (_, success) = state.state.luck.advance(player_xp);
             if tree.record.outpoint.to_string() != expected.tree_outpoint
                 || state.record.outpoint.to_string() != expected.player_state_outpoint
                 || success != expected.drop

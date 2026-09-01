@@ -187,11 +187,6 @@ impl WoodlandClient {
             .ok_or_else(|| anyhow!("player creating transaction has no state packets"))?;
         let logs = record.asset_amount(self.world.log_asset).unwrap_or(0);
         let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
-        if state.xp.value() != xp_balance {
-            return Err(anyhow!(
-                "player XP counter is not backed by its XP asset balance"
-            ));
-        }
         Ok(Some(PlayerSnapshot {
             state,
             record,
@@ -374,19 +369,10 @@ impl WoodlandClient {
             },
         )
         .map_err(|error| anyhow!("attach PLAYER_ID issuance packet: {error}"))?;
-        let identity =
-            player::derive_player_identity(self.keys.owner_pk(), self.world.genesis_txid);
+        let initial_luck = player::PlayerLuck::initial(&self.contract.vtxo.script_pubkey())?;
         player::attach_player_state_packets(
             &mut activation.ark_tx,
-            PlayerState {
-                identity,
-                position: player::PlayerPosition {
-                    x: crate::world::PLAYER_SPAWN_X,
-                    y: crate::world::PLAYER_SPAWN_Y,
-                },
-                luck: player::PlayerLuck::initial(identity),
-                xp: player::PlayerXp::new(0),
-            },
+            PlayerState { luck: initial_luck },
         )?;
         if activation.ark_tx.unsigned_tx.output.len() != protocol::ACTIVATION_OUTPUT_COUNT {
             return Err(anyhow!("activation transaction has an invalid shape"));
@@ -653,12 +639,24 @@ impl WoodlandClient {
             self.world.pins.clone(),
         )
         .await?;
+        let fee_funding = if services.renewal_requires_fee(&prepared)? {
+            crate::batch::find_renewal_fee_funding(
+                &self.rest,
+                &self.keys,
+                &self.params,
+                tree.record.outpoint,
+            )
+            .await?
+        } else {
+            None
+        };
         let outcome = services
             .settle_renewal(
                 &self.keys,
                 self.emulator_params.signer_pk,
                 prepared,
                 &tree.previous_tx,
+                fee_funding.as_ref().map(|funding| funding.source()),
             )
             .await?;
         let renewed = self
@@ -705,12 +703,24 @@ impl WoodlandClient {
             self.world.pins.clone(),
         )
         .await?;
+        let fee_funding = if services.renewal_requires_fee(&prepared)? {
+            crate::batch::find_renewal_fee_funding(
+                &self.rest,
+                &self.keys,
+                &self.params,
+                player.record.outpoint,
+            )
+            .await?
+        } else {
+            None
+        };
         let outcome = services
             .settle_renewal(
                 &self.keys,
                 self.emulator_params.signer_pk,
                 prepared,
                 &player.previous_tx,
+                fee_funding.as_ref().map(|funding| funding.source()),
             )
             .await?;
         let renewed = self

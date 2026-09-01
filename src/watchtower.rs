@@ -132,12 +132,24 @@ pub async fn renew_player(
         world.pins.clone(),
     )
     .await?;
+    let fee_funding = if batch_services.renewal_requires_fee(&prepared)? {
+        crate::batch::find_renewal_fee_funding(
+            services.rest,
+            rollover_keys,
+            services.params,
+            old_outpoint,
+        )
+        .await?
+    } else {
+        None
+    };
     let outcome = batch_services
         .settle_renewal(
             rollover_keys,
             services.emulator.signer_pk,
             prepared,
             &previous_tx,
+            fee_funding.as_ref().map(|funding| funding.source()),
         )
         .await?;
     let renewed = wait_for_record(services.rest, &script, outcome.outpoint).await?;
@@ -160,7 +172,7 @@ pub async fn renew_player(
 
     Ok(PlayerRenewalOutcome {
         old_outpoint,
-        xp: previous_state.xp.value(),
+        xp: record.asset_amount(world.xp_asset).unwrap_or(0),
         old_expires_at,
         new_outpoint: renewed.outpoint,
         new_expires_at: renewed.expires_at,

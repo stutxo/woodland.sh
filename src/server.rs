@@ -549,19 +549,15 @@ impl Verifier {
             .remove(&record.outpoint.txid)
             .ok_or_else(|| anyhow!("indexer omitted the player creating transaction"))?;
         record.validate_creating_transaction(&previous_tx)?;
-        let state = player::player_state_from_tx(&previous_tx)?
+        let _state = player::player_state_from_tx(&previous_tx)?
             .ok_or_else(|| anyhow!("player creating transaction has no state packets"))?;
-        let expected_identity = player::derive_player_identity(owner, self.world.genesis_txid);
         let xp_balance = record.asset_amount(self.world.xp_asset).unwrap_or(0);
-        if state.identity != expected_identity || state.xp.value() != xp_balance {
-            bail!("player identity or XP backing is invalid");
-        }
         let now = now_unix();
         Ok(Some(LeaderboardPlayer {
             owner: owner.to_string(),
             player_asset: player_asset.to_string(),
-            xp: state.xp.value(),
-            level: player::level_from_xp(state.xp.value()),
+            xp: xp_balance,
+            level: player::level_from_xp(xp_balance),
             logs: record.asset_amount(self.world.log_asset).unwrap_or(0),
             state_outpoint: record.outpoint.to_string(),
             expires_at: record.expires_at,

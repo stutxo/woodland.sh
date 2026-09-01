@@ -16,9 +16,9 @@ use crate::arkade::{now_unix, VtxoRecord};
 use crate::keys::Keys;
 use crate::player::{PlayerContract, PlayerState};
 use crate::protocol::{
-    PLAYER_IDENTITY_PACKET_TYPE, PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_POSITION_PACKET_TYPE,
-    PLAYER_ROLL_PACKET_TYPE, PLAYER_XP_PACKET_TYPE, RENEWAL_INPUT_COUNT, RENEWAL_STATE_INPUT_INDEX,
-    RENEWAL_STATE_OUTPUT_INDEX, TREE_HEALTH_PACKET_TYPE, TREE_STATE_PACKET_TYPE,
+    PLAYER_LUCK_CREDIT_PACKET_TYPE, PLAYER_ROLL_PACKET_TYPE, RENEWAL_FEE_INPUT_INDEX,
+    RENEWAL_INPUT_COUNT, RENEWAL_STATE_INPUT_INDEX, RENEWAL_STATE_OUTPUT_INDEX,
+    TREE_HEALTH_PACKET_TYPE, TREE_STATE_PACKET_TYPE,
 };
 use crate::tree::{TreeContract, TreeState};
 use anyhow::{anyhow, Context, Result};
@@ -38,12 +38,19 @@ const INTENT_DELETE_TTL_SECS: u64 = 120;
 /// One validated state VTXO prepared for batch renewal.
 pub struct RenewalIntent {
     input: intent::Input,
+    funding: Option<RenewalFunding>,
     outputs: Vec<intent::Output>,
     groups: Vec<AssetGroup>,
     state_packets: Vec<(u8, Vec<u8>)>,
+    input_created_at: i64,
     input_expires_at: i64,
     /// The renewal Arkade script; its tweaked emulator key must countersign.
     pub arkade_script: ScriptBuf,
+}
+
+struct RenewalFunding {
+    input: intent::Input,
+    previous_tx: Transaction,
 }
 
 /// A rollover proof signed by the dedicated service key and bound to its exact
@@ -54,6 +61,7 @@ pub struct PreparedRenewal {
     /// Exact JSON committed by the proof's fake message input.
     pub message_json: String,
     pub input: intent::Input,
+    pub funding_input: Option<intent::Input>,
     pub input_expires_at: i64,
     /// Exact non-anchor outputs arkd must place in this intent's batch leaf.
     pub leaf_outputs: Vec<TxOut>,
@@ -66,6 +74,7 @@ pub struct ApprovedRenewal {
     pub message: IntentMessage,
     pub message_json: String,
     pub input: intent::Input,
+    pub funding_input: Option<intent::Input>,
     pub input_expires_at: i64,
     /// Exact non-anchor outputs arkd must place in this intent's batch leaf.
     pub leaf_outputs: Vec<TxOut>,
@@ -101,6 +110,7 @@ pub async fn approve(
         message_json: prepared.message_json,
         input: prepared.input,
         input_expires_at: prepared.input_expires_at,
+        funding_input: prepared.funding_input,
         leaf_outputs: prepared.leaf_outputs,
         arkade_script: prepared.arkade_script,
     })
@@ -132,10 +142,19 @@ pub fn prepare_tree(
     let other_assets = assets.iter().any(|asset| {
         asset.asset_id != tree_asset && asset.asset_id != log_asset && asset.asset_id != xp_asset
     });
-    let health = if raw_health.value() == 0 && log_count > 0 {
-        crate::tree::TreeHealth::new(crate::tree::LOGS_PER_TREE)?
+    let funded_stump = raw_health.value() == 0 && log_count > 0;
+    let (health, spend_script, arkade_script) = if funded_stump {
+        (
+            crate::tree::TreeHealth::new(crate::tree::LOGS_PER_TREE)?,
+            &contract.regrowth_spend_script,
+            contract.regrowth_arkade_script.clone(),
+        )
     } else {
-        raw_health
+        (
+            raw_health,
+            &contract.maintenance_spend_script,
+            contract.maintenance_arkade_script.clone(),
+        )
     };
     if tree_count != 1
         || other_assets
@@ -156,8 +175,8 @@ pub fn prepare_tree(
     build(
         record,
         &contract.vtxo,
-        &contract.renewal_spend_script,
-        contract.renewal_arkade_script.clone(),
+        spend_script,
+        arkade_script,
         assets,
         groups,
         vec![
@@ -229,11 +248,6 @@ fn prepare_player_for_path(
     }
     let log_count = asset_amount(&assets, contract.log_asset);
     let xp_count = asset_amount(&assets, contract.xp_asset);
-    if state.xp.value() != xp_count {
-        return Err(anyhow!(
-            "player XP counter is not backed by its XP asset balance"
-        ));
-    }
     let mut groups = vec![renewal_group(player_asset, 1)];
     if log_count > 0 {
         groups.push(renewal_group(contract.log_asset, log_count));
@@ -260,20 +274,11 @@ fn prepare_player_for_path(
         assets,
         groups,
         vec![
-            (
-                PLAYER_IDENTITY_PACKET_TYPE,
-                state.identity.encode().to_vec(),
-            ),
-            (
-                PLAYER_POSITION_PACKET_TYPE,
-                state.position.encode().to_vec(),
-            ),
             (PLAYER_ROLL_PACKET_TYPE, state.luck.roll.encode().to_vec()),
             (
                 PLAYER_LUCK_CREDIT_PACKET_TYPE,
                 state.luck.credit.encode().to_vec(),
             ),
-            (PLAYER_XP_PACKET_TYPE, state.xp.encode().to_vec()),
         ],
         expiry_margin_secs,
     )
@@ -302,10 +307,12 @@ fn build(
     expiry_margin_secs: i64,
 ) -> Result<RenewalIntent> {
     record.ensure_live(now_unix(), expiry_margin_secs)?;
+    let input_created_at = record
+        .created_at
+        .ok_or_else(|| anyhow!("renewal input has no indexed creation time"))?;
     let input_expires_at = record
         .expires_at
         .ok_or_else(|| anyhow!("renewal input has no indexed expiry"))?;
-
     let control_block = vtxo
         .get_spend_info(spend_script.clone())
         .map_err(|error| anyhow!("renewal spend info: {error}"))?;
@@ -335,12 +342,221 @@ fn build(
 
     Ok(RenewalIntent {
         input,
+        funding: None,
         outputs,
         groups,
         state_packets,
+        input_created_at,
         input_expires_at,
         arkade_script,
     })
+}
+impl RenewalIntent {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn state_outpoint(&self) -> bitcoin::OutPoint {
+        self.input.outpoint()
+    }
+
+    pub(crate) fn estimate_base_fee(&self, estimators: &[ark_fees::Estimator]) -> Result<u64> {
+        let input = [ark_fees::OffchainInput {
+            amount: self.input.amount().to_sat(),
+            expiry: Some(self.input_expires_at),
+            birth: Some(self.input_created_at),
+            input_type: ark_fees::VtxoType::Vtxo,
+            weight: 0.0,
+        }];
+        let outputs = self
+            .outputs
+            .iter()
+            .map(output_txout)
+            .map(|output| output.map(fee_output))
+            .collect::<Result<Vec<_>>>()?;
+        estimators
+            .iter()
+            .map(|estimator| {
+                estimator
+                    .eval(&input, &[], &outputs, &[])
+                    .map(|fee| fee.to_satoshis())
+                    .map_err(|error| anyhow!("evaluate renewal intent fee: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|fees| fees.into_iter().max().unwrap_or(0))
+    }
+
+    pub(crate) fn estimate_sponsored_fee(
+        &self,
+        funding_record: &VtxoRecord,
+        funding_previous_tx: &Transaction,
+        funding_vtxo: &ark_core::Vtxo,
+        estimators: &[ark_fees::Estimator],
+        minimum_change_sats: u64,
+        expiry_margin_secs: i64,
+    ) -> Result<u64> {
+        validate_fee_funding(
+            funding_record,
+            funding_previous_tx,
+            funding_vtxo,
+            expiry_margin_secs,
+        )?;
+        if funding_record.outpoint == self.input.outpoint() {
+            return Err(anyhow!("renewal fee input duplicates the state input"));
+        }
+
+        let state_output = output_txout(
+            self.outputs
+                .first()
+                .ok_or_else(|| anyhow!("renewal intent has no state output"))?,
+        )?;
+        let extension_output = output_txout(
+            self.outputs
+                .last()
+                .ok_or_else(|| anyhow!("renewal intent has no extension output"))?,
+        )?;
+        let fee_inputs = [
+            ark_fees::OffchainInput {
+                amount: self.input.amount().to_sat(),
+                expiry: Some(self.input_expires_at),
+                birth: Some(self.input_created_at),
+                input_type: ark_fees::VtxoType::Vtxo,
+                weight: 0.0,
+            },
+            ark_fees::OffchainInput {
+                amount: funding_record.amount_sats,
+                expiry: funding_record.expires_at,
+                birth: funding_record.created_at,
+                input_type: ark_fees::VtxoType::Vtxo,
+                weight: 0.0,
+            },
+        ];
+        let mut paid_fee = 0_u64;
+        for _ in 0..64 {
+            let change_sats = funding_record
+                .amount_sats
+                .checked_sub(paid_fee)
+                .filter(|change| *change >= minimum_change_sats)
+                .ok_or_else(|| anyhow!("renewal fee leaves sub-minimum wallet change"))?;
+            let outputs = [
+                fee_output(state_output),
+                ark_fees::Output {
+                    amount: change_sats,
+                    script: script_hex(&funding_record.script),
+                },
+                fee_output(extension_output),
+            ];
+            let required_fee = estimators
+                .iter()
+                .map(|estimator| {
+                    estimator
+                        .eval(&fee_inputs, &[], &outputs, &[])
+                        .map(|fee| fee.to_satoshis())
+                        .map_err(|error| anyhow!("evaluate renewal intent fee: {error}"))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            if required_fee <= paid_fee {
+                return Ok(paid_fee);
+            }
+            paid_fee = required_fee;
+        }
+        Err(anyhow!("renewal fee program did not converge"))
+    }
+
+    pub(crate) fn add_fee_funding(
+        mut self,
+        funding_record: &VtxoRecord,
+        funding_previous_tx: &Transaction,
+        funding_vtxo: &ark_core::Vtxo,
+        fee_sats: u64,
+        minimum_change_sats: u64,
+        expiry_margin_secs: i64,
+    ) -> Result<Self> {
+        validate_fee_funding(
+            funding_record,
+            funding_previous_tx,
+            funding_vtxo,
+            expiry_margin_secs,
+        )?;
+        if funding_record.outpoint == self.input.outpoint() {
+            return Err(anyhow!("renewal fee input duplicates the state input"));
+        }
+        let change_sats = funding_record
+            .amount_sats
+            .checked_sub(fee_sats)
+            .filter(|change| *change >= minimum_change_sats)
+            .ok_or_else(|| anyhow!("renewal fee leaves sub-minimum wallet change"))?;
+        let (spend_script, control_block) = funding_vtxo
+            .forfeit_spend_info()
+            .map_err(|error| anyhow!("fee input spend info: {error}"))?;
+        let input = intent::Input::new(
+            funding_record.outpoint,
+            Sequence::MAX,
+            None,
+            TxOut {
+                value: Amount::from_sat(funding_record.amount_sats),
+                script_pubkey: funding_vtxo.script_pubkey(),
+            },
+            funding_vtxo.tapscripts(),
+            (spend_script, control_block),
+            false,
+            false,
+            Vec::new(),
+        );
+        self.outputs.insert(
+            1,
+            intent::Output::Offchain(TxOut {
+                value: Amount::from_sat(change_sats),
+                script_pubkey: funding_vtxo.script_pubkey(),
+            }),
+        );
+        self.input_expires_at = self.input_expires_at.min(
+            funding_record
+                .expires_at
+                .expect("fee funding liveness validated the expiry"),
+        );
+        self.funding = Some(RenewalFunding {
+            input,
+            previous_tx: funding_previous_tx.clone(),
+        });
+        Ok(self)
+    }
+}
+
+fn validate_fee_funding(
+    record: &VtxoRecord,
+    previous_tx: &Transaction,
+    vtxo: &ark_core::Vtxo,
+    expiry_margin_secs: i64,
+) -> Result<()> {
+    record.validate_creating_transaction(previous_tx)?;
+    record.ensure_live(now_unix(), expiry_margin_secs)?;
+    if !record.assets.is_empty() || record.amount_sats == 0 || record.script != vtxo.script_pubkey()
+    {
+        return Err(anyhow!(
+            "renewal fee input must be an asset-free wallet VTXO"
+        ));
+    }
+    Ok(())
+}
+
+fn output_txout(output: &intent::Output) -> Result<&TxOut> {
+    match output {
+        intent::Output::Offchain(output) | intent::Output::AssetPacket(output) => Ok(output),
+        intent::Output::Onchain(_) => Err(anyhow!("renewal intent contains an onchain output")),
+    }
+}
+
+fn fee_output(output: &TxOut) -> ark_fees::Output {
+    ark_fees::Output {
+        amount: output.value.to_sat(),
+        script: script_hex(&output.script_pubkey),
+    }
+}
+
+fn script_hex(script: &ScriptBuf) -> String {
+    use bitcoin::hex::DisplayHex;
+    script.as_bytes().to_lower_hex_string()
 }
 
 /// Bind the exact self-send to a short-lived registration message, sign it
@@ -424,29 +640,33 @@ pub fn bind(
 ) -> Result<PreparedRenewal> {
     let RenewalIntent {
         input,
+        funding,
         outputs,
         groups,
         state_packets,
+        input_created_at: _,
         input_expires_at,
         arkade_script,
     } = prepared;
-    if previous_tx.compute_txid() != input.outpoint().txid {
-        return Err(anyhow!(
-            "previous transaction {} does not create renewal input {}",
-            previous_tx.compute_txid(),
-            input.outpoint()
-        ));
+    validate_previous_input(&input, previous_tx, "renewal state")?;
+    let funding_input = funding.as_ref().map(|funding| funding.input.clone());
+    if let Some(funding) = &funding {
+        validate_previous_input(&funding.input, &funding.previous_tx, "renewal fee")?;
     }
-    let previous_output = previous_tx
-        .output
-        .get(input.outpoint().vout as usize)
-        .ok_or_else(|| anyhow!("previous transaction omits the renewal input"))?;
-    if previous_output.script_pubkey != *input.script_pubkey()
-        || previous_output.value != input.amount()
-    {
-        return Err(anyhow!(
-            "previous transaction output does not match the indexed renewal input"
-        ));
+    let continuation_outputs = outputs
+        .iter()
+        .take(
+            outputs
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("renewal intent has no extension output"))?,
+        )
+        .map(output_txout)
+        .map(|output| output.cloned())
+        .collect::<Result<Vec<_>>>()?;
+    let mut real_inputs = vec![input.clone()];
+    if let Some(funding_input) = &funding_input {
+        real_inputs.push(funding_input.clone());
     }
 
     let now = now_unix() as u64;
@@ -469,41 +689,82 @@ pub fn bind(
     let mut intent = intent::make_intent(
         sign_for_vtxo,
         sign_for_onchain,
-        vec![input.clone()],
+        real_inputs,
         outputs,
         message.clone(),
     )
     .map_err(|error| anyhow!("build renewal intent: {error}"))?;
 
-    attach_previous_transaction(&mut intent, previous_tx)?;
+    attach_previous_transaction(
+        &mut intent,
+        previous_tx,
+        RENEWAL_STATE_INPUT_INDEX,
+        "renewal state",
+    )?;
+    if let Some(funding) = &funding {
+        attach_previous_transaction(
+            &mut intent,
+            &funding.previous_tx,
+            RENEWAL_FEE_INPUT_INDEX,
+            "renewal fee",
+        )?;
+    }
 
-    let leaf_outputs = vec![
-        TxOut {
-            value: input.amount(),
-            script_pubkey: input.script_pubkey().clone(),
-        },
-        batch_leaf_extension_txout(
-            &groups,
-            &state_packets,
-            &arkade_script,
-            intent.proof.unsigned_tx.compute_txid(),
-        )?,
-    ];
+    let mut leaf_outputs = continuation_outputs;
+    leaf_outputs.push(batch_leaf_extension_txout(
+        &groups,
+        &state_packets,
+        &arkade_script,
+        intent.proof.unsigned_tx.compute_txid(),
+    )?);
 
     Ok(PreparedRenewal {
         intent,
         message,
         message_json,
         input,
+        funding_input,
         input_expires_at,
         leaf_outputs,
         arkade_script,
     })
 }
 
-fn attach_previous_transaction(intent: &mut Intent, previous_tx: &Transaction) -> Result<()> {
-    // The fake message input shares the state input's script but has no
-    // previous Ark transaction; only the real input needs one.
+fn validate_previous_input(
+    input: &intent::Input,
+    previous_tx: &Transaction,
+    label: &str,
+) -> Result<()> {
+    if previous_tx.compute_txid() != input.outpoint().txid {
+        return Err(anyhow!(
+            "{label} creating transaction {} does not match {}",
+            previous_tx.compute_txid(),
+            input.outpoint()
+        ));
+    }
+    let previous_output = previous_tx
+        .output
+        .get(input.outpoint().vout as usize)
+        .ok_or_else(|| anyhow!("{label} creating transaction omits the input"))?;
+    if previous_output.script_pubkey != *input.script_pubkey()
+        || previous_output.value != input.amount()
+    {
+        return Err(anyhow!(
+            "{label} creating transaction output does not match the indexed input"
+        ));
+    }
+    Ok(())
+}
+
+fn attach_previous_transaction(
+    intent: &mut Intent,
+    previous_tx: &Transaction,
+    input_index: usize,
+    label: &str,
+) -> Result<()> {
+    // The fake message input has no previous Ark transaction. Every real VTXO
+    // input must carry its exact creating transaction for emulator
+    // introspection.
     let key = bitcoin::psbt::raw::Key {
         type_value: 0xde,
         key: b"prevarktx".to_vec(),
@@ -511,11 +772,11 @@ fn attach_previous_transaction(intent: &mut Intent, previous_tx: &Transaction) -
     let proof_input = intent
         .proof
         .inputs
-        .get_mut(RENEWAL_STATE_INPUT_INDEX)
-        .ok_or_else(|| anyhow!("renewal proof is missing its state input"))?;
+        .get_mut(input_index)
+        .ok_or_else(|| anyhow!("renewal proof is missing its {label} input"))?;
     if proof_input.unknown.contains_key(&key) {
         return Err(anyhow!(
-            "previous Ark transaction field already exists on input {RENEWAL_STATE_INPUT_INDEX}"
+            "previous Ark transaction field already exists on input {input_index}"
         ));
     }
     proof_input
@@ -524,9 +785,9 @@ fn attach_previous_transaction(intent: &mut Intent, previous_tx: &Transaction) -
     Ok(())
 }
 
-/// Merge the emulator response into the exact submitted PSBT, then verify the
-/// dedicated rollover and script-tweaked emulator signatures on both inputs.
-/// PSBT combination rejects conflicting metadata.
+/// Merge the emulator response into the exact submitted PSBT, then verify its
+/// script-tweaked signatures on the fake and state inputs. An optional clean
+/// fee input is signed only by its wallet owner.
 pub fn combine_and_verify_emulator_approval(
     verifier: &Keys,
     expected: &Psbt,
@@ -534,9 +795,10 @@ pub fn combine_and_verify_emulator_approval(
     emulator_pk: bitcoin::XOnlyPublicKey,
     arkade_script: &ScriptBuf,
 ) -> Result<Psbt> {
+    let expected_input_count = expected.inputs.len();
     if expected.unsigned_tx != approved.unsigned_tx
-        || expected.inputs.len() != approved.inputs.len()
-        || expected.inputs.len() != RENEWAL_INPUT_COUNT
+        || expected_input_count != approved.inputs.len()
+        || ![RENEWAL_INPUT_COUNT, RENEWAL_FEE_INPUT_INDEX + 1].contains(&expected_input_count)
     {
         return Err(anyhow!("emulator changed the renewal intent proof"));
     }
@@ -547,24 +809,23 @@ pub fn combine_and_verify_emulator_approval(
     let tweaked_emulator =
         ark_script::compute_arkade_script_public_key(&emulator_pk, arkade_script)
             .context("derive renewal emulator signer")?;
-    let rollover_pk = verifier.owner_pk();
-    // The authorizer signs only when its key is a renewal-leaf signer; a
-    // permissionless leaf (operator + tweaked emulator) takes the emulator
-    // signature alone and arkd completes its own when it enforces.
-    let client_sig_expected = expected.inputs[RENEWAL_STATE_INPUT_INDEX]
+    let authorizer_pk = verifier.owner_pk();
+    // The authorizer signs state inputs only when its key is a renewal-leaf
+    // signer. Permissionless regrowth needs only the emulator plus arkd.
+    let state_authorizer_expected = expected.inputs[RENEWAL_STATE_INPUT_INDEX]
         .witness_script
         .as_ref()
         .map(ark_core::script::extract_checksig_pubkeys)
-        .is_some_and(|signers| signers.contains(&rollover_pk));
+        .is_some_and(|signers| signers.contains(&authorizer_pk));
     for input_index in 0..RENEWAL_INPUT_COUNT {
-        if client_sig_expected {
+        if state_authorizer_expected {
             crate::txbuild::verified_signature_for_key_with_sighash(
                 verifier,
                 expected,
                 &combined,
                 input_index,
-                rollover_pk,
-                "rollover",
+                authorizer_pk,
+                "renewal authorizer",
                 bitcoin::TapSighashType::Default,
             )?;
         }
@@ -577,9 +838,39 @@ pub fn combine_and_verify_emulator_approval(
             "emulator",
             bitcoin::TapSighashType::All,
         )?;
-        let expected_sigs = 1 + usize::from(client_sig_expected);
+        let expected_sigs = 1 + usize::from(state_authorizer_expected);
         if combined.inputs[input_index].tap_script_sigs.len() != expected_sigs {
-            return Err(anyhow!("rollover proof contains an unexpected signature"));
+            return Err(anyhow!(
+                "renewal proof contains an unexpected state signature"
+            ));
+        }
+    }
+    if expected_input_count > RENEWAL_INPUT_COUNT {
+        let funding_signers = expected.inputs[RENEWAL_FEE_INPUT_INDEX]
+            .witness_script
+            .as_ref()
+            .map(ark_core::script::extract_checksig_pubkeys)
+            .ok_or_else(|| anyhow!("renewal fee input has no witness script"))?;
+        if !funding_signers.contains(&authorizer_pk) {
+            return Err(anyhow!("renewal authorizer does not own the fee input"));
+        }
+        crate::txbuild::verified_signature_for_key_with_sighash(
+            verifier,
+            expected,
+            &combined,
+            RENEWAL_FEE_INPUT_INDEX,
+            authorizer_pk,
+            "fee input owner",
+            bitcoin::TapSighashType::Default,
+        )?;
+        if combined.inputs[RENEWAL_FEE_INPUT_INDEX]
+            .tap_script_sigs
+            .len()
+            != 1
+        {
+            return Err(anyhow!(
+                "renewal fee input contains an unexpected signature"
+            ));
         }
     }
     Ok(combined)
@@ -825,6 +1116,7 @@ mod tests {
             &secp,
             xonly(3),
             xonly(4),
+            xonly(7),
             Sequence::from_height(144),
             Network::Regtest,
             asset(2, 0),
@@ -894,10 +1186,17 @@ mod tests {
         tree_tx(contract, state, 5, 5)
     }
 
+    fn player_state(contract: &PlayerContract) -> PlayerState {
+        PlayerState {
+            luck: crate::player::PlayerLuck::initial(&contract.vtxo.script_pubkey()).unwrap(),
+        }
+    }
+
     fn previous_player_tx(
         contract: &PlayerContract,
         player_asset: AssetId,
         state: PlayerState,
+        xp_balance: u64,
     ) -> Transaction {
         let mut psbt = Psbt::from_unsigned_tx(Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -913,9 +1212,9 @@ mod tests {
         })
         .unwrap();
         let mut groups = vec![assigned_group(player_asset, 1)];
-        if state.xp.value() > 0 {
+        if xp_balance > 0 {
             groups.push(assigned_group(contract.log_asset, 2));
-            groups.push(assigned_group(contract.xp_asset, state.xp.value()));
+            groups.push(assigned_group(contract.xp_asset, xp_balance));
         }
         ark_core::asset::packet::add_asset_packet_to_psbt(&mut psbt, &AssetPacket { groups })
             .unwrap();
@@ -1147,6 +1446,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
+            prepared.input.spend_info().0,
+            contract.regrowth_spend_script
+        );
+        assert_eq!(
             prepared.state_packets,
             [
                 (TREE_STATE_PACKET_TYPE, state.encode().to_vec()),
@@ -1193,6 +1496,10 @@ mod tests {
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )
         .unwrap();
+        assert_eq!(
+            prepared.input.spend_info().0,
+            contract.maintenance_spend_script
+        );
         assert_eq!(prepared.groups.len(), 1);
         assert_eq!(
             prepared.state_packets,
@@ -1263,17 +1570,11 @@ mod tests {
     }
 
     #[test]
-    fn player_renewal_preserves_player_id_identity_position_and_xp_counter() {
+    fn player_renewal_preserves_identity_asset_inventory_and_luck() {
         let contract = player_contract();
         let player_asset = asset(9, 0);
-        let identity = crate::player::PlayerIdentity { player_id: [7; 32] };
-        let state = PlayerState {
-            identity,
-            position: crate::player::PlayerPosition { x: 3, y: 17 },
-            luck: crate::player::PlayerLuck::initial(identity),
-            xp: crate::player::PlayerXp::new(83),
-        };
-        let previous = previous_player_tx(&contract, player_asset, state);
+        let state = player_state(&contract);
+        let previous = previous_player_tx(&contract, player_asset, state, 83);
         let mut good = record(
             9,
             &contract.vtxo.script_pubkey(),
@@ -1298,20 +1599,11 @@ mod tests {
         assert_eq!(
             prepared.state_packets,
             [
-                (
-                    PLAYER_IDENTITY_PACKET_TYPE,
-                    state.identity.encode().to_vec()
-                ),
-                (
-                    PLAYER_POSITION_PACKET_TYPE,
-                    state.position.encode().to_vec()
-                ),
                 (PLAYER_ROLL_PACKET_TYPE, state.luck.roll.encode().to_vec()),
                 (
                     PLAYER_LUCK_CREDIT_PACKET_TYPE,
                     state.luck.credit.encode().to_vec()
                 ),
-                (PLAYER_XP_PACKET_TYPE, state.xp.encode().to_vec()),
             ]
         );
 
@@ -1326,11 +1618,7 @@ mod tests {
         )
         .is_err());
 
-        let zero_state = PlayerState {
-            xp: crate::player::PlayerXp::new(0),
-            ..state
-        };
-        let zero_previous = previous_player_tx(&contract, player_asset, zero_state);
+        let zero_previous = previous_player_tx(&contract, player_asset, state, 0);
         let mut zero_record = record(
             10,
             &contract.vtxo.script_pubkey(),
@@ -1365,14 +1653,8 @@ mod tests {
     fn prepare_player_rejects_foreign_assets_even_without_xp() {
         let contract = player_contract();
         let player_asset = asset(9, 0);
-        let identity = crate::player::PlayerIdentity { player_id: [7; 32] };
-        let state = PlayerState {
-            identity,
-            position: crate::player::PlayerPosition { x: 3, y: 17 },
-            luck: crate::player::PlayerLuck::initial(identity),
-            xp: crate::player::PlayerXp::new(0),
-        };
-        let previous = previous_player_tx(&contract, player_asset, state);
+        let state = player_state(&contract);
+        let previous = previous_player_tx(&contract, player_asset, state, 0);
         let mut foreign = record(
             9,
             &contract.vtxo.script_pubkey(),
@@ -1400,5 +1682,135 @@ mod tests {
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS
         )
         .is_err());
+    }
+    fn fee_estimator(input_sats: u64, output_sats: u64) -> ark_fees::Estimator {
+        ark_fees::Estimator::new(ark_fees::Config {
+            intent_offchain_input_program: format!("{input_sats}.0"),
+            intent_offchain_output_program: format!("{output_sats}.0"),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn renewal_fee_funding_preserves_state_and_returns_exact_change() {
+        let (secp, contract) = tree_contract();
+        let state = TreeState {
+            tree_id: 7,
+            x: 1,
+            y: 2,
+        };
+        let previous = previous_tree_tx(&contract, state);
+        let mut indexed_tree = record(
+            9,
+            &contract.vtxo.script_pubkey(),
+            330,
+            vec![
+                indexed(asset(2, 0), 1),
+                indexed(asset(2, 1), 5),
+                indexed(asset(2, 2), 5),
+            ],
+        );
+        indexed_tree.outpoint.txid = previous.compute_txid();
+        let renewal = prepare_tree(
+            &indexed_tree,
+            &previous,
+            &contract,
+            asset(2, 0),
+            asset(2, 1),
+            asset(2, 2),
+            330,
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+        )
+        .unwrap();
+
+        let authorizer = Keys::from_hex(&"07".repeat(32)).unwrap();
+        let wallet = ark_core::Vtxo::new_default(
+            &secp,
+            xonly(3),
+            authorizer.owner_pk(),
+            Sequence::from_height(144),
+            Network::Regtest,
+        )
+        .unwrap();
+        let funding_previous = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: wallet.script_pubkey(),
+                },
+                ark_core::anchor_output(),
+            ],
+        };
+        let mut funding_record = record(10, &wallet.script_pubkey(), 1_000, Vec::new());
+        funding_record.outpoint.txid = funding_previous.compute_txid();
+        let estimators = [fee_estimator(1, 2), fee_estimator(3, 4)];
+        assert_eq!(renewal.estimate_base_fee(&estimators).unwrap(), 11);
+        let fee = renewal
+            .estimate_sponsored_fee(
+                &funding_record,
+                &funding_previous,
+                &wallet,
+                &estimators,
+                330,
+                crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+            )
+            .unwrap();
+        assert_eq!(fee, 18);
+
+        let mut asset_bearing = funding_record.clone();
+        asset_bearing.assets.push(indexed(asset(9, 9), 1));
+        assert!(renewal
+            .estimate_sponsored_fee(
+                &asset_bearing,
+                &funding_previous,
+                &wallet,
+                &estimators,
+                330,
+                crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+            )
+            .is_err());
+
+        let funded = renewal
+            .add_fee_funding(
+                &funding_record,
+                &funding_previous,
+                &wallet,
+                fee,
+                330,
+                crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+            )
+            .unwrap();
+        assert!(funded.funding.is_some());
+        assert_eq!(funded.outputs.len(), 3);
+        assert_eq!(
+            output_txout(&funded.outputs[1]).unwrap().value,
+            Amount::from_sat(982)
+        );
+
+        let cosigner =
+            Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[8; 32]).unwrap()).public_key();
+        let bound = bind(&authorizer, funded, &previous, cosigner).unwrap();
+        let previous_key = bitcoin::psbt::raw::Key {
+            type_value: 0xde,
+            key: b"prevarktx".to_vec(),
+        };
+        assert_eq!(
+            bound.intent.proof.inputs[1].unknown.get(&previous_key),
+            Some(&bitcoin::consensus::encode::serialize(&previous))
+        );
+        assert_eq!(
+            bound.intent.proof.inputs[2].unknown.get(&previous_key),
+            Some(&bitcoin::consensus::encode::serialize(&funding_previous))
+        );
+        assert!(bound.funding_input.is_some());
+        assert_eq!(bound.intent.proof.unsigned_tx.input.len(), 3);
+        assert_eq!(bound.intent.proof.unsigned_tx.output.len(), 3);
+        assert_eq!(bound.leaf_outputs.len(), 3);
+        assert_eq!(bound.leaf_outputs[1].value, Amount::from_sat(982));
+        assert_eq!(bound.intent.proof.inputs[2].tap_script_sigs.len(), 1);
     }
 }

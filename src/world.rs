@@ -1,11 +1,14 @@
 //! Immutable shared-world manifest used by setup and browser players.
 
 use crate::arkade::{EmulatorParams, ServerParams};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::keys::Keys;
 use crate::tree::{self, TreeContract, TreeState};
 use crate::txbuild;
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
-use bitcoin::secp256k1::{Secp256k1, Verification};
+use bitcoin::hashes::{sha256, Hash, HashEngine};
+use bitcoin::secp256k1::{Message, Secp256k1, Verification};
 #[cfg(not(target_arch = "wasm32"))]
 use bitcoin::OutPoint;
 use bitcoin::Txid;
@@ -14,10 +17,11 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 pub(crate) const GAME_ID: &str = "woodland.sh";
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
+pub(crate) const RULESET_ID: &str = "woodland.sh/forest/v3";
 /// No-vault world: all fixed-supply assets live on 420 recursive trees and
 /// funded stumps regrow in one permissionless renewal batch.
-pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 3;
 pub(crate) const PROTOCOL_DUST_SATS: u64 = 330;
 pub(crate) const ACTIVE_LOGS_PER_TREE: u64 = 10;
 pub(crate) const LOG_RESERVE_PER_TREE: u64 = 50_000;
@@ -134,6 +138,7 @@ pub struct WorldManifest {
     pub schema_version: u32,
     pub protocol_version: u32,
     pub game_id: String,
+    pub ruleset_id: String,
     pub network: String,
     pub arkade_service_url: String,
     pub emulator_url: String,
@@ -141,6 +146,7 @@ pub struct WorldManifest {
     pub forfeit_pubkey: String,
     pub forfeit_address: String,
     pub emulator_signer: String,
+    pub deployer_signer: String,
     pub rollover_signer: String,
     pub unilateral_exit_sequence: u32,
     pub dust_sats: u64,
@@ -162,9 +168,11 @@ pub struct WorldManifest {
     pub initial_luck_credit: u64,
     pub tree_script: String,
     pub tree_chop_arkade_script: String,
-    pub tree_renewal_arkade_script: String,
+    pub tree_regrowth_arkade_script: String,
+    pub tree_maintenance_arkade_script: String,
     pub genesis_txid: String,
     pub trees: Vec<ManifestTree>,
+    pub manifest_signature: String,
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +198,7 @@ pub struct ValidatedWorld {
     pub xp_asset: AssetId,
     pub genesis_txid: Txid,
     pub trees: Vec<ValidatedTree>,
+    pub deployer_signer: bitcoin::XOnlyPublicKey,
     /// Used by the native and browser batch flows; the browser reads the
     /// pins through the manifest instead.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -204,6 +213,7 @@ impl WorldManifest {
     pub fn new(
         params: &ServerParams,
         emulator: &EmulatorParams,
+        deployer_keys: &Keys,
         arkade_service_url: &str,
         emulator_url: &str,
         rollover_signer: bitcoin::XOnlyPublicKey,
@@ -213,11 +223,12 @@ impl WorldManifest {
         contract: &TreeContract,
         genesis_txid: Txid,
         deployments: &[(TreeState, Txid)],
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let mut manifest = Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             protocol_version: PROTOCOL_VERSION,
             game_id: GAME_ID.to_string(),
+            ruleset_id: RULESET_ID.to_string(),
             network: params.network.to_string(),
             arkade_service_url: arkade_service_url.trim_end_matches('/').to_owned(),
             emulator_url: emulator_url.trim_end_matches('/').to_owned(),
@@ -225,6 +236,7 @@ impl WorldManifest {
             forfeit_pubkey: params.forfeit_pk.to_string(),
             forfeit_address: params.forfeit_address.to_string(),
             emulator_signer: emulator.signer_pk.to_string(),
+            deployer_signer: deployer_keys.owner_pk().to_string(),
             rollover_signer: rollover_signer.to_string(),
             unilateral_exit_sequence: params.unilateral_exit_delay.to_consensus_u32(),
             dust_sats: params.dust_sats,
@@ -246,7 +258,8 @@ impl WorldManifest {
             initial_luck_credit: crate::player::INITIAL_LUCK_CREDIT,
             tree_script: contract.vtxo.script_pubkey().to_hex_string(),
             tree_chop_arkade_script: contract.chop_arkade_script.to_hex_string(),
-            tree_renewal_arkade_script: contract.renewal_arkade_script.to_hex_string(),
+            tree_regrowth_arkade_script: contract.regrowth_arkade_script.to_hex_string(),
+            tree_maintenance_arkade_script: contract.maintenance_arkade_script.to_hex_string(),
             genesis_txid: genesis_txid.to_string(),
             trees: deployments
                 .iter()
@@ -255,11 +268,76 @@ impl WorldManifest {
                     deployment_txid: deployment_txid.to_string(),
                 })
                 .collect(),
+            manifest_signature: String::new(),
+        };
+        manifest.sign(deployer_keys)?;
+        Ok(manifest)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sign(&mut self, deployer_keys: &Keys) -> Result<()> {
+        if self.deployer_signer != deployer_keys.owner_pk().to_string() {
+            return Err(anyhow!(
+                "manifest deployer signer does not match its signing key"
+            ));
         }
+        let message = self.signature_message()?;
+        let signatures = deployer_keys.sign_msg(&message);
+        let [(signature, signer)] = signatures.as_slice() else {
+            return Err(anyhow!("manifest signer returned an invalid signature set"));
+        };
+        if *signer != deployer_keys.owner_pk() {
+            return Err(anyhow!("manifest signer returned the wrong public key"));
+        }
+        self.manifest_signature = signature.to_string();
+        Ok(())
+    }
+
+    pub fn verify_authenticity<C: Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+    ) -> Result<bitcoin::XOnlyPublicKey> {
+        if self.schema_version != MANIFEST_SCHEMA_VERSION
+            || self.protocol_version != PROTOCOL_VERSION
+            || self.game_id != GAME_ID
+            || self.ruleset_id != RULESET_ID
+        {
+            return Err(anyhow!("world manifest has an unsupported signed ruleset"));
+        }
+        let deployer_signer = self
+            .deployer_signer
+            .parse::<bitcoin::XOnlyPublicKey>()
+            .context("parse manifest deployer signer")?;
+        let signature = self
+            .manifest_signature
+            .parse::<bitcoin::secp256k1::schnorr::Signature>()
+            .context("parse manifest signature")?;
+        if signature.to_string() != self.manifest_signature {
+            return Err(anyhow!("manifest signature is not canonically encoded"));
+        }
+        secp.verify_schnorr(&signature, &self.signature_message()?, &deployer_signer)
+            .context("verify manifest deployer signature")?;
+        Ok(deployer_signer)
+    }
+
+    fn signature_message(&self) -> Result<Message> {
+        let mut unsigned = self.clone();
+        unsigned.manifest_signature.clear();
+        let value = serde_json::to_value(unsigned).context("encode manifest signing value")?;
+        let mut canonical = Vec::new();
+        write_canonical_json(&value, &mut canonical)?;
+        let mut engine = sha256::Hash::engine();
+        engine.input(b"woodland.sh/world-manifest/v3\0");
+        engine.input(&canonical);
+        Ok(Message::from_digest(
+            sha256::Hash::from_engine(engine).to_byte_array(),
+        ))
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
-        serde_json::from_str(json).context("parse woodland.sh world manifest")
+        let manifest: Self =
+            serde_json::from_str(json).context("parse woodland.sh world manifest")?;
+        manifest.verify_authenticity(&Secp256k1::verification_only())?;
+        Ok(manifest)
     }
 
     /// Parse the pinned service identity, checking the forfeit address
@@ -298,6 +376,7 @@ impl WorldManifest {
         params: &ServerParams,
         emulator: &EmulatorParams,
     ) -> Result<ValidatedWorld> {
+        let deployer_signer = self.verify_authenticity(secp)?;
         if self.schema_version != MANIFEST_SCHEMA_VERSION {
             return Err(anyhow!(
                 "unsupported woodland.sh world manifest schema {}; deploy schema {MANIFEST_SCHEMA_VERSION}",
@@ -310,6 +389,7 @@ impl WorldManifest {
             .context("parse world rollover signer")?;
         if self.protocol_version != PROTOCOL_VERSION
             || self.game_id != GAME_ID
+            || self.ruleset_id != RULESET_ID
             || self.network != params.network.to_string()
             || self.operator_signer != params.signer_pk.to_string()
             || self.forfeit_pubkey != params.forfeit_pk.to_string()
@@ -327,13 +407,20 @@ impl WorldManifest {
                 "woodland.sh world manifest does not match the running services"
             ));
         }
-        if [params.signer_pk, emulator.signer_pk, rollover_signer]
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .len()
-            != 3
+        if [
+            params.signer_pk,
+            emulator.signer_pk,
+            rollover_signer,
+            deployer_signer,
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .len()
+            != 4
         {
-            return Err(anyhow!("world service signers must be distinct"));
+            return Err(anyhow!(
+                "world deployer and service signers must be distinct"
+            ));
         }
         if self.map_width != MAP_WIDTH
             || self.map_height != MAP_HEIGHT
@@ -409,6 +496,7 @@ impl WorldManifest {
             secp,
             params.signer_pk,
             emulator.signer_pk,
+            rollover_signer,
             params.unilateral_exit_delay,
             params.network,
             tree_asset,
@@ -418,7 +506,9 @@ impl WorldManifest {
         )?;
         if self.tree_script != contract.vtxo.script_pubkey().to_hex_string()
             || self.tree_chop_arkade_script != contract.chop_arkade_script.to_hex_string()
-            || self.tree_renewal_arkade_script != contract.renewal_arkade_script.to_hex_string()
+            || self.tree_regrowth_arkade_script != contract.regrowth_arkade_script.to_hex_string()
+            || self.tree_maintenance_arkade_script
+                != contract.maintenance_arkade_script.to_hex_string()
         {
             return Err(anyhow!("world manifest covenant script mismatch"));
         }
@@ -429,18 +519,82 @@ impl WorldManifest {
             xp_asset,
             genesis_txid,
             trees,
+            deployer_signer,
             pins: self.pins(params.network)?,
             rollover_signer,
             contract,
         })
     }
 }
-fn expected_asset_metadata(label: &str) -> Vec<u8> {
-    let entries = [
-        ("game", GAME_ID.to_string()),
-        ("protocol", PROTOCOL_VERSION.to_string()),
-        ("asset", label.to_string()),
-    ];
+fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> Result<()> {
+    match value {
+        serde_json::Value::Null => output.extend_from_slice(b"null"),
+        serde_json::Value::Bool(value) => {
+            output.extend_from_slice(if *value { b"true" } else { b"false" })
+        }
+        serde_json::Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        serde_json::Value::String(value) => output.extend_from_slice(
+            serde_json::to_string(value)
+                .context("encode canonical JSON string")?
+                .as_bytes(),
+        ),
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push(b'{');
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                output.extend_from_slice(
+                    serde_json::to_string(key)
+                        .context("encode canonical JSON key")?
+                        .as_bytes(),
+                );
+                output.push(b':');
+                write_canonical_json(
+                    values
+                        .get(key)
+                        .expect("canonical JSON key came from this object"),
+                    output,
+                )?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
+}
+pub(crate) fn asset_metadata_entries(
+    label: &str,
+    deployer_signer: bitcoin::XOnlyPublicKey,
+    rollover_signer: bitcoin::XOnlyPublicKey,
+) -> Vec<(String, String)> {
+    vec![
+        ("game".to_string(), GAME_ID.to_string()),
+        ("protocol".to_string(), PROTOCOL_VERSION.to_string()),
+        ("ruleset".to_string(), RULESET_ID.to_string()),
+        ("asset".to_string(), label.to_string()),
+        ("deployer".to_string(), deployer_signer.to_string()),
+        ("rollover".to_string(), rollover_signer.to_string()),
+    ]
+}
+
+fn expected_asset_metadata(
+    label: &str,
+    deployer_signer: bitcoin::XOnlyPublicKey,
+    rollover_signer: bitcoin::XOnlyPublicKey,
+) -> Vec<u8> {
+    let entries = asset_metadata_entries(label, deployer_signer, rollover_signer);
     let mut encoded = Vec::new();
     ark_core::extension::encode_uvarint(&mut encoded, entries.len() as u64);
     for (key, value) in entries {
@@ -560,7 +714,8 @@ impl ValidatedWorld {
                 .with_context(|| format!("verify indexed {label} asset"))?;
             if details.control_asset.is_some()
                 || details.supply != expected_supply
-                || details.metadata != expected_asset_metadata(label)
+                || details.metadata
+                    != expected_asset_metadata(label, self.deployer_signer, self.rollover_signer)
             {
                 return Err(anyhow!(
                     "indexed {label} asset does not match the fixed-supply world genesis"
@@ -588,6 +743,7 @@ mod tests {
         let operator_secret = SecretKey::from_slice(&[3; 32]).unwrap();
         let emulator_secret = SecretKey::from_slice(&[4; 32]).unwrap();
         let rollover_secret = SecretKey::from_slice(&[7; 32]).unwrap();
+        let deployer_keys = Keys::from_hex(&"08".repeat(32)).unwrap();
         let operator_keypair = Keypair::from_secret_key(&secp, &operator_secret);
         let operator = operator_keypair.x_only_public_key().0;
         let emulator = Keypair::from_secret_key(&secp, &emulator_secret)
@@ -631,6 +787,7 @@ mod tests {
             &secp,
             operator,
             emulator,
+            rollover,
             params.unilateral_exit_delay,
             params.network,
             tree_asset,
@@ -651,6 +808,7 @@ mod tests {
         let manifest = WorldManifest::new(
             &params,
             &emulator_params,
+            &deployer_keys,
             "http://127.0.0.1:7070",
             "http://127.0.0.1:7073",
             rollover,
@@ -660,7 +818,8 @@ mod tests {
             &contract,
             genesis_txid,
             &deployments,
-        );
+        )
+        .unwrap();
         (secp, params, emulator_params, manifest)
     }
 
@@ -668,6 +827,7 @@ mod tests {
     fn manifest_round_trips_exactly_declared_trees() {
         let (secp, params, emulator, manifest) = fixture();
         let json = manifest.to_json().unwrap();
+        assert!(json.contains("\"manifestSignature\""));
         assert!(json.contains("\"xpAsset\""));
         assert!(json.contains("\"xpPerTree\""));
         let parsed = WorldManifest::from_json(&json).unwrap();
@@ -702,9 +862,28 @@ mod tests {
             parsed.tree_chop_arkade_script
         );
         assert_eq!(
-            world.contract.renewal_arkade_script.to_hex_string(),
-            parsed.tree_renewal_arkade_script
+            world.contract.regrowth_arkade_script.to_hex_string(),
+            parsed.tree_regrowth_arkade_script
         );
+        assert_eq!(
+            world.contract.maintenance_arkade_script.to_hex_string(),
+            parsed.tree_maintenance_arkade_script
+        );
+    }
+
+    #[test]
+    fn manifest_deserialization_rejects_unsigned_or_tampered_authority() {
+        let (_, _, _, manifest) = fixture();
+
+        let mut changed_url = manifest.clone();
+        changed_url.arkade_service_url = "http://127.0.0.1:7999".to_string();
+        let json = serde_json::to_string(&changed_url).unwrap();
+        assert!(WorldManifest::from_json(&json).is_err());
+
+        let mut unsigned = manifest;
+        unsigned.manifest_signature.clear();
+        let json = serde_json::to_string(&unsigned).unwrap();
+        assert!(WorldManifest::from_json(&json).is_err());
     }
 
     #[test]
@@ -728,9 +907,13 @@ mod tests {
     fn manifest_rejects_changed_tree_leaf_commitments() {
         let (secp, params, emulator, manifest) = fixture();
 
-        let mut renewal = manifest.clone();
-        renewal.tree_renewal_arkade_script.push_str("00");
-        assert!(renewal.validate(&secp, &params, &emulator).is_err());
+        let mut regrowth = manifest.clone();
+        regrowth.tree_regrowth_arkade_script.push_str("00");
+        assert!(regrowth.validate(&secp, &params, &emulator).is_err());
+
+        let mut maintenance = manifest.clone();
+        maintenance.tree_maintenance_arkade_script.push_str("00");
+        assert!(maintenance.validate(&secp, &params, &emulator).is_err());
 
         let mut chop = manifest;
         chop.tree_chop_arkade_script.push_str("00");

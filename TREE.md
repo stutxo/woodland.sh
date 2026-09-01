@@ -1,11 +1,12 @@
-# woodland.sh Tree Protocol v2
+# woodland.sh Tree Protocol v3
 
 ## Status
 
-Protocol v2 uses manifest schema 2, stock arkd, and the stock Arkade Script
-emulator. Genesis metadata commits `game=woodland.sh`, `protocol=2`, and one of
-`TREE`, `LOG`, or `XP`. Every manifest field is mandatory; incomplete or
-unknown manifests fail closed.
+Protocol v3 uses signed manifest schema 3, stock arkd, and the stock Arkade
+Script emulator. Genesis metadata commits `game=woodland.sh`, `protocol=3`,
+`ruleset=woodland.sh/forest/v3`, one of `TREE`, `LOG`, or `XP`, and the exact
+deployer and rollover signers. The deployer signs every manifest field with
+BIP340; invalid, incomplete, or unknown manifests fail closed.
 
 ## Genesis
 
@@ -57,7 +58,6 @@ The tree covenant enforces atomically:
 ```text
 player LOG:       M -> M+G
 player XP asset:  X -> X+G
-player XP packet: X -> X+G
 tree LOG:         N -> N-G
 tree XP:          F -> F-G
 tree health:      H -> H-G
@@ -65,7 +65,7 @@ tree health:      H -> H-G
 
 It also requires the canonical two-input/four-output shape, ordered uncontrolled
 asset groups, one conserved TREE marker, recursive player and tree scripts,
-fixed sat values, preserved identities, canonical player luck, and exact
+fixed sat values, preserved tree state, canonical player luck, and exact
 extension and anchor outputs. The player covenant pins this exact tree script,
 so both halves authorize the same transaction.
 
@@ -83,35 +83,40 @@ funded input health = 0
 output health = 10
 ```
 
-TREE, LOG, XP, identity, script, and 330 sats remain byte-for-byte conserved.
-Any caller may submit the path. No player state, player key, reward entropy,
-height witness, or project-held lifecycle key participates.
+TREE, LOG, XP, immutable tree state, script, and 330 sats remain byte-for-byte
+conserved. Any caller may submit the path. No player state, player key, reward
+entropy, height witness, or project-held lifecycle key participates.
 
 After 5,000 complete health cycles, a tree's 50,000 local LOG and XP are
-exhausted. Its health-zero state remains terminal: renewal preserves zero
-health, and no protocol path can draw reserves from another tree or mint
-replacements.
+exhausted. Its health-zero state remains terminal: the regrowth leaf requires a
+positive LOG reserve, maintenance preserves zero health, and no protocol path
+can draw reserves from another tree or mint replacements.
 
 ## Renewal
 
-Swing transactions do not extend Arkade batch lifetime. The same permissionless
-exact-self-send leaf enters a tree into a fresh batch while preserving:
+Swing transactions do not extend Arkade batch lifetime. Tree lifecycle uses two
+separate exact-state leaves:
 
-- P2TR and 330 sats;
-- TREE, LOG, and XP amounts;
-- identity;
-- active health.
+- **regrowth** requires input health zero and positive LOG reserve, changes only
+  output health to ten, and closes over operator plus tweaked emulator;
+- **maintenance** preserves health exactly, handles active trees and terminal
+  stumps, and additionally requires the dedicated rollover signer.
 
-A funded stump takes the one-batch regrowth branch above. An unnecessary
-renewal can race gameplay by rotating the outpoint, so the operator `watch`
-command selects funded stumps immediately and renews every other tree lineage
-only near the observed expiry margin. The public client `regrow` API uses the
-same transaction and needs no player key.
+Both preserve P2TR, 330 sats, TREE, LOG, XP, and immutable tree state. If arkd's
+current or scheduled intent fee is nonzero, the intent adds one clean,
+asset-free wallet VTXO and returns exact same-contract change; tree state never
+funds fees.
+
+An unnecessary maintenance renewal can race gameplay by rotating the outpoint,
+so the operator `watch` command selects funded stumps immediately and maintains
+every other tree lineage only near the observed expiry margin. The public
+client `regrow` API submits only eligible funded-stump regrowth.
 
 ## Trust
 
 Every usable tree leaf closes over the Arkade operator and covenant-tweaked
-emulator, not a woodland-held lifecycle key. Bitcoin Taproot enforces those
-signer requirements. The pinned stock emulator is trusted to execute Arkade
-Script correctly. The NUMS-keyed CSV leaf satisfies Arkade expiry accounting
-but provides no unilateral bypass of the recursive covenant.
+emulator. Maintenance additionally closes over the dedicated rollover signer;
+regrowth does not. Bitcoin Taproot enforces those signer requirements. The
+pinned stock emulator is trusted to execute Arkade Script correctly. The
+NUMS-keyed CSV leaf satisfies Arkade expiry accounting but provides no
+unilateral bypass of the recursive covenant.

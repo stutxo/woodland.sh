@@ -1,17 +1,16 @@
-# woodland.sh Player Protocol v2
+# woodland.sh Player Protocol v3
 
 ## Purpose
 
 A player is one owner-specific recursive VTXO. It holds 330 sats, exactly one
-self-issued PLAYER_ID, immutable identity and position packets, a recursive
-player roll, bounded luck credit, numeric XP, harvested LOG, and earned XP.
-There is no carrier, PLAYER_TICKET, allocator, protocol registry, or player cap.
-When configured, the game server indexes public state, presence, and chat, but
-has no role in gameplay authorization.
+self-issued PLAYER_ID, a recursive player roll, bounded luck credit, harvested
+LOG, and soulbound XP. There is no carrier, PLAYER_TICKET, allocator, protocol
+registry, or player cap. When configured, the game server indexes public state,
+presence, and chat, but has no role in gameplay authorization.
 
 ```text
-player state: D sats + 1 PLAYER_ID + identity + position + player roll
-              + luck credit + numeric XP + optional LOG + optional XP asset
+player state: D sats + 1 PLAYER_ID + player roll + luck credit
+              + optional LOG + optional XP
 D = 330 sats
 ```
 
@@ -22,11 +21,9 @@ exact `D`-sat VTXO. Activation is an owner-signed offchain transaction that both
 issues a marker and creates the personalized player state. It attaches:
 
 - one uncontrolled, one-unit `PLAYER_ID` at fresh asset group zero;
-- metadata `game=woodland.sh`, `protocol=2`, `asset=PLAYER_ID`, and the owner;
-- identity derived from `SHA256("woodland.sh/PlayerIdentity/v1" || owner || genesis_txid)`;
-- spawn position `(3,17)`;
-- roll `SHA256("woodland.sh/player-roll/v1" || identity_packet)`;
-- luck credit 8,000 and canonical numeric XP zero.
+- metadata `game=woodland.sh`, `protocol=3`, `asset=PLAYER_ID`, and the owner;
+- roll `SHA256("woodland.sh/player-roll/v2" || p2tr_witness_program)`;
+- luck credit 8,000.
 
 The PLAYER_ID AssetId is `(activation_txid, 0)`. The browser persists that exact
 ID before submission, then discovers only state containing that one-unit asset.
@@ -36,24 +33,22 @@ or mint a decoy marker, but cannot reproduce an existing transaction-derived ID.
 For the reference client's direct issuance-to-state shape, every player
 covenant leaf recognizes the first recursive spend because the PLAYER_ID
 AssetId txid equals the state input's outpoint txid. On that spend it requires
-the identity-derived roll, AssetId group index zero, and 8,000 credit. A
-malformed direct activation therefore cannot be laundered through renewal or
-withdrawal before chopping.
+the script-derived roll, AssetId group index zero, and 8,000 credit. A malformed
+direct activation therefore cannot be laundered through renewal or withdrawal
+before chopping.
 
 ## XP Backing
 
-`PlayerXp` is a checked `u64` encoded as eight little-endian value bytes plus a
-zero sign byte. Alternate numeric encodings, including negative zero, fail.
-
-XP must equal the amount of fixed-supply XP held by player state:
+XP has one protocol representation: the fixed-supply XP asset balance held by
+the recursive player state. There is no numeric XP packet, duplicate counter,
+or alternate encoding to forge:
 
 ```text
-numeric XP X  <=>  player state owns X XP
+player progression X  =  player state owns X XP
 ```
 
-A forged activation with a high XP packet but no XP cannot chop: both
-player and tree covenants compare the packet to the state asset balance.
-XP has no control asset and cannot be reissued.
+XP has no control asset and cannot be reissued. Every successful chop moves one
+XP from the selected tree to player state; every miss moves none.
 
 Level is derived, never stored. The reachable canonical curve is
 `woodland-xp-v1`: level 2 at 83 XP, with chance boundaries at levels 10, 20,
@@ -87,10 +82,10 @@ variance; it does not prevent PLAYER_ID Sybils or provide hidden randomness.
 
 XP is soulbound by covenant: no leaf moves it out of player state. The chop
 covenants pin XP deltas to the deterministic drop bit, both renewal leaves
-preserve the XP balance and packet exactly, and the LOG withdrawal leaf
-requires the XP balance and packet to survive unchanged. There is no transfer
-path at all — not to other players, not to ordinary outputs — so a level can
-never be bought, sold, or pooled.
+preserve the XP asset balance exactly, and the LOG withdrawal leaf requires that
+balance to survive unchanged. There is no transfer path at all — not to other
+players, not to ordinary outputs — so a level can never be bought, sold, or
+pooled.
 
 LOG is the liquid token. The fourth player tapleaf, authorized by the owner
 plus the Arkade operator and tweaked emulator, withdraws an arbitrary amount
@@ -103,9 +98,9 @@ outputs: player state minus the withdrawn LOG, LOG destination, extension,
 groups:  PLAYER_ID, LOG, XP
 ```
 
-The covenant preserves the player P2TR, 330 sats, PLAYER_ID, identity,
-position, XP packet, and XP balance exactly; the destination output is funded
-entirely by the wallet dust input, never by player sats.
+The covenant preserves the player P2TR, 330 sats, PLAYER_ID, roll, luck credit,
+and XP asset balance exactly; the destination output is funded entirely by the
+wallet dust input, never by player sats.
 
 ## Atomic Chop
 
@@ -133,12 +128,10 @@ The player covenant requires:
 - exactly two inputs and four outputs;
 - recursive preservation of player script and `D` sats;
 - the exact shared tree script and fixed tree value;
-- preserved identity and position;
 - canonical initial luck on the first recursive spend;
 - exact roll hash successor and bounded luck-credit transition;
 - player input/output assets contain exactly one PLAYER_ID and only optional LOG
   and XP besides it;
-- input and output XP packets equal their corresponding XP balances;
 - canonical extension and anchor.
 
 The reciprocal tree covenant enforces the actual inventory and XP deltas.
@@ -159,7 +152,7 @@ merely an emulator policy.
 
 ## Direct Owner Renewal
 
-Player state has one exact-self-send covenant per authority:
+Player state has one exact-state self-send covenant per authority:
 
 - owner renewal;
 - optional-watchtower renewal.
@@ -176,10 +169,14 @@ delegation and accepts a newer signed revocation. It can rotate only the exact
 state into a new batch, but that outpoint change can race gameplay; unattended
 operation is therefore near-expiry policy, not a requirement for active players.
 
+If arkd's current or scheduled intent policy charges a fee, either path adds
+one clean asset-free wallet VTXO and returns exact same-contract change. The
+player's 330 sats and assets never fund the fee.
+
 Every renewal preserves byte-for-byte:
 
 - player P2TR and 330 sats;
-- identity, position, roll, luck-credit, and XP packets;
+- roll and luck-credit packets;
 - the one-unit PLAYER_ID;
 - LOG and XP balances.
 
@@ -213,9 +210,9 @@ The player count is unlimited, but season resources are not: the world
 contains exactly 21,000,000 LOG and 21,000,000 XP, all issued into 420
 tree-local reserves of 50,000 each. Harvested LOG leaves player state through
 the owner-authorized withdrawal leaf; XP never leaves.
-PLAYER_ID and player identity are world-specific. A new deployment has a fresh
-genesis and fresh TREE/LOG/XP AssetIds; an owner may reuse a key, but the
-genesis-bound identity and marker change.
+PLAYER_ID is world-specific. A new deployment has a fresh genesis and fresh
+TREE/LOG/XP AssetIds; an owner may reuse a key, but the transaction-derived
+marker changes.
 
 A covenant sees the current transaction, not arbitrary ancestry from before a
 marker entered player state. An owner can issue a marker to an unconstrained

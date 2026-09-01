@@ -316,8 +316,6 @@ pub(crate) struct ExpectedChop {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChopMutation {
     None,
-    InvertXp,
-    NonCanonicalXp,
     NonCanonicalHealth,
     SwapWorldGroups,
     SwapLogXpGroups,
@@ -327,7 +325,6 @@ pub enum ChopMutation {
     WrongLogDelta,
     WrongXpDelta,
     DoubleTreeMarker,
-    WrongPlayerPosition,
     ExtraOutput,
     WrongAnchor,
     AssetMetadata,
@@ -345,10 +342,8 @@ impl ChopMutation {
             "wrong-luck-credit" => Ok(Self::WrongLuckCredit),
             "wrong-log-delta" => Ok(Self::WrongLogDelta),
             "wrong-xp-delta" => Ok(Self::WrongXpDelta),
-            "noncanonical-xp-zero" => Ok(Self::NonCanonicalXp),
             "noncanonical-health-zero" => Ok(Self::NonCanonicalHealth),
             "double-tree-marker" => Ok(Self::DoubleTreeMarker),
-            "wrong-player-position" => Ok(Self::WrongPlayerPosition),
             "extra-output" => Ok(Self::ExtraOutput),
             "wrong-anchor" => Ok(Self::WrongAnchor),
             "asset-metadata" => Ok(Self::AssetMetadata),
@@ -394,36 +389,8 @@ impl ChopMutation {
         }
     }
 
-    fn mutate_extensions(
-        self,
-        psbt: &mut bitcoin::Psbt,
-        success: bool,
-        previous_state: PlayerState,
-        next_state: PlayerState,
-        map_width: u16,
-    ) -> Result<()> {
+    fn mutate_extensions(self, psbt: &mut bitcoin::Psbt, next_state: PlayerState) -> Result<()> {
         match self {
-            Self::InvertXp => {
-                let wrong_xp = if success {
-                    previous_state.xp
-                } else {
-                    previous_state.xp.increment()?
-                };
-                replace_extension_packet(
-                    psbt,
-                    crate::protocol::PLAYER_XP_PACKET_TYPE,
-                    &wrong_xp.encode(),
-                )?;
-            }
-            Self::NonCanonicalXp => {
-                let mut negative_zero = [0_u8; 9];
-                negative_zero[8] = 0x80;
-                replace_extension_packet(
-                    psbt,
-                    crate::protocol::PLAYER_XP_PACKET_TYPE,
-                    &negative_zero,
-                )?;
-            }
             Self::NonCanonicalHealth => {
                 let mut negative_zero = [0_u8; 9];
                 negative_zero[8] = 0x80;
@@ -449,15 +416,6 @@ impl ChopMutation {
                     psbt,
                     crate::protocol::PLAYER_LUCK_CREDIT_PACKET_TYPE,
                     &crate::player::PlayerLuckCredit::new(wrong)?.encode(),
-                )?;
-            }
-            Self::WrongPlayerPosition => {
-                let mut position = next_state.position;
-                position.x = (position.x + 1) % map_width;
-                replace_extension_packet(
-                    psbt,
-                    crate::protocol::PLAYER_POSITION_PACKET_TYPE,
-                    &position.encode(),
                 )?;
             }
             _ => {}
@@ -550,9 +508,6 @@ pub fn prepare_chop(
         .record
         .asset_amount(world.xp_asset)
         .unwrap_or(0);
-    if player_state.state.xp.value() != player_xp_balance_before {
-        return Err(anyhow!("player XP counter is not backed by the XP asset"));
-    }
     require_asset_amount(
         player_state.record,
         player_state.player_asset,
@@ -576,10 +531,7 @@ pub fn prepare_chop(
             .ensure_live(now, crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS)
             .with_context(|| format!("{label} input"))?;
     }
-    let (next_luck, success) = player_state
-        .state
-        .luck
-        .advance(player_state.state.xp.value());
+    let (next_luck, success) = player_state.state.luck.advance(player_xp_balance_before);
     let reward = u64::from(success);
     let log_reward = if matches!(mutation, ChopMutation::WrongLogDelta) {
         1 - reward
@@ -599,16 +551,7 @@ pub fn prepare_chop(
     let player_xp_balance_after = player_xp_balance_before
         .checked_add(xp_reward)
         .ok_or_else(|| anyhow!("player XP balance overflow"))?;
-    let next_xp = if success {
-        player_state.state.xp.increment()?
-    } else {
-        player_state.state.xp
-    };
-    let next_state = PlayerState {
-        luck: next_luck,
-        xp: next_xp,
-        ..player_state.state
-    };
+    let next_state = PlayerState { luck: next_luck };
 
     let inputs = [
         player::player_state_vtxo_input(
@@ -700,15 +643,10 @@ pub fn prepare_chop(
         player_state.contract,
         world.contract,
         [player_state.previous_tx, tree.previous_tx],
+        player_xp_balance_before,
         next_state,
     )?;
-    mutation.mutate_extensions(
-        &mut chop.ark_tx,
-        success,
-        player_state.state,
-        next_state,
-        world.map_width,
-    )?;
+    mutation.mutate_extensions(&mut chop.ark_tx, next_state)?;
     if chop.ark_tx.unsigned_tx.output.len() != crate::protocol::CHOP_OUTPUT_COUNT {
         return Err(anyhow!("chop transaction has an invalid output count"));
     }

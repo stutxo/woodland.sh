@@ -151,12 +151,15 @@ async function main() {
   }
 
   const options = parseArgs(argv);
-  if (!options.command) fail('usage: node regtest.mjs <start|stop|clean|mine|rpc|ark|arkd>');
+  if (!options.command) fail('usage: node regtest.mjs <start|fees|stop|clean|mine|rpc|ark|arkd>');
   loadEnv(ROOT, options.env);
 
   switch (options.command) {
     case 'start':
       await start(options);
+      break;
+    case 'fees':
+      await applyArkdFees();
       break;
     case 'stop':
       log('Stopping woodland.sh regtest...');

@@ -1,7 +1,7 @@
 # woodland.sh Regtest
 
-This directory provides the minimal local stack used by woodland.sh protocol v2:
-Bitcoin Core, indexers, stock arkd/arkd-wallet, Redis, and the stock Arkade
+This directory provides the minimal local stack used by woodland.sh protocol
+v3: Bitcoin Core, indexers, stock arkd/arkd-wallet, Redis, and the stock Arkade
 Script emulator.
 
 ## Run
@@ -15,7 +15,7 @@ Open `http://127.0.0.1:8000/`. `woodland-server` serves both `dist/` and every
 `/v1/*` API on that origin. Gameplay calls local arkd on 7070 and the stock
 emulator on 7073. A separate local renewal watcher runs alongside Axum.
 
-Protocol v2 uses manifest schema 2. A fresh world creates three fixed-supply
+Protocol v3 uses signed manifest schema 3. A fresh world creates three fixed-supply
 groups:
 
 ```text
@@ -31,8 +31,8 @@ PLAYER_TICKET, allocator reserve, invitation, or player registry.
 
 A browser wallet receives one exact 330-sat VTXO and, in one transaction,
 issues a unique uncontrolled PLAYER_ID into recursive player state with its
-canonical roll and initial 8,000 luck credit. Harvested LOG and XP remain in
-that state; numeric XP must equal held XP.
+canonical roll and initial 8,000 luck credit. Harvested LOG and the soulbound
+XP asset remain in that state; held XP is the sole progression value.
 
 ## Commands
 
@@ -40,6 +40,7 @@ that state; numeric XP must equal held XP.
 ./scripts/regtest.sh start
 ./scripts/regtest.sh start-tree
 ./scripts/regtest.sh renew-world
+./scripts/regtest.sh fees
 ./scripts/regtest.sh stop
 ./scripts/regtest.sh clean --force
 ./scripts/regtest.sh build-images [arkd-source]
@@ -53,6 +54,10 @@ that state; numeric XP must equal held XP.
 ./scripts/regtest.sh arkd <arkd-cli args...>
 ```
 
+`fees` reapplies the configured live arkd intent policy. `fund` is a serialized
+test faucet: it pauses intent fees only long enough to create the requested
+exact VTXO, then restores that policy before returning.
+
 ## Stock arkd
 
 The wrapper checks out unmodified commit:
@@ -62,15 +67,16 @@ c7c3184f5cd416e231023f717489a5b0550960cc
 ```
 
 The source defaults to `.cache/arkd-stock`. Startup verifies expected image tags
-and stock-emulator version before deployment. Protocol v2 requires no custom
+and stock-emulator version before deployment. Protocol v3 requires no custom
 arkd, emulator patch, or policy proxy.
 
 ## Renewal
 
 The manifest pins one `rolloverSigner` for optional player watchtower
-authorization. Active players renew directly with their owner key. Tree renewal
-and one-batch funded-stump regrowth are permissionless covenant self-sends; the
-watcher submits active renewals near expiry and funded stumps immediately.
+authorization and exact-state tree maintenance. Active players renew directly
+with their owner key. Funded-stump regrowth remains permissionless; active trees
+and terminal stumps require rollover-authorized maintenance. The watcher
+submits funded stumps immediately and maintains other trees near expiry.
 
 Run one pre-game pass with:
 
@@ -90,15 +96,16 @@ renewal process:
 ./scripts/run-mutinynet.sh
 ```
 
-Initial deployment needs the deployer and rollover children because the manifest
-commits the rollover public key. After `ensure`, the launcher removes the
-deployer child, withholds the rollover child from the tree watcher, and exposes
-it only to the optional delegated-renewal server. Neither secret reaches GitHub
-Pages. The script writes the live manifest to its configured ignored path and
-builds a local `dist/` bundle.
+Initial deployment needs the deployer and rollover children because the
+deployer signs every manifest field and genesis metadata commits both public
+keys. After `ensure`, the launcher removes the deployer child. The tree watcher
+and optional delegated-renewal server receive the lower-authority rollover
+child; neither receives the deployer secret, and no secret reaches GitHub Pages.
+The script writes the live manifest to its configured ignored path and builds a
+local `dist/` bundle.
 
-To publish Pages after a real deployment, copy the verified public schema-2
-manifest to a deliberate tracked deployment path, then set
+To publish Pages after a real deployment, copy the verified public signed
+schema-3 manifest to a deliberate tracked deployment path, then set
 `WOODLAND_PAGES_MANIFEST` to that path. Set `WOODLAND_SERVER_URL` to enable the
 optional social, leaderboard, and renewal-delegation UI.
 
@@ -172,6 +179,6 @@ The profiles are destructive only to resources owned by this checkout. If port
 
 ## Security
 
-Regtest uses deterministic keys, fixed passwords, unauthenticated HTTP, and
-zero-fee accounting. Published fixture ports bind to `127.0.0.1`. Never expose
-this stack or reuse fixture secrets.
+Regtest uses deterministic keys, fixed passwords, unauthenticated HTTP, and a
+test intent-fee policy (1% per offchain input by default). Published fixture
+ports bind to `127.0.0.1`. Never expose this stack or reuse fixture secrets.

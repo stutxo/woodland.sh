@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Renewal E2E: proves a world tree re-enters a fresh batch through its
-// renewal leaf with a new expiry, identical contract, assets, and state, and
-// that the renewed lineage keeps working for a second renewal.
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+// rollover-authorized maintenance leaf with a new expiry, identical contract,
+// assets, and state, and that the renewed lineage works a second time.
+import { execFileSync, spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
@@ -25,7 +25,6 @@ function treeRenewalEnv() {
     ...process.env,
     WOODLAND_FORCE_ROLLOVER: '1',
   };
-  delete environment.WOODLAND_ROLLOVER_SECRET;
   return environment;
 }
 
@@ -47,6 +46,45 @@ function renewArgs(args) {
   ];
 }
 
+function renewalAddress() {
+  const output = execFileSync(
+    'cargo',
+    [
+      'run',
+      '--manifest-path',
+      path.join(ROOT, 'Cargo.toml'),
+      '--locked',
+      '--quiet',
+      '--features',
+      'regtest-e2e',
+      '--bin',
+      'woodland-operator',
+      '--',
+      'renewal-address',
+      MANIFEST,
+    ],
+    {
+      cwd: ROOT,
+      env: treeRenewalEnv(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'inherit'],
+    },
+  );
+  return output.trim().split('\n').at(-1);
+}
+
+function fundRenewals() {
+  execFileSync(
+    path.join(ROOT, 'scripts/regtest.sh'),
+    ['fund', renewalAddress(), '2000'],
+    {
+      cwd: ROOT,
+      env: process.env,
+      stdio: 'inherit',
+    },
+  );
+}
+
 function renew(...args) {
   const output = execFileSync(
     'cargo',
@@ -61,33 +99,6 @@ function renew(...args) {
   return JSON.parse(output.trim().split('\n').at(-1));
 }
 
-function renewAsync(...args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      'cargo',
-      renewArgs(args),
-      {
-        cwd: ROOT,
-        env: treeRenewalEnv(),
-        stdio: ['ignore', 'pipe', 'inherit'],
-      },
-    );
-    let output = '';
-    child.stdout.on('data', (chunk) => { output += chunk.toString(); });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`renewal process exited with status ${code}`));
-        return;
-      }
-      try {
-        resolve(JSON.parse(output.trim().split('\n').at(-1)));
-      } catch (error) {
-        reject(error);
-      }
-    });
-  });
-}
 
 async function indexerVtxos(params) {
   const records = [];
@@ -165,9 +176,12 @@ async function main() {
   assert.notEqual(blockedRenewal.status, 0, 'interactive renewal unexpectedly ran');
   assert.match(blockedRenewal.stderr, /renew-world is pre-game only/);
   const manifest = JSON.parse(fs.readFileSync(MANIFEST, 'utf8'));
-  assert.equal(manifest.schemaVersion, 2, 'world manifest must be schema 2');
-  assert.equal(manifest.protocolVersion, 2, 'world manifest must declare protocol v2');
+  assert.equal(manifest.schemaVersion, 3, 'world manifest must be schema 3');
+  assert.equal(manifest.protocolVersion, 3, 'world manifest must declare protocol v3');
   assert.equal(manifest.gameId, 'woodland.sh');
+  assert.equal(manifest.rulesetId, 'woodland.sh/forest/v3');
+  assert.match(manifest.deployerSigner, /^[0-9a-f]{64}$/);
+  assert.match(manifest.manifestSignature, /^[0-9a-f]{128}$/);
   assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');
   assert.equal(manifest.maxPlayerLevel, 99);
   assert.equal(manifest.baseLogDropBasisPoints, 2_000);
@@ -191,7 +205,14 @@ async function main() {
   ]) {
     assert.equal(removed in manifest, false, `manifest retained obsolete ${removed}`);
   }
-  assert.ok(manifest.treeRenewalArkadeScript, 'world manifest must pin the tree renewal leaf');
+  assert.ok(
+    manifest.treeMaintenanceArkadeScript,
+    'world manifest must pin the tree maintenance leaf',
+  );
+  assert.ok(
+    manifest.treeRegrowthArkadeScript,
+    'world manifest must pin the tree regrowth leaf',
+  );
   const treeState = manifest.trees.find((tree) => tree.state.treeId === TREE_ID)?.state;
   assert.ok(treeState, `manifest omits tree ${TREE_ID}`);
   const treeScript = manifest.treeScript;
@@ -209,7 +230,10 @@ async function main() {
       [
         ['game', 'woodland.sh'],
         ['protocol', String(manifest.protocolVersion)],
+        ['ruleset', manifest.rulesetId],
         ['asset', label],
+        ['deployer', manifest.deployerSigner],
+        ['rollover', manifest.rolloverSigner],
       ],
       `${label} metadata changed`,
     );
@@ -223,6 +247,7 @@ async function main() {
   assert.equal(xpAssetInfo.supply, '21000000', 'indexed XP supply changed');
   assert.equal(logAssetInfo.controlAsset || '', '');
   assert.equal(xpAssetInfo.controlAsset || '', '');
+  fundRenewals();
   const worldBefore = await indexerVtxos({ scripts: treeScript, spendableOnly: 'true' });
   assert.equal(
     worldBefore.length,
@@ -243,24 +268,20 @@ async function main() {
       && totalsBefore.logs <= manifest.logReservePerTree * manifest.trees.length,
   );
 
-  // Join two untouched, equal-depth lineages to the same batch. Each
-  // topic-filtered client receives its own path while parent chunks retain
-  // omitted sibling references.
-  const [peer, sibling] = await Promise.all([
-    renewAsync('tree', String(TREE_ID + 1)),
-    renewAsync('tree', String(TREE_ID + 2)),
-  ]);
+  // Serialize fee-funded maintenance so the exact ordinary-wallet change from
+  // one round funds the next without a conflicting double spend.
+  const peer = renew('tree', String(TREE_ID + 1));
+  const sibling = renew('tree', String(TREE_ID + 2));
   assert.equal(peer.kind, 'tree');
   assert.equal(peer.treeId, TREE_ID + 1);
+  assert.equal(sibling.kind, 'tree');
   assert.equal(sibling.treeId, TREE_ID + 2);
-  assert.equal(peer.commitmentTxid, sibling.commitmentTxid, 'peer renewals must share one batch');
   assert.notEqual(peer.newOutpoint, peer.oldOutpoint);
   assert.notEqual(sibling.newOutpoint, sibling.oldOutpoint);
   assert.ok(peer.newExpiresAt > peer.oldExpiresAt);
   assert.ok(sibling.newExpiresAt > sibling.oldExpiresAt);
 
-  // Independently renew the mutated target so lookup depth cannot decide
-  // whether the peer intents reach the same Ark batch.
+  // Renew the target independently, then inspect its actual batch-leaf bytes.
   const first = renew('tree', String(TREE_ID));
   assert.equal(first.kind, 'tree');
   assert.equal(first.treeId, TREE_ID);
@@ -321,7 +342,7 @@ async function main() {
   );
 
   console.log(
-    `renewal E2E (${E2E_PROFILE}) passed: concurrent renewal preserved tree state`
+    `renewal E2E (${E2E_PROFILE}) passed: recurring renewal preserved tree state`
       + (FULL_E2E ? ' and remained renewable' : ''),
   );
 }

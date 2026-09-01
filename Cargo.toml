@@ -1,6 +1,6 @@
 [package]
 name = "woodland"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.88"
 publish = false
@@ -45,6 +45,7 @@ fuzzing = []
 anyhow = "1"
 bip39 = { version = "2.2.2", optional = true, features = ["zeroize"] }
 ark-core = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
+ark-fees = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
 ark-script = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
 ark-rest = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
 base64 = "0.22"
