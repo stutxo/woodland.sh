@@ -28,9 +28,9 @@ export WOODLAND_E2E_WEB_URL="$WOODLAND_SERVER_URL"
 PROFILE=${1:-full}
 
 case "$PROFILE" in
-  smoke|full|soak|chaos|regrowth) ;;
+  smoke|full|soak|chaos|regrowth|progression) ;;
   *)
-    printf 'usage: %s [smoke|full|soak|chaos|regrowth]\n' "$0" >&2
+    printf 'usage: %s [smoke|full|soak|chaos|regrowth|progression]\n' "$0" >&2
     exit 2
     ;;
 esac
@@ -154,6 +154,8 @@ if [[ "$PROFILE" == soak || "$PROFILE" == chaos ]]; then
   setsid node "$ROOT/scripts/e2e-soak-regtest.mjs" &
 elif [[ "$PROFILE" == regrowth ]]; then
   setsid node "$ROOT/scripts/e2e-regrowth-regtest.mjs" &
+elif [[ "$PROFILE" == progression ]]; then
+  setsid node "$ROOT/scripts/e2e-progression-regtest.mjs" &
 else
   setsid node "$ROOT/scripts/e2e-suite.mjs" &
 fi

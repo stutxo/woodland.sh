@@ -335,6 +335,12 @@ Full deterministic browser, renewal, adversarial, and multiplayer profile:
 ./scripts/test-regtest.sh full
 ```
 
+All-tier material and axe progression under the live covenant:
+
+```bash
+./scripts/test-regtest.sh progression
+```
+
 Long configurable same-tree contention profile:
 
 ```bash

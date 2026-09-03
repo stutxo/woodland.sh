@@ -1834,37 +1834,35 @@ pub(crate) fn push_material_drop_code(
         .push_opcode(op::BIN2NUM)
         .push_int(CHOP_ROLL_BASIS_POINTS as i64)
         .push_opcode(OP_MOD);
-    let builder =
-        crate::tree::push_optional_input_asset_lookup(builder, player_input_index, xp_asset)
-            .push_opcode(OP_DROP)
-            .push_int((IRON_ORE_UNLOCK_XP_BALANCE - 1) as i64)
-            .push_opcode(OP_GREATERTHAN)
-            .push_opcode(OP_IF)
-            .push_opcode(OP_DUP)
-            .push_int(IRON_ORE_DROP_BASIS_POINTS as i64)
-            .push_opcode(OP_LESSTHAN)
-            .push_opcode(OP_IF)
-            .push_opcode(OP_DROP)
-            .push_int(MaterialDrop::IronOre as i64)
-            .push_opcode(OP_ELSE)
-            .push_int((IRON_ORE_DROP_BASIS_POINTS + STONE_DROP_BASIS_POINTS) as i64)
-            .push_opcode(OP_LESSTHAN)
-            .push_opcode(OP_IF)
-            .push_int(MaterialDrop::Stone as i64)
-            .push_opcode(OP_ELSE)
-            .push_int(MaterialDrop::None as i64)
-            .push_opcode(OP_ENDIF)
-            .push_opcode(OP_ENDIF)
-            .push_opcode(OP_ELSE)
-            .push_int(STONE_DROP_BASIS_POINTS as i64)
-            .push_opcode(OP_LESSTHAN)
-            .push_opcode(OP_IF)
-            .push_int(MaterialDrop::Stone as i64)
-            .push_opcode(OP_ELSE)
-            .push_int(MaterialDrop::None as i64)
-            .push_opcode(OP_ENDIF)
-            .push_opcode(OP_ENDIF);
-    builder
+    crate::tree::push_optional_input_asset_lookup(builder, player_input_index, xp_asset)
+        .push_opcode(OP_DROP)
+        .push_int((IRON_ORE_UNLOCK_XP_BALANCE - 1) as i64)
+        .push_opcode(OP_GREATERTHAN)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_DUP)
+        .push_int(IRON_ORE_DROP_BASIS_POINTS as i64)
+        .push_opcode(OP_LESSTHAN)
+        .push_opcode(OP_IF)
+        .push_opcode(OP_DROP)
+        .push_int(MaterialDrop::IronOre as i64)
+        .push_opcode(OP_ELSE)
+        .push_int((IRON_ORE_DROP_BASIS_POINTS + STONE_DROP_BASIS_POINTS) as i64)
+        .push_opcode(OP_LESSTHAN)
+        .push_opcode(OP_IF)
+        .push_int(MaterialDrop::Stone as i64)
+        .push_opcode(OP_ELSE)
+        .push_int(MaterialDrop::None as i64)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_ELSE)
+        .push_int(STONE_DROP_BASIS_POINTS as i64)
+        .push_opcode(OP_LESSTHAN)
+        .push_opcode(OP_IF)
+        .push_int(MaterialDrop::Stone as i64)
+        .push_opcode(OP_ELSE)
+        .push_int(MaterialDrop::None as i64)
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_ENDIF)
 }
 
 fn push_luck_credit_value(builder: Builder, input_index: Option<usize>) -> Builder {
@@ -2224,6 +2222,36 @@ mod tests {
             material_drop(iron, IRON_ORE_UNLOCK_XP_BALANCE, false),
             MaterialDrop::None
         );
+    }
+
+    #[test]
+    fn material_roll_distribution_tracks_signed_rates() {
+        const SAMPLES: u64 = 100_000;
+        let mut roll = PlayerLuck::initial(&player_script(8)).unwrap().roll;
+        let mut locked_stone = 0_u64;
+        let mut unlocked_stone = 0_u64;
+        let mut unlocked_iron_ore = 0_u64;
+        for _ in 0..SAMPLES {
+            roll = roll.next();
+            locked_stone += u64::from(
+                material_drop(roll, IRON_ORE_UNLOCK_XP_BALANCE - 1, true) == MaterialDrop::Stone,
+            );
+            match material_drop(roll, IRON_ORE_UNLOCK_XP_BALANCE, true) {
+                MaterialDrop::None => {}
+                MaterialDrop::Stone => unlocked_stone += 1,
+                MaterialDrop::IronOre => unlocked_iron_ore += 1,
+            }
+        }
+        for (label, observed, minimum, maximum) in [
+            ("locked STONE", locked_stone, 9_500, 10_500),
+            ("unlocked STONE", unlocked_stone, 9_500, 10_500),
+            ("unlocked IRON ORE", unlocked_iron_ore, 1_750, 2_250),
+        ] {
+            assert!(
+                (minimum..=maximum).contains(&observed),
+                "{label} distribution {observed}/{SAMPLES} is outside {minimum}..={maximum}",
+            );
+        }
     }
 
     #[test]

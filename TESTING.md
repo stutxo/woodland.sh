@@ -50,10 +50,11 @@ arkd or emulator patch or policy proxy is part of the protocol.
 ```bash
 ./scripts/test-regtest.sh smoke
 ./scripts/test-regtest.sh full
+./scripts/test-regtest.sh progression
 ./scripts/test-regtest.sh regrowth
 ```
 
-All three clean wrapper-owned containers and volumes, start
+All four profiles clean wrapper-owned containers and volumes, start
 Bitcoin/indexers/stock arkd/emulator, deploy a fresh signed schema 3 world,
 build the web bundle, and serve the bundle plus `/v1/*` API from one native
 Axum origin. Browser and renewal stages then run before teardown.
@@ -61,8 +62,10 @@ Axum origin. Browser and renewal stages then run before teardown.
 Smoke proves the complete path quickly, including one covenant-enforced Wooden
 Axe craft. Full exercises player-bound luck, bounded reward streaks, material
 drops, harvesting, axe crafting, lifecycle renewal, LOG withdrawal, recovery,
-adversarial mutations, and four-player concurrency. The dedicated `regrowth`
-profile exercises complete one-batch stump regrowth.
+adversarial mutations, and four-player concurrency. The `progression` profile
+uses one fixed-key Firefox player to find both materials, exercise the exact
+level gates, and craft Wooden, Stone, and Iron Axes on the stock emulator. The
+dedicated `regrowth` profile exercises complete one-batch stump regrowth.
 Both mobile and desktop checks require the player overlay to remain exactly
 centered across every sampled frame while only the Canvas camera changes. Tests
 also require viewport-only tile rendering, zero per-tile DOM nodes, real canvas
@@ -139,6 +142,28 @@ Set `WOODLAND_E2E_REQUIRE_RENEWAL_FEE=1` with a nonzero
 `ARK_OFFCHAIN_INPUT_FEE` to make the browser and regrowth profiles require an
 observed reduction in the clean fee VTXO. Without that flag, the same scenarios
 also support intentionally fee-free local overrides.
+
+## Deployed Axe Progression
+
+```bash
+./scripts/test-regtest.sh progression
+```
+
+The progression profile submits every swing through the real browser/WASM,
+stock arkd, and stock emulator. It rejects Stone and Iron crafting one XP asset
+unit before their exact level thresholds, then continues through real material
+drops until each recipe is funded. Successful Wooden, Stone, and Iron crafts
+must burn exactly 8 LOG, 2 STONE, and 2 IRON ORE in total while preserving XP,
+PLAYER_ID, luck, sats, and every unrelated inventory unit.
+
+Final assertions require the Iron Axe rate, maximum-tier UI, exact tree/player
+accounting, indexed circulating supplies of 20,999,992 LOG, 21,000,000 XP,
+20,999,998 STONE, and 20,999,998 IRON ORE, owner renewal, and browser-reload
+recovery. The structured report is
+`regtest/_build/progression-report.json`. Material acquisition is unbounded in
+the protocol, so the local harness uses configurable safety limits
+`WOODLAND_PROGRESSION_MAX_SWINGS` and
+`WOODLAND_PROGRESSION_MAX_SUCCESSES`.
 
 ## Adversarial Covenant Coverage
 
