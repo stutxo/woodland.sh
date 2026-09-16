@@ -16,6 +16,7 @@ on:
           - full
           - soak
           - regrowth
+          - progression
         default: smoke
 
 concurrency:
@@ -91,6 +92,7 @@ jobs:
             node --check "$file"
           done
       - run: node scripts/test-assemble-web.mjs
+      - run: node scripts/test-browser-recovery.mjs
       - name: Validate regtest Compose files
         env:
           EMULATOR_SECRET_KEY: 1111111111111111111111111111111111111111111111111111111111111111
@@ -114,16 +116,21 @@ jobs:
         working-directory: fuzz
 
   regtest:
-    name: Regtest (${{ github.event_name == 'schedule' && 'full' || inputs.profile || 'smoke' }})
+    name: Regtest (${{ matrix.profile }})
     needs: [test, msrv, audit]
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(inputs.profile == 'progression' && '["progression"]' || format('["{0}", "progression"]', github.event_name == 'schedule' && 'full' || inputs.profile || 'smoke')) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.profile == 'progression' && 150 || 45 }}
     env:
       EMULATOR_SECRET_KEY: 1111111111111111111111111111111111111111111111111111111111111111
-      WOODLAND_CI_PROFILE: ${{ github.event_name == 'schedule' && 'full' || inputs.profile || 'smoke' }}
+      WOODLAND_CI_PROFILE: ${{ matrix.profile }}
       WOODLAND_E2E_ARTIFACT_DIR: regtest/_build/ci-artifacts
       WOODLAND_E2E_JUNIT: regtest/_build/ci-artifacts/e2e-junit.xml
       WOODLAND_SOAK_REPORT: regtest/_build/ci-artifacts/soak-report.json
+      WOODLAND_PROGRESSION_REPORT: regtest/_build/ci-artifacts/progression-report.json
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -154,7 +161,7 @@ jobs:
         if: steps.arkd-images.outputs.cache-hit != 'true'
         run: docker save arkd-local:c7c3184-forest-v1-stock arkd-wallet-local:c7c3184-forest-v1-stock | zstd --threads=0 --fast=3 > "$RUNNER_TEMP/woodland-arkd-images.tar.zst"
       - name: Run functional profile
-        timeout-minutes: 12
+        timeout-minutes: ${{ matrix.profile == 'progression' && 120 || 12 }}
         run: |
           set -o pipefail
           ./scripts/test-regtest.sh "$WOODLAND_CI_PROFILE" \
@@ -163,8 +170,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: regtest-${{ env.WOODLAND_CI_PROFILE }}-junit
-          path: ${{ env.WOODLAND_E2E_JUNIT }}
+          name: regtest-${{ env.WOODLAND_CI_PROFILE }}-report
+          path: |
+            ${{ env.WOODLAND_E2E_JUNIT }}
+            ${{ env.WOODLAND_PROGRESSION_REPORT }}
           if-no-files-found: warn
           retention-days: 7
       - name: Collect failure diagnostics

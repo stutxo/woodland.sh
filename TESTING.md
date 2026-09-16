@@ -34,7 +34,12 @@ CC_wasm32_unknown_unknown=<clang> \
 node --check web/app.js
 for file in scripts/*.mjs; do node --check "$file"; done
 node scripts/test-assemble-web.mjs
+node scripts/test-browser-recovery.mjs
 ```
+
+The browser-state regression runs the real application module against isolated
+DOM and wallet boundaries. It covers unavailable-delegation fallback, visible
+renewal errors, and backup identity after a stale or failed activation refresh.
 
 ## Stock arkd Boundary
 
@@ -46,6 +51,9 @@ creates a different AssetId rather than reissuing an existing one. No custom
 arkd or emulator patch or policy proxy is part of the protocol.
 
 ## Functional Profiles
+
+Use Node.js 22 or newer and Firefox/Geckodriver with WebDriver BiDi support.
+The full profile injects a submission failure before the reloaded page starts.
 
 ```bash
 ./scripts/test-regtest.sh smoke
@@ -62,10 +70,14 @@ Axum origin. Browser and renewal stages then run before teardown.
 Smoke proves the complete path quickly, including one covenant-enforced Wooden
 Axe craft. Full exercises player-bound luck, bounded reward streaks, material
 drops, harvesting, axe crafting, lifecycle renewal, LOG withdrawal, recovery,
-adversarial mutations, and four-player concurrency. The `progression` profile
-uses one fixed-key Firefox player to find both materials, exercise the exact
-level gates, and craft Wooden, Stone, and Iron Axes on the stock emulator. The
-dedicated `regrowth` profile exercises complete one-batch stump regrowth.
+adversarial mutations, and four-player concurrency. Its later-swing recovery
+check preserves the exact signed journal through a failed reload, then settles
+the pending tree outside the viewport without duplicating rewards. The
+`progression` profile uses one fixed-key Firefox player to find both materials,
+exercise the exact level gates, and craft Wooden, Stone, and Iron Axes on the
+stock emulator. It replays an old craft request after the next tier becomes
+affordable and requires unchanged player state, balances, and asset supplies.
+The dedicated `regrowth` profile exercises complete one-batch stump regrowth.
 Both mobile and desktop checks require the player overlay to remain exactly
 centered across every sampled frame while only the Canvas camera changes. Tests
 also require viewport-only tile rendering, zero per-tile DOM nodes, real canvas
@@ -81,6 +93,11 @@ still calls Arkade and the stock emulator directly.
 CI allows 120 two-second emulator readiness attempts. A timeout prints the
 container state and the final 200 log lines before teardown, so startup failures
 remain diagnosable.
+
+Pushes and pull requests gate on both smoke and progression. Scheduled runs
+use full plus progression; manual dispatch runs the selected profile plus
+progression, without duplicating a selected progression run. Each matrix leg
+uploads its own report, and Pages waits for every functional leg to pass.
 
 ## Bootstrap Assertions
 

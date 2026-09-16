@@ -49,13 +49,19 @@ fn require_rollover_due(record: &VtxoRecord, force: bool) -> Result<()> {
 
 async fn wait_for_record(
     rest: &ArkadeRest,
-    script_hex: &str,
+    script: &bitcoin::ScriptBuf,
     outpoint: OutPoint,
 ) -> Result<VtxoRecord> {
     for _ in 0..INDEX_ATTEMPTS {
-        let records = rest.get_vtxos(script_hex, "spendableOnly").await?;
-        if let Some(record) = records.iter().find(|record| record.outpoint == outpoint) {
-            return Ok(record.clone());
+        let records = rest.get_vtxos_by_outpoints(&[outpoint]).await?;
+        if let Some(record) = records.into_iter().find(|record| {
+            record.outpoint == outpoint
+                && record.script == *script
+                && !record.is_spent
+                && !record.is_swept
+                && !record.is_unrolled
+        }) {
+            return Ok(record);
         }
         tokio::time::sleep(std::time::Duration::from_millis(INDEX_POLL_MS)).await;
     }
@@ -154,7 +160,12 @@ pub async fn renew_player(
             fee_funding.as_ref().map(|funding| funding.source()),
         )
         .await?;
-    let renewed = wait_for_record(services.rest, &script, outcome.outpoint).await?;
+    let renewed = wait_for_record(
+        services.rest,
+        &contract.vtxo.script_pubkey(),
+        outcome.outpoint,
+    )
+    .await?;
     if renewed.expires_at <= old_expires_at {
         return Err(anyhow!("player renewal did not extend the indexed expiry"));
     }

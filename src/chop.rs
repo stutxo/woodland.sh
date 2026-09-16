@@ -220,6 +220,9 @@ pub fn prepare_withdraw(
             "withdraw builder produced an unexpected output count"
         ));
     }
+    // The SDK seeds this output with the funding wallet; replace it before signing.
+    withdraw.ark_tx.unsigned_tx.output
+        [usize::from(crate::protocol::WITHDRAW_DESTINATION_OUTPUT_INDEX)] = destination.clone();
 
     let logs_after = logs - amount;
     let mut log_outputs = Vec::new();
@@ -1138,5 +1141,177 @@ mod tests {
         json["schemaVersion"] = serde_json::Value::from(PENDING_CHOP_SCHEMA_VERSION);
         json["checkpointPsbts"].as_array_mut().unwrap().pop();
         assert!(PendingChop::from_json(&json.to_string()).is_err());
+    }
+
+    #[test]
+    fn withdrawal_pays_external_recipient_and_preserves_player_state() {
+        let keys = Keys::from_hex(&"03".repeat(32)).unwrap();
+        let operator = Keys::from_hex(&"04".repeat(32)).unwrap();
+        let emulator = Keys::from_hex(&"05".repeat(32)).unwrap();
+        let rollover = Keys::from_hex(&"06".repeat(32)).unwrap();
+        let recipient = Keys::from_hex(&"07".repeat(32)).unwrap();
+        let params = crate::arkade::ServerParams {
+            version: String::new(),
+            signer_pk: operator.owner_pk(),
+            forfeit_pk: bitcoin::PublicKey::new(
+                operator
+                    .owner_pk()
+                    .public_key(bitcoin::secp256k1::Parity::Even),
+            ),
+            network: bitcoin::Network::Regtest,
+            dust_sats: 330,
+            vtxo_min_sats: 330,
+            unilateral_exit_delay: bitcoin::Sequence::from_height(144),
+            max_tx_weight: 400_000,
+            max_op_return_outputs: 1,
+            zero_offchain_fees: true,
+            checkpoint_tapscript: bitcoin::script::Builder::new()
+                .push_int(144)
+                .push_opcode(bitcoin::opcodes::all::OP_CSV)
+                .push_opcode(bitcoin::opcodes::all::OP_DROP)
+                .push_x_only_key(&operator.owner_pk())
+                .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
+                .into_script(),
+            forfeit_address: bitcoin::Address::p2tr(
+                &keys.secp,
+                operator.owner_pk(),
+                None,
+                bitcoin::Network::Regtest,
+            ),
+        };
+        let asset = |group_index| AssetId {
+            txid: Txid::from_byte_array([9; 32]),
+            group_index,
+        };
+        let wallet = crate::txbuild::player_vtxo(&keys, &params).unwrap();
+        let recipient_wallet = crate::txbuild::player_vtxo(&recipient, &params).unwrap();
+        let contract = player::build_player_contract(
+            &keys.secp,
+            keys.owner_pk(),
+            params.signer_pk,
+            emulator.owner_pk(),
+            rollover.owner_pk(),
+            params.unilateral_exit_delay,
+            params.network,
+            asset(0),
+            asset(1),
+            asset(2),
+            asset(3),
+            asset(4),
+            params.dust_sats,
+            &wallet.script_pubkey(),
+        )
+        .unwrap();
+        let player_asset = AssetId {
+            txid: Txid::from_byte_array([10; 32]),
+            group_index: 0,
+        };
+        let input = |script: ScriptBuf, assets: Vec<ark_core::Asset>| {
+            let mut previous = psbt(1, 2);
+            previous.unsigned_tx.output[0] = TxOut {
+                value: Amount::from_sat(330),
+                script_pubkey: script.clone(),
+            };
+            previous.unsigned_tx.output[1] = ark_core::anchor_output();
+            if !assets.is_empty() {
+                let groups = assets
+                    .iter()
+                    .map(|asset| {
+                        transfer_group(
+                            asset.asset_id,
+                            vec![(0, asset.amount)],
+                            vec![(0, asset.amount)],
+                        )
+                    })
+                    .collect();
+                ark_core::asset::packet::add_asset_packet_to_psbt(
+                    &mut previous,
+                    &Packet { groups },
+                )
+                .unwrap();
+            }
+            let previous = previous.unsigned_tx;
+            let record = VtxoRecord {
+                outpoint: OutPoint {
+                    txid: previous.compute_txid(),
+                    vout: 0,
+                },
+                script,
+                amount_sats: 330,
+                assets,
+                created_at: Some(1),
+                expires_at: Some(i64::MAX),
+                is_preconfirmed: false,
+                is_swept: false,
+                spent_by: None,
+                settled_by: None,
+                is_unrolled: false,
+                is_spent: false,
+            };
+            (record, previous)
+        };
+        let assets = [
+            (player_asset, 1),
+            (asset(1), 3),
+            (asset(2), 100),
+            (asset(3), 5),
+            (asset(4), 2),
+        ]
+        .into_iter()
+        .map(|(asset_id, amount)| ark_core::Asset { asset_id, amount })
+        .collect();
+        let (mut record, previous) = input(contract.vtxo.script_pubkey(), assets);
+        let state = PlayerState {
+            luck: player::PlayerLuck::initial(&contract.vtxo.script_pubkey()).unwrap(),
+            axe: player::AxeTier::Stone,
+        };
+        let mut previous = Psbt::from_unsigned_tx(previous).unwrap();
+        player::attach_player_state_packets(&mut previous, state).unwrap();
+        let previous = previous.unsigned_tx;
+        record.outpoint.txid = previous.compute_txid();
+        let (funding, funding_previous) = input(wallet.script_pubkey(), Vec::new());
+        let destination =
+            bitcoin::Address::from_script(&recipient_wallet.script_pubkey(), params.network)
+                .unwrap();
+        let prepared = prepare_withdraw(
+            &keys,
+            &crate::txbuild::server_info(&params),
+            &contract,
+            player_asset,
+            &record,
+            &previous,
+            state,
+            &funding,
+            &funding_previous,
+            &wallet,
+            1,
+            destination,
+        )
+        .unwrap();
+        let tx = &prepared.ark_tx.unsigned_tx;
+        let destination_index = u32::from(crate::protocol::WITHDRAW_DESTINATION_OUTPUT_INDEX);
+        assert_eq!(
+            tx.output[destination_index as usize],
+            TxOut {
+                value: Amount::from_sat(330),
+                script_pubkey: recipient_wallet.script_pubkey(),
+            }
+        );
+        assert!(crate::asset_packet::equal_asset_sets(
+            &crate::asset_packet::output_assets(tx, destination_index).unwrap(),
+            &[ark_core::Asset {
+                asset_id: asset(1),
+                amount: 1
+            }],
+        ));
+        let mut retained = record.assets.clone();
+        retained[1].amount = 2;
+        let state_index = u32::from(crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX);
+        assert!(crate::asset_packet::equal_asset_sets(
+            &crate::asset_packet::output_assets(tx, state_index).unwrap(),
+            &retained,
+        ));
+        assert_eq!(tx.output[state_index as usize].value, Amount::from_sat(330));
+        assert_eq!(player::player_state_from_tx(tx).unwrap(), Some(state));
     }
 }

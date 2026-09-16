@@ -429,7 +429,7 @@ impl WoodlandClient {
         .await
         .context("submit permissionless player activation")?;
         self.wait_for_vtxo(
-            &self.contract.vtxo.script_pubkey().to_hex_string(),
+            &self.contract.vtxo.script_pubkey(),
             OutPoint {
                 txid,
                 vout: u32::from(protocol::ACTIVATION_STATE_OUTPUT_INDEX),
@@ -536,16 +536,10 @@ impl WoodlandClient {
             &returned_ark,
             returned_checkpoints,
         )?;
-        self.wait_for_vtxo(
-            &self.contract.vtxo.script_pubkey().to_hex_string(),
-            expected_player,
-        )
-        .await?;
-        self.wait_for_vtxo(
-            &self.world.contract.vtxo.script_pubkey().to_hex_string(),
-            expected_tree,
-        )
-        .await?;
+        self.wait_for_vtxo(&self.contract.vtxo.script_pubkey(), expected_player)
+            .await?;
+        self.wait_for_vtxo(&self.world.contract.vtxo.script_pubkey(), expected_tree)
+            .await?;
         Ok(ChopOutcome {
             tree_id,
             success: prepared.success,
@@ -590,11 +584,8 @@ impl WoodlandClient {
                 "emulator changed the submitted axe crafting transaction"
             ));
         }
-        self.wait_for_vtxo(
-            &self.contract.vtxo.script_pubkey().to_hex_string(),
-            player_outpoint,
-        )
-        .await?;
+        self.wait_for_vtxo(&self.contract.vtxo.script_pubkey(), player_outpoint)
+            .await?;
         let settled = self
             .sync_player()
             .await?
@@ -685,13 +676,10 @@ impl WoodlandClient {
         if returned_ark.unsigned_tx != prepared.ark_tx.unsigned_tx {
             return Err(anyhow!("emulator changed the submitted withdraw"));
         }
+        self.wait_for_vtxo(&self.contract.vtxo.script_pubkey(), state_outpoint)
+            .await?;
         self.wait_for_vtxo(
-            &self.contract.vtxo.script_pubkey().to_hex_string(),
-            state_outpoint,
-        )
-        .await?;
-        self.wait_for_vtxo(
-            &wallet.script_pubkey().to_hex_string(),
+            &prepared.destination.script_pubkey,
             OutPoint {
                 txid,
                 vout: u32::from(protocol::WITHDRAW_DESTINATION_OUTPUT_INDEX),
@@ -758,10 +746,7 @@ impl WoodlandClient {
             )
             .await?;
         let renewed = self
-            .wait_for_vtxo(
-                &self.world.contract.vtxo.script_pubkey().to_hex_string(),
-                outcome.outpoint,
-            )
+            .wait_for_vtxo(&self.world.contract.vtxo.script_pubkey(), outcome.outpoint)
             .await?;
         let transaction = self
             .rest
@@ -822,10 +807,7 @@ impl WoodlandClient {
             )
             .await?;
         let renewed = self
-            .wait_for_vtxo(
-                &self.contract.vtxo.script_pubkey().to_hex_string(),
-                outcome.outpoint,
-            )
+            .wait_for_vtxo(&self.contract.vtxo.script_pubkey(), outcome.outpoint)
             .await?;
         if renewed.expires_at <= old_expires_at {
             return Err(anyhow!("player renewal did not extend the indexed expiry"));
@@ -837,11 +819,21 @@ impl WoodlandClient {
         txbuild::server_info(&self.params)
     }
 
-    async fn wait_for_vtxo(&self, script_hex: &str, outpoint: OutPoint) -> Result<VtxoRecord> {
+    async fn wait_for_vtxo(
+        &self,
+        script: &bitcoin::ScriptBuf,
+        outpoint: OutPoint,
+    ) -> Result<VtxoRecord> {
         for _ in 0..INDEX_ATTEMPTS {
-            let records = self.rest.get_vtxos(script_hex, "spendableOnly").await?;
-            if let Some(record) = records.iter().find(|record| record.outpoint == outpoint) {
-                return Ok(record.clone());
+            let records = self.rest.get_vtxos_by_outpoints(&[outpoint]).await?;
+            if let Some(record) = records.into_iter().find(|record| {
+                record.outpoint == outpoint
+                    && record.script == *script
+                    && !record.is_spent
+                    && !record.is_swept
+                    && !record.is_unrolled
+            }) {
+                return Ok(record);
             }
             tokio::time::sleep(std::time::Duration::from_millis(INDEX_POLL_MS)).await;
         }

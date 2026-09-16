@@ -188,6 +188,7 @@ async function main() {
         alwaysMatch: {
           browserName: 'firefox',
           unhandledPromptBehavior: 'accept',
+          webSocketUrl: FULL_E2E,
           'moz:firefoxOptions': { args: ['-headless'] },
         },
       },
@@ -397,6 +398,170 @@ async function main() {
       assert.equal(currentTree.nextDrop, tree.nextDrop, label);
       return { result: null, refreshed };
     };
+
+    const recoverLaterSwingAfterReload = async (snapshot, tree) => {
+      assert.notEqual(
+        tree.treeOutpoint,
+        `${tree.deploymentTxid}:0`,
+        'pending reload must use a second-or-later tree input',
+      );
+      assert.equal(typeof WebSocket, 'function', 'pending reload requires Node 22+ WebSocket');
+      const socket = new WebSocket(session.capabilities.webSocketUrl);
+      await new Promise((resolve, reject) => {
+        socket.addEventListener('open', resolve, { once: true });
+        socket.addEventListener('error', reject, { once: true });
+      });
+      let commandId = 0;
+      const bidi = (method, params) => new Promise((resolve, reject) => {
+        const id = ++commandId;
+        const timer = setTimeout(() => {
+          socket.removeEventListener('message', receive);
+          reject(new Error(`BiDi ${method} timed out`));
+        }, 30_000);
+        const receive = ({ data }) => {
+          const response = JSON.parse(data);
+          if (response.id !== id) return;
+          clearTimeout(timer);
+          socket.removeEventListener('message', receive);
+          if (response.type === 'error') reject(new Error(response.message));
+          else resolve(response.result);
+        };
+        socket.addEventListener('message', receive);
+        socket.send(JSON.stringify({ id, method, params }));
+      });
+      const blockKey = 'woodland-e2e-block-submit';
+      const pendingKey = `woodland.sh:web:v2:pending:${manifest.arkadeServiceUrl.replace(/\/+$/, '')}:${manifest.genesisTxid}`;
+      // Preload runs in the page's own realm before WASM starts. Only transport
+      // fails: the signed journal and all gameplay still come from real WASM.
+      const intercept = `() => {
+        const original = globalThis.fetch;
+        globalThis.__WOODLAND_BLOCKED_SUBMITS = 0;
+        globalThis.fetch = async (...args) => {
+          const url = new URL(args[0] instanceof Request ? args[0].url : args[0], location.href);
+          if (url.origin === ${JSON.stringify(new URL(manifest.emulatorUrl).origin)}
+            && url.pathname === '/v1/tx'
+            && sessionStorage.getItem(${JSON.stringify(blockKey)}) === '1') {
+            globalThis.__WOODLAND_BLOCKED_SUBMITS += 1;
+            throw new TypeError('local test transport unavailable');
+          }
+          return original(...args);
+        };
+      }`;
+      let preload;
+      try {
+        preload = await bidi('script.addPreloadScript', { functionDeclaration: intercept });
+        await execute('sessionStorage.setItem(arguments[0], "1");', [blockKey]);
+        const { contexts } = await bidi('browsingContext.getTree', {});
+        const installed = await bidi('script.callFunction', {
+          functionDeclaration: intercept,
+          target: { context: contexts[0].context },
+          awaitPromise: false,
+        });
+        assert.equal(installed.type, 'success', JSON.stringify(installed));
+        const rejected = await expectedChop(snapshot, tree);
+        assert.equal(rejected.ok, false, 'blocked swing unexpectedly settled');
+        const stored = await execute(`
+          return {
+            journal: localStorage.getItem(arguments[0]),
+            blocked: globalThis.__WOODLAND_BLOCKED_SUBMITS,
+          };
+        `, [pendingKey]);
+        assert.ok(stored.blocked > 0, 'emulator submission was not intercepted');
+        assert.ok(stored.journal, 'unresolved swing has no persisted journal');
+        const journal = JSON.parse(stored.journal);
+        assert.equal(journal.treeInput, tree.treeOutpoint);
+        assert.equal(journal.playerStateInput, snapshot.playerStateOutpoint);
+        assert.equal(journal.treeId, tree.treeId);
+        assert.equal(rejected.state.pendingChopTxid, journal.expectedTxid);
+
+        await wd('POST', '/refresh', {});
+        const reloaded = await waitFor(
+          'unresolved later swing survives browser startup',
+          () => execute(`return {
+            ready: Boolean(globalThis.__WOODLAND_E2E_READY),
+            busy: Boolean(document.getElementById('refresh')?.disabled),
+            recoveryError: globalThis.__WOODLAND_E2E_ERROR || '',
+          };`),
+          (value) => !value.busy && (value.ready || value.recoveryError),
+          180_000,
+        );
+        assert.equal(reloaded.ready, true, reloaded.recoveryError);
+        assert.match(reloaded.recoveryError, /local test transport unavailable/);
+        reloaded.state = await execute('return globalThis.__WOODLAND_E2E_STATE;');
+        assert.equal(reloaded.state.pendingChopTxid, journal.expectedTxid);
+        assert.equal(
+          await execute('return localStorage.getItem(arguments[0]);', [pendingKey]),
+          stored.journal,
+          'reload replaced or discarded the exact signed journal',
+        );
+        for (const field of [
+          'playerStateOutpoint', 'playerAsset', 'playerXp', 'playerLuckCredit',
+          'playerLogs', 'playerStone', 'playerIronOre', 'playerAxe',
+        ]) {
+          assert.equal(reloaded.state[field], snapshot[field], `unresolved reload changed ${field}`);
+        }
+        assert.ok(
+          await execute('return globalThis.__WOODLAND_BLOCKED_SUBMITS;') > 0,
+          'reload did not retry the pending submission',
+        );
+
+        // Recover with a deliberately disjoint viewport: the pending tree must
+        // be refreshed independently of the ordinary visible-world filter.
+        const farX = tree.x < manifest.mapWidth / 2 ? manifest.mapWidth - 1 : 0;
+        const farY = tree.y < manifest.mapHeight / 2 ? manifest.mapHeight - 1 : 0;
+        await execute(`
+          globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT(arguments[0], arguments[1], arguments[0], arguments[1]);
+          sessionStorage.removeItem(arguments[2]);
+        `, [farX, farY, blockKey]);
+        const resumed = await executeAsync(`
+          const done = arguments[arguments.length - 1];
+          globalThis.__WOODLAND_E2E_RESUME_PENDING()
+            .then((state) => done({ state }))
+            .catch((error) => done({ error: String(error) }));
+        `);
+        assert.equal(resumed.error, undefined, resumed.error);
+        assert.equal(resumed.state.pendingChopTxid ?? null, null);
+        assert.equal(resumed.state.playerStateOutpoint, `${journal.expectedTxid}:0`);
+        assert.equal(
+          await execute('return localStorage.getItem(arguments[0]);', [pendingKey]),
+          null,
+          'settled exact journal was not cleared',
+        );
+        // Snapshots publish only visible trees. Bring the recovered tree back
+        // into view before checking its displayed lineage and reward balances.
+        const visible = await executeAsync(`
+          const done = arguments[arguments.length - 1];
+          globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT();
+          globalThis.__WOODLAND_E2E_REFRESH_WORLD()
+            .then((state) => done({ state }))
+            .catch((error) => done({ error: String(error) }));
+        `);
+        assert.equal(visible.error, undefined, visible.error);
+        assert.equal(
+          visible.state.trees.find((candidate) => candidate.treeId === tree.treeId).treeOutpoint,
+          `${journal.expectedTxid}:1`,
+        );
+        // This boot error was the deliberately blocked transport, now proved
+        // recovered. Do not leak it into later independent E2E diagnostics.
+        await bidi('script.evaluate', {
+          expression: 'globalThis.__WOODLAND_E2E_ERROR = null',
+          target: { context: contexts[0].context },
+          awaitPromise: false,
+        });
+        console.log(`recovered later swing ${journal.expectedTxid} after reload outside viewport`);
+        return { result: { ok: true, state: visible.state }, refreshed: null };
+      } finally {
+        await execute(`
+          sessionStorage.removeItem(arguments[0]);
+          globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT?.();
+        `, [blockKey]);
+        try {
+          if (preload) await bidi('script.removePreloadScript', { script: preload.script });
+        } finally {
+          socket.close();
+        }
+      }
+    };
     const assertExpectedChopPreconditions = async (snapshot, tree) => {
       const mutations = [
         { treeOutpoint: `${tree.treeOutpoint}-stale` },
@@ -544,10 +709,10 @@ async function main() {
       const treeOutpoints = before.state.trees.map((tree) => tree.treeOutpoint);
       const result = await executeAsync(`
         const done = arguments[arguments.length - 1];
-        globalThis.__WOODLAND_E2E_CRAFT_AXE()
+        globalThis.__WOODLAND_E2E_CRAFT_AXE(arguments[0])
           .then((state) => done({ state }))
           .catch((error) => done({ error: String(error) }));
-      `);
+      `, [before.state.playerStateOutpoint]);
       assert.equal(result.error, undefined, `${label}: ${result.error}`);
       const after = await inspect();
       assert.equal(after.state.playerAxe, 'wooden', `${label}: equipped axe`);
@@ -587,10 +752,10 @@ async function main() {
 
       const rejected = await executeAsync(`
         const done = arguments[arguments.length - 1];
-        globalThis.__WOODLAND_E2E_CRAFT_AXE()
+        globalThis.__WOODLAND_E2E_CRAFT_AXE(arguments[0])
           .then(() => done({ ok: true }))
           .catch((error) => done({ rejection: String(error) }));
-      `);
+      `, [after.state.playerStateOutpoint]);
       assert.match(rejected.rejection || '', /requires Woodcutting level 5/);
       const unchanged = await inspect();
       assert.equal(unchanged.state.playerStateOutpoint, after.state.playerStateOutpoint, label);
@@ -1180,6 +1345,7 @@ async function main() {
     let sawMiss = false;
     let checkedNonzeroXpMutation = false;
     let renewalRefreshes = 0;
+    let testedPendingReload = false;
     while (hits < TARGET_HITS) {
       assert.ok(
         attempts < TARGET_HITS * 11,
@@ -1206,11 +1372,11 @@ async function main() {
         );
         checkedNonzeroXpMutation = true;
       }
-      const attempt = await expectedChopAfterRenewal(
-        before,
-        beforeTree,
-        'recursive swing renewal',
-      );
+      const recoverPending = FULL_E2E && attempts === 1 && !testedPendingReload;
+      const attempt = recoverPending
+        ? await recoverLaterSwingAfterReload(before, beforeTree)
+        : await expectedChopAfterRenewal(before, beforeTree, 'recursive swing renewal');
+      if (recoverPending) testedPendingReload = true;
       if (attempt.refreshed) {
         renewalRefreshes += 1;
         assert.ok(renewalRefreshes <= 20, 'recursive swings encountered excessive renewals');
@@ -1300,6 +1466,7 @@ async function main() {
       'drop sequence exceeded the luck-protection bound',
     );
     if (FULL_E2E) {
+      assert.equal(testedPendingReload, true, 'later-swing journal reload was not exercised');
       assert.ok(sawMiss, 'the bounded luck sequence must exercise at least one miss');
       assert.equal(checkedNonzeroXpMutation, true, 'nonzero-XP mutation probe did not run');
     }

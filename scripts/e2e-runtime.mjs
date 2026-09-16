@@ -156,7 +156,9 @@ export async function webdriverRequest(
     signal: AbortSignal.timeout(timeoutMs),
   });
   const payload = await response.json();
-  if (!response.ok || payload.value?.error) throw new Error(JSON.stringify(payload));
+  // An executed script may legitimately return an object with an `error`
+  // field. WebDriver command failures are identified by their HTTP status.
+  if (!response.ok) throw new Error(JSON.stringify(payload));
   return payload.value;
 }
 

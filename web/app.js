@@ -37,7 +37,7 @@ const treeState = element('tree-state');
 const emulator = element('emulator');
 const status = element('status');
 const log = element('log');
-const onboarding = element('onboarding');
+const walletHeading = element('wallet-heading');
 const onboardingNote = element('onboarding-note');
 const dashboard = element('dashboard');
 const bagPanel = element('bag-panel');
@@ -127,6 +127,7 @@ let remoteLocations = [];
 let chatMessages = [];
 let delegatedRenewal = false;
 let delegationAvailable = false;
+let lastRenewalError = null;
 let socialPosting = false;
 let locationPosting = false;
 let lastPublishedLocation = null;
@@ -346,7 +347,7 @@ async function refreshLeaderboard() {
     delegatedPlayerAssets = Array.isArray(payload.delegatedPlayerAssets)
       ? payload.delegatedPlayerAssets
       : [];
-    delegatedRenewal = delegatedPlayerAssets.includes(state?.playerAsset);
+    delegatedRenewal = delegationAvailable && delegatedPlayerAssets.includes(state?.playerAsset);
     updateServerStatus();
     publishSocialSnapshot();
     render();
@@ -882,6 +883,12 @@ function renderMap() {
   globalThis.__WOODLAND_E2E_LOCKED_TREE = lockedTreeId;
 }
 function fundingMessage() {
+  if (state.playerActive) {
+    const available = (state.walletVtxos || [])
+      .filter((vtxo) => vtxo.assets.length === 0)
+      .reduce((sats, vtxo) => sats + vtxo.amountSats, 0);
+    return `${available} asset-free wallet sats available for renewal fees`;
+  }
   if (state.activationBlockedReason) return state.activationBlockedReason;
   if (state.fundingRequiredSats <= 0) return 'No additional player funding required';
   return `Deposit ${state.fundingRequiredSats} sats to the Arkade address above`;
@@ -949,7 +956,7 @@ function render() {
   hudOnline.textContent = String(nearbyPlayerCount());
   hudPosition.textContent = `(${player.x}, ${player.y})`;
 
-  onboarding.hidden = playerActive;
+  walletHeading.textContent = playerActive ? 'Wallet / top up' : 'Create player';
   dashboard.classList.toggle('player-active', playerActive);
   bagPanel.hidden = !playerActive;
   statsPanel.hidden = !playerActive;
@@ -969,7 +976,9 @@ function render() {
 
 
   onboardingNote.classList.toggle('error', Boolean(state.activationBlockedReason));
-  if (state.activationBlockedReason) {
+  if (playerActive) {
+    onboardingNote.textContent = `The ${state.dustSats}-sat player deposit stays locked. If Arkade charges renewal fees, send a separate asset-free VTXO to this address, then press Refresh.`;
+  } else if (state.activationBlockedReason) {
     onboardingNote.textContent = state.activationBlockedReason;
   } else if (state.fundingRequiredSats > 0) {
     onboardingNote.textContent = 'Send from any Arkade wallet, then press Refresh.';
@@ -1031,6 +1040,7 @@ function render() {
     : '0';
   emulator.textContent = `${state.emulatorVersion} / ${state.emulatorSigner.slice(0, 12)}...`;
 
+  activateButton.hidden = playerActive;
   activateButton.disabled = walking || busy || playerActive || !state.activationReady;
   activateButton.textContent = busy && !playerActive ? 'Creating player...' : 'Create player';
   resetProfileButton.hidden = playerActive || !localStorage.getItem(profileStorageKey);
@@ -1159,6 +1169,7 @@ function setBackupStatus(message, isError = false) {
 
 function createPlayerBackup() {
   if (!app || !state || !worldManifest) throw new Error('Player wallet is not ready');
+  const profile = JSON.parse(app.exportProfile());
   return {
     format: PLAYER_BACKUP_FORMAT,
     version: PLAYER_BACKUP_VERSION,
@@ -1166,10 +1177,10 @@ function createPlayerBackup() {
     gameId: worldManifest.gameId,
     protocolVersion: worldManifest.protocolVersion,
     network: worldManifest.network,
-    genesisTxid: state.genesisTxid,
-    walletAddress: state.address,
+    genesisTxid: profile.genesisTxid,
+    walletAddress: app.address(),
     secretKey: app.exportKey(),
-    playerAsset: state.playerAsset || null,
+    playerAsset: profile.playerAsset || null,
     position: state.playerActive ? { x: player.x, y: player.y } : null,
   };
 }
@@ -1313,7 +1324,21 @@ async function restorePlayerBackup(file) {
 }
 
 async function renewPlayer() {
-  return app.renewPlayer();
+  try {
+    const renewed = await app.renewPlayer();
+    lastRenewalError = null;
+    status.classList.remove('error');
+    status.textContent = 'Player session renewed.';
+    return renewed;
+  } catch (error) {
+    const message = `Player renewal failed: ${error}`;
+    if (lastRenewalError !== message) appendLog(message);
+    lastRenewalError = message;
+    status.classList.add('error');
+    status.textContent = message;
+    render();
+    throw error;
+  }
 }
 
 async function refreshWorld() {
@@ -1460,9 +1485,10 @@ chatForm.addEventListener('submit', (event) => {
 craftAxeButton.addEventListener('click', () => {
   const recipe = state?.nextAxeRecipe;
   if (!recipe) return;
+  const expectedOutpoint = state.playerStateOutpoint;
   run(
     `Crafting ${axeName(recipe.axe)} under the player covenant...`,
-    () => withApp(() => app.craftAxe()),
+    () => withApp(() => app.craftAxe(expectedOutpoint)),
     () => `${axeName(state.playerAxe)} crafted and equipped.`,
   );
 });
@@ -1618,8 +1644,8 @@ async function boot() {
       render();
       return state;
     };
-    globalThis.__WOODLAND_E2E_CRAFT_AXE = async () => {
-      adoptState(await withApp(() => app.craftAxe()));
+    globalThis.__WOODLAND_E2E_CRAFT_AXE = async (expectedOutpoint = state.playerStateOutpoint) => {
+      adoptState(await withApp(() => app.craftAxe(expectedOutpoint)));
       render();
       return state;
     };
@@ -1747,7 +1773,7 @@ setInterval(async () => {
       && !delegatedRenewal
     ) {
       status.textContent = 'Rolling player state into a fresh Arkade batch...';
-      adoptState(await renewPlayer());
+      adoptState(await withApp(renewPlayer));
     }
     persistProfile();
     render();

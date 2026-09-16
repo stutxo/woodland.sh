@@ -1719,13 +1719,19 @@ async fn run_one_renewal(
 /// Wait for the indexer to expose the renewed VTXO, then return its record.
 async fn wait_for_record(
     rest: &ArkadeRest,
-    script_hex: &str,
+    script: &bitcoin::ScriptBuf,
     outpoint: OutPoint,
 ) -> Result<VtxoRecord> {
     for _ in 0..INDEX_ATTEMPTS {
-        let records = rest.get_vtxos(script_hex, "spendableOnly").await?;
-        if let Some(record) = records.iter().find(|record| record.outpoint == outpoint) {
-            return Ok(record.clone());
+        let records = rest.get_vtxos_by_outpoints(&[outpoint]).await?;
+        if let Some(record) = records.into_iter().find(|record| {
+            record.outpoint == outpoint
+                && record.script == *script
+                && !record.is_spent
+                && !record.is_swept
+                && !record.is_unrolled
+        }) {
+            return Ok(record);
         }
         tokio::time::sleep(std::time::Duration::from_millis(INDEX_POLL_MS)).await;
     }
@@ -1783,7 +1789,7 @@ async fn renew_current_tree(
     let tree_id = crate::renewal::tree_state_from_tx(previous_tx)?
         .map(|state| state.tree_id)
         .ok_or_else(|| anyhow!("tree transaction has no state packet"))?;
-    let tree_script = world.contract.vtxo.script_pubkey().to_hex_string();
+    let tree_script = world.contract.vtxo.script_pubkey();
     let old_expires_at = record.expires_at;
     let prepared = crate::renewal::prepare_tree(
         record,

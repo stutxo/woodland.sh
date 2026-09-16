@@ -184,12 +184,12 @@ async function createBrowser(driverUrl) {
       });
     }).catch((error) => done({ ok: false, message: String(error) }));
   `, [tree.treeId, tree.treeOutpoint, state.playerStateOutpoint, tree.nextDrop]);
-  const craft = () => executeAsync(`
+  const craft = (expectedOutpoint) => executeAsync(`
     const done = arguments[arguments.length - 1];
-    globalThis.__WOODLAND_E2E_CRAFT_AXE()
+    globalThis.__WOODLAND_E2E_CRAFT_AXE(arguments[0])
       .then(() => done({ ok: true }))
       .catch((error) => done({ ok: false, failure: String(error) }));
-  `);
+  `, [expectedOutpoint]);
   const renew = () => executeAsync(`
     const done = arguments[arguments.length - 1];
     globalThis.__WOODLAND_E2E_RENEW_PLAYER()
@@ -309,6 +309,7 @@ try {
   let testedStoneBoundary = false;
   let testedIronBoundary = false;
   const crafts = [];
+  const staleCrafts = [];
 
   const selectNextTree = async () => {
     treeIndex += 1;
@@ -333,7 +334,7 @@ try {
 
   const assertCraftRejected = async (pattern, label) => {
     const before = current.player;
-    const result = await browser.craft();
+    const result = await browser.craft(before.playerStateOutpoint);
     assert.equal(result.ok, false, `${label}: craft unexpectedly succeeded`);
     assert.match(result.failure || '', pattern, label);
     const unchanged = await browser.inspect();
@@ -345,11 +346,36 @@ try {
     current.player = playerView(unchanged.state);
   };
 
+  const assertStaleCraftRejected = async (expectedOutpoint, label) => {
+    const before = current.player;
+    assert.equal(before.craftAxeReady, true, `${label}: next tier must be affordable`);
+    assert.notEqual(expectedOutpoint, before.playerStateOutpoint, `${label}: stale input`);
+    const assetIds = [manifest.logAsset, manifest.stoneAsset, manifest.ironOreAsset];
+    const supplies = await Promise.all(assetIds.map((id) => fetchAssetSupply(arkadeBase, id)));
+    const result = await browser.craft(expectedOutpoint);
+    assert.equal(result.ok, false, `${label}: stale request advanced to the next tier`);
+    const refreshed = await browser.refreshWorld();
+    assert.equal(refreshed.failure, undefined, refreshed.failure);
+    for (const field of [
+      'playerStateOutpoint', 'playerAsset', 'playerXp', 'playerLuckCredit',
+      'playerAxe', 'playerLogs', 'playerStone', 'playerIronOre', 'walletSats',
+    ]) {
+      assert.equal(refreshed.state[field], before[field], `${label}: changed ${field}`);
+    }
+    assert.deepEqual(
+      await Promise.all(assetIds.map((id) => fetchAssetSupply(arkadeBase, id))),
+      supplies,
+      `${label}: stale request burned assets`,
+    );
+    current.player = playerView(refreshed.state);
+    staleCrafts.push({ expectedOutpoint, retainedOutpoint: before.playerStateOutpoint });
+  };
+
   const craftTier = async (recipe) => {
     const before = current.player;
     assert.equal(before.nextAxeRecipe?.axe, recipe.axe, `${recipe.axe}: next recipe`);
     assert.equal(before.craftAxeReady, true, `${recipe.axe}: recipe readiness`);
-    const result = await browser.craft();
+    const result = await browser.craft(before.playerStateOutpoint);
     assert.equal(result.ok, true, `${recipe.axe}: ${result.failure || 'craft failed'}`);
     const crafted = await browser.inspect();
     const after = playerView(crafted.state);
@@ -488,6 +514,7 @@ try {
       && current.player.playerLogs >= manifest.axeRecipes[1].logCost
       && current.player.playerStone >= manifest.axeRecipes[1].stoneCost
     ) {
+      await assertStaleCraftRejected(crafts[0].before, 'replayed Wooden Axe request');
       await craftTier(manifest.axeRecipes[1]);
       await assertCraftRejected(/requires Woodcutting level 15/, 'early Iron Axe');
     }
@@ -505,6 +532,7 @@ try {
       && current.player.playerLogs >= manifest.axeRecipes[2].logCost
       && current.player.playerIronOre >= manifest.axeRecipes[2].ironOreCost
     ) {
+      await assertStaleCraftRejected(crafts[1].before, 'replayed Stone Axe request');
       await craftTier(manifest.axeRecipes[2]);
     }
     if (successes > 0 && successes % 25 === 0 && success) {
@@ -518,6 +546,7 @@ try {
   assert.equal(testedStoneBoundary, true, 'Stone Axe exact level boundary was not exercised');
   assert.equal(testedIronBoundary, true, 'Iron Axe exact level boundary was not exercised');
   assert.deepEqual(crafts.map(({ axe }) => axe), ['wooden', 'stone', 'iron']);
+  assert.equal(staleCrafts.length, 2, 'prior-tier stale craft requests were not exercised');
   assert.ok(stoneFinds >= 2, 'progression did not find enough STONE');
   assert.ok(ironOreFinds >= 2, 'progression did not find enough IRON ORE');
   await assertCraftRejected(/already the highest tier/, 'maximum Iron Axe tier');
@@ -649,6 +678,7 @@ try {
     logDropBasisPoints: view.state.logDropBasisPoints,
     treesUsed: treeIndex + 1,
     crafts,
+    staleCrafts,
     indexedAssetSupplies: {
       tree: treeSupply,
       log: logSupply,

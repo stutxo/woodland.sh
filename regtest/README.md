@@ -15,19 +15,21 @@ Open `http://127.0.0.1:8000/`. `woodland-server` serves both `dist/` and every
 `/v1/*` API on that origin. Gameplay calls local arkd on 7070 and the stock
 emulator on 7073. A separate local renewal watcher runs alongside Axum.
 
-Protocol v3 uses signed manifest schema 3. A fresh world creates three fixed-supply
+Protocol v3 uses signed manifest schema 3. A fresh world creates five fixed-supply
 groups:
 
 ```text
 group 0:       420 TREE
 group 1: 21,000,000 LOG
 group 2: 21,000,000 XP asset units
+group 3: 21,000,000 STONE
+group 4: 21,000,000 IRON ORE
 ```
 
-Each tree receives one TREE, 50,000 LOG, 50,000 XP asset units, health ten, and
-330 sats. Every earned XP unit represents 25 Woodcutting XP, so each tree backs
-1,250,000 Woodcutting XP. Both complete asset supplies are distributed across
-exactly 420 tree-local reserves.
+Each tree receives one TREE, 50,000 units each of LOG, XP, STONE, and IRON ORE,
+health ten, and 330 sats. Every earned XP unit represents 25 Woodcutting XP, so
+each tree backs 1,250,000 Woodcutting XP. All four complete inventory supplies
+are distributed across exactly 420 tree-local reserves.
 Bootstrap funding is 138,600 sats. There is no vault, control asset,
 PLAYER_TICKET, allocator reserve, invitation, or player registry.
 
@@ -150,13 +152,16 @@ independently before creating irreversible assets.
 ```bash
 ./scripts/test-regtest.sh smoke
 ./scripts/test-regtest.sh full
+./scripts/test-regtest.sh progression
 ./scripts/test-regtest.sh soak
 ./scripts/test-regtest.sh chaos
 ./scripts/test-regtest.sh regrowth
 ```
 
-Smoke uses two browsers and full uses four. Soak defaults to 12 independent
-players racing one shared tree for 30 rounds; player count, rounds, tree groups,
+Smoke uses two browsers and full uses four. Progression farms both materials,
+crafts all three axe tiers, rejects stale recipe retries, and renews Iron Axe
+state. Soak defaults to 12 independent players racing one shared tree for 30
+rounds; player count, rounds, tree groups,
 activation/race concurrency, inter-round delay, and rotating browser reloads are
 configurable through `WOODLAND_SOAK_*`. All profiles serve the bundle and API from
 `woodland-server` on port 8090.

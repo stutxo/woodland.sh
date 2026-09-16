@@ -172,6 +172,11 @@ untouched. The browser registers the intent, follows Arkade's batch event
 stream, contributes tree nonces/signatures, obtains emulator forfeit
 signatures, and validates the new expiry itself.
 
+The active player's **Wallet / top up** panel keeps the receive address and copy
+button visible. It shows asset-free wallet sats separately from the locked
+330-sat player deposit. Top up with a separate asset-free VTXO and press
+**Refresh** when renewal needs fees; renewal failures remain visible in status.
+
 Tree lifecycle uses two disjoint leaves. Funded-stump regrowth is permissionless
 apart from the Arkade operator and tweaked emulator closure, and may only change
 health from zero to ten. Exact-state maintenance handles active trees and
@@ -263,8 +268,9 @@ retains only the newest 200 messages in memory.
 Players can separately enable or revoke delegated renewal. When configured with
 the manifest's rollover key, the server renews opted-in state near expiry through
 the covenant's exact-self-send watchtower leaf. That key cannot transfer or
-alter player state. If the server becomes unreachable, an online browser falls
-back to its owner-authorized renewal path.
+alter player state. If the server becomes unreachable or reports delegation
+unavailable, an online browser falls back to its owner-authorized renewal path,
+even when the player's saved delegation preference remains enabled.
 
 Registration persists; presence and chat do not survive a server restart.
 Registration has no self-service deletion endpoint, so clearing browser storage
@@ -297,7 +303,9 @@ collapsible, with level, XP, LOG, and online count kept in the map HUD.
 
 Browser storage uses `woodland.sh:web:v2:*`. **New test wallet** clears the
 local key, profile (including PLAYER_ID), pending swing, and position. It does
-not delete a durable server registration.
+not delete a durable server registration. Player backups use the persisted
+profile's PLAYER_ID rather than the last rendered snapshot, so a failed
+post-activation refresh cannot omit the selected identity.
 
 For a public protocol-v3 Mutinynet world, `run-mutinynet.sh` deploys or resumes
 the world, builds the same-origin bundle, and runs the renewal watcher and Axum:

@@ -575,8 +575,14 @@ impl WoodlandApp {
     }
 
     #[wasm_bindgen(js_name = craftAxe)]
-    pub async fn craft_axe(&mut self) -> Result<JsValue, JsValue> {
-        self.craft_axe_inner().await.map_err(js_err)?;
+    pub async fn craft_axe(&mut self, expected_outpoint: String) -> Result<JsValue, JsValue> {
+        let expected_outpoint = expected_outpoint
+            .parse()
+            .context("parse expected player state outpoint")
+            .map_err(js_err)?;
+        self.craft_axe_inner(expected_outpoint)
+            .await
+            .map_err(js_err)?;
         self.refresh().await
     }
     pub async fn refresh(&mut self) -> Result<JsValue, JsValue> {
@@ -972,7 +978,13 @@ impl WoodlandApp {
         let trees_to_refresh = self
             .trees
             .iter()
-            .filter(|tree| self.tree_viewport.contains(tree.state))
+            .filter(|tree| {
+                self.tree_viewport.contains(tree.state)
+                    || self
+                        .pending_chop
+                        .as_ref()
+                        .is_some_and(|pending| pending.tree_id == tree.state.tree_id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         let expected_tree_count = if initializing_trees {
@@ -1175,7 +1187,12 @@ impl WoodlandApp {
             None => None,
         };
         self.wallet_records = wallet_records;
-        self.reconcile_pending_chop()?;
+        // Deployment placeholders are not indexed state and cannot prove a
+        // pending swing conflicted. The next pass resolves its tree, including
+        // when that tree is outside the current viewport.
+        if !initializing_trees {
+            self.reconcile_pending_chop()?;
+        }
         Ok(())
     }
 
@@ -1294,7 +1311,8 @@ impl WoodlandApp {
             None => None,
         };
         self.wallet_records = wallet_records;
-        self.reconcile_pending_chop()
+        // Only a world sync refreshes both inputs needed to reconcile a swing.
+        Ok(())
     }
 
     fn player_contract(&self) -> Result<PlayerContract> {
@@ -1487,7 +1505,7 @@ impl WoodlandApp {
         let txid = pending.txid()?;
         wait_for_vtxo(
             &self.rest,
-            &contract.vtxo.script_pubkey().to_hex_string(),
+            &contract.vtxo.script_pubkey(),
             OutPoint {
                 txid,
                 vout: u32::from(crate::protocol::PLAYER_STATE_OUTPUT_INDEX),
@@ -1496,7 +1514,7 @@ impl WoodlandApp {
         .await?;
         wait_for_vtxo(
             &self.rest,
-            &self.world.contract.vtxo.script_pubkey().to_hex_string(),
+            &self.world.contract.vtxo.script_pubkey(),
             OutPoint {
                 txid,
                 vout: u32::from(crate::protocol::TREE_OUTPUT_INDEX),
@@ -1605,7 +1623,7 @@ impl WoodlandApp {
         .context("submit permissionless player activation")?;
         wait_for_vtxo(
             &self.rest,
-            &contract.vtxo.script_pubkey().to_hex_string(),
+            &contract.vtxo.script_pubkey(),
             OutPoint {
                 txid,
                 vout: u32::from(crate::protocol::ACTIVATION_STATE_OUTPUT_INDEX),
@@ -1674,7 +1692,7 @@ impl WoodlandApp {
         }
         wait_for_vtxo(
             &self.rest,
-            &state.contract.vtxo.script_pubkey().to_hex_string(),
+            &state.contract.vtxo.script_pubkey(),
             OutPoint {
                 txid,
                 vout: u32::from(crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX),
@@ -1685,7 +1703,7 @@ impl WoodlandApp {
         Ok(())
     }
 
-    async fn craft_axe_inner(&mut self) -> Result<()> {
+    async fn craft_axe_inner(&mut self, expected_outpoint: OutPoint) -> Result<()> {
         self.sync_player().await?;
         if let Some(pending) = &self.pending_chop {
             return Err(anyhow!(
@@ -1697,6 +1715,9 @@ impl WoodlandApp {
             .player_state
             .clone()
             .ok_or_else(|| anyhow!("activate the player before crafting an axe"))?;
+        if state.record.outpoint != expected_outpoint {
+            return Err(anyhow!("player state changed; refresh before crafting"));
+        }
         let player_asset = self.require_player_asset()?;
         let prepared = crate::chop::prepare_craft(
             &self.keys,
@@ -1724,7 +1745,7 @@ impl WoodlandApp {
         }
         wait_for_vtxo(
             &self.rest,
-            &state.contract.vtxo.script_pubkey().to_hex_string(),
+            &state.contract.vtxo.script_pubkey(),
             expected_outpoint,
         )
         .await?;
@@ -1818,7 +1839,7 @@ impl WoodlandApp {
             .await?;
         let renewed = wait_for_vtxo(
             &self.rest,
-            &state.contract.vtxo.script_pubkey().to_hex_string(),
+            &state.contract.vtxo.script_pubkey(),
             outcome.outpoint,
         )
         .await?;
@@ -1893,7 +1914,7 @@ impl WoodlandApp {
             .await?;
         wait_for_vtxo(
             &self.rest,
-            &self.world.contract.vtxo.script_pubkey().to_hex_string(),
+            &self.world.contract.vtxo.script_pubkey(),
             outcome.outpoint,
         )
         .await?;
@@ -2122,7 +2143,7 @@ impl WoodlandApp {
         )?;
         let state_record = wait_for_vtxo(
             &self.rest,
-            &state.contract.vtxo.script_pubkey().to_hex_string(),
+            &state.contract.vtxo.script_pubkey(),
             OutPoint {
                 txid: chop_txid,
                 vout: u32::from(crate::protocol::PLAYER_STATE_OUTPUT_INDEX),
@@ -2131,7 +2152,7 @@ impl WoodlandApp {
         .await?;
         let tree_record = wait_for_vtxo(
             &self.rest,
-            &self.world.contract.vtxo.script_pubkey().to_hex_string(),
+            &self.world.contract.vtxo.script_pubkey(),
             OutPoint {
                 txid: chop_txid,
                 vout: u32::from(crate::protocol::TREE_OUTPUT_INDEX),
@@ -2555,13 +2576,20 @@ fn player_vtxo(keys: &Keys, params: &ServerParams) -> Result<ark_core::Vtxo> {
     txbuild::player_vtxo(keys, params)
 }
 
-async fn wait_for_vtxo(rest: &ArkadeRest, script: &str, outpoint: OutPoint) -> Result<VtxoRecord> {
+async fn wait_for_vtxo(
+    rest: &ArkadeRest,
+    script: &bitcoin::ScriptBuf,
+    outpoint: OutPoint,
+) -> Result<VtxoRecord> {
     for _ in 0..INDEX_ATTEMPTS {
-        let records = rest.get_vtxos(script, "spendableOnly").await?;
-        if let Some(record) = records
-            .into_iter()
-            .find(|record| record.outpoint == outpoint)
-        {
+        let records = rest.get_vtxos_by_outpoints(&[outpoint]).await?;
+        if let Some(record) = records.into_iter().find(|record| {
+            record.outpoint == outpoint
+                && record.script == *script
+                && !record.is_spent
+                && !record.is_swept
+                && !record.is_unrolled
+        }) {
             return Ok(record);
         }
         txbuild::sleep_ms(INDEX_POLL_MS).await;

@@ -224,9 +224,11 @@ LOG bit, and material outcome. Reject locally if any changed after refresh.
 
 ## Build an Axe Craft
 
-Refresh player state and derive the sole recipe from its current axe tier.
-Require the recipe's level and balances locally, but treat the covenant as
-authoritative. Build one input and three outputs:
+Capture the player-state outpoint alongside the displayed recipe. Before
+building, refresh player state and reject the request if that outpoint changed;
+do not silently reinterpret a retry as the next axe tier. Derive the recipe from
+the matching state, require its level and balances locally, and treat the
+covenant as authoritative. Build one input and three outputs:
 
 ```text
 input/output 0: player state
@@ -239,7 +241,8 @@ exact recipe burn. Replace packet type 9 with the next tier, keep canonical
 asset group order, and include no destination output. Execute with the craft
 Arkade Script, owner signature, and checkpoint before finalizing through Arkade.
 After settlement, verify the exact tier and balance deltas; an emulator success
-response alone is not completion.
+response alone is not completion. After an unknown outcome, refresh and show
+the settled tier before accepting another craft request.
 
 ## Unknown Outcomes
 
@@ -251,6 +254,13 @@ and both inputs remain current, retry only the exact persisted PSBT. The
 reference client does this after a bounded reconcile poll that gives the
 original submission time to land; resubmitting against a still in-flight
 original can trip the service's concurrent-spend protection.
+
+Reconcile only after refreshing both indexed inputs, including the pending
+tree when it lies outside the viewport. A player-only refresh or a tree's
+deployment placeholder is not evidence that the saved input was superseded.
+Keep the journal across reload until the exact result or conflicting spend is
+established. Poll known output outpoints directly, validating their expected
+scripts and rejecting spent, swept, or unrolled records.
 
 The reference key is `woodland.sh:web:v2:pending:<arkade-url>:<genesis-txid>`.
 
@@ -299,6 +309,10 @@ client.regrow(tree_id).await?;         // permissionless one-batch regrowth
 let outpoint = client.renew_player().await?;
 ```
 
+For an external recipient, pass `Some(bitcoin::Address)` encoding that
+recipient's Arkade VTXO script. This is an offchain LOG transfer, not an onchain
+Bitcoin withdrawal; settlement checks the recipient's exact output.
+
 `connect` authenticates and validates the manifest against the live services
 and pins the batch flow to its forfeit identity. `craft_axe` derives the only
 next recipe, builds and signs its covenant self-send, and verifies the settled
@@ -336,8 +350,12 @@ resumePendingChop()
 renewPlayer()
 regrow(treeId)
 withdrawLog(amount)
-craftAxe()
+craftAxe(expectedPlayerStateOutpoint)
 ```
+
+Backups must use `exportProfile()` for the genesis and selected PLAYER_ID,
+not the last rendered snapshot: activation may have persisted the identity
+before a later refresh failed.
 
 Snapshots expose `playerStone`, `playerIronOre`, `playerAxe`, `nextAxeRecipe`,
 `craftAxeReady`, both material AssetIds, and each tree's material reserves.
