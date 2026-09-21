@@ -58,9 +58,9 @@ dependencies = [
 [[package]]
 name = "ark-fees"
 version = "0.10.1"
-source = "git+https://github.com/arkade-os/rust-sdk?rev=adcb5a8c76ebb14145cddcb0bb685973bc2a981c#adcb5a8c76ebb14145cddcb0bb685973bc2a981c"
 dependencies = [
  "cel",
+ "js-sys",
 ]
 
 [[package]]
@@ -2062,7 +2062,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "woodland"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "ark-core",

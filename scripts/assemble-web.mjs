@@ -2,6 +2,7 @@
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const [rawManifestPath, rawOutputPath] = process.argv.slice(2);
@@ -19,10 +20,10 @@ const expectedAxeRecipes = [
   { axe: 'iron', requiredLevel: 15, logCost: 5, stoneCost: 0, ironOreCost: 2 },
 ];
 if (
-  manifest.schemaVersion !== 3
-  || manifest.protocolVersion !== 3
+  manifest.schemaVersion !== 4
+  || manifest.protocolVersion !== 4
   || manifest.gameId !== 'woodland.sh'
-  || manifest.rulesetId !== 'woodland.sh/forest/v3'
+  || manifest.rulesetId !== 'woodland.sh/forest/v4'
   || manifest.woodcuttingXpPerLog !== 25
   || !/^[0-9a-f]{68}$/.test(manifest.stoneAsset || '')
   || !/^[0-9a-f]{68}$/.test(manifest.ironOreAsset || '')
@@ -32,11 +33,11 @@ if (
   || manifest.ironOreDropBasisPoints !== 200
   || manifest.ironOreUnlockLevel !== 10
   || manifest.maxLogDropBasisPoints !== 3_800
-  || JSON.stringify(manifest.axeRecipes) !== JSON.stringify(expectedAxeRecipes)
+  || !isDeepStrictEqual(manifest.axeRecipes, expectedAxeRecipes)
   || !/^[0-9a-f]{64}$/.test(manifest.deployerSigner || '')
   || !/^[0-9a-f]{128}$/.test(manifest.manifestSignature || '')
 ) {
-  throw new Error('web bundle requires a signed woodland.sh protocol v3 schema 3 manifest');
+  throw new Error('web bundle requires a signed woodland.sh protocol v4 schema 4 manifest');
 }
 
 const arkade = new URL(manifest.arkadeServiceUrl);

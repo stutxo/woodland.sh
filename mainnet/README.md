@@ -4,6 +4,11 @@ This directory contains public templates only. Never commit generated mnemonics,
 child private keys, filled environment files, or deployment logs containing
 secrets.
 
+These instructions target package 4.0.0, protocol 4, signed schema 4, and
+ruleset `woodland.sh/forest/v4`. Deploy a fresh v4 genesis with new world assets
+and a new signed manifest. Never reuse v3 assets, deployment outpoints, or
+manifests, and do not point v4 services at a v3 world.
+
 ## Two-root key hierarchy
 
 Use two independent 24-word BIP39 roots:
@@ -48,7 +53,7 @@ Build and run the utility on an offline Linux machine from a reviewed checkout:
 ```bash
 cargo build --release --locked --features keygen --bin woodland-keygen
 umask 077
-./target/release/woodland-keygen generate /media/offline/woodland-mainnet-v3
+./target/release/woodland-keygen generate /media/offline/woodland-mainnet-v4
 ```
 
 The command refuses to overwrite an existing destination and creates:
@@ -127,8 +132,8 @@ signer between clients and that endpoint.
 Follow the deployment sequence in the repository `README.md`:
 
 1. run `woodland-operator status` before funding;
-2. require the proposed manifest to report signed schema 3, protocol 3, and
-   ruleset `woodland.sh/forest/v3`;
+2. require the proposed manifest to report signed schema 4, protocol 4, and
+   ruleset `woodland.sh/forest/v4`;
 3. fund clean VTXOs at the reported address whose total exactly equals the
    reported amount (138,600 sats at 330-sat dust);
 4. run `woodland-operator ensure` until complete;
@@ -138,6 +143,14 @@ Follow the deployment sequence in the repository `README.md`:
    and axe recipes, and exactly 420 tree VTXOs, each with 50,000 LOG, XP, STONE,
    and IRON ORE units, health ten, and fixed issued supplies;
 7. back up and commit the public manifest.
+
+Before funding, run `./scripts/test-covenants.sh` with Go 1.26.5 or newer in
+addition to the native, WASM, and live regtest checks. The v4 tree must
+authenticate the complete six-leaf player template using the 32-byte owner key
+and one compressed-output prefix byte (`0x02` or `0x03`); player covenants pin
+the immutable TREE AssetId. Verify the additional Wooden Axe gate of one earned
+XP asset unit (25 Woodcutting XP) alongside its one-LOG recipe. Stone and Iron
+retain their level-5 and level-15 thresholds.
 
 After verification, remove `WOODLAND_DEPLOYER_SECRET` from online systems. If
 the deployer has no spendable VTXO or change, its deployment root may be
@@ -260,7 +273,9 @@ Build the Axum server and a same-origin web bundle separately from the watcher:
 
 ```bash
 cargo build --release --locked --features server --bin woodland-server
-WOODLAND_SERVER_URL=self \
+WOODLAND_NETWORK=bitcoin \
+  WOODLAND_WORLD_MANIFEST=/absolute/path/to/verified-mainnet-world.json \
+  WOODLAND_SERVER_URL=self \
   WOODLAND_WASM_FEATURES=woodland-app \
   ./scripts/build-web.sh
 sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin woodland-server
@@ -292,6 +307,8 @@ changing the public URL or pointing the server at a redeployed world
 invalidates every stored registration and the server refuses to start: stop
 it, remove `players.json`, and let players re-register.
 `WOODLAND_SERVER_WEB_ROOT` makes Axum serve the bundle on that same origin.
+The build requires an explicit manifest path, and server startup rejects a
+bundle whose signed `world.json` differs from `WOODLAND_WORLD_MANIFEST`.
 `WOODLAND_SERVER_ORIGIN` is needed only to allow a separate static frontend
 such as GitHub Pages. Public origins must use HTTPS on mainnet.
 
@@ -329,9 +346,21 @@ sudo journalctl -u woodland-server.service -f
 curl --fail https://replace-with-server-api.example/health.json
 ```
 
-Monitor `ready`, `lastRefreshAt`, `lastError`, `onlinePlayers`,
+Monitor `ready`, `lastRefreshAt`, `lastRenewalAt`, `lastError`, `onlinePlayers`,
 `delegationAvailable`, process restarts, registry size, Arkade/emulator latency,
-and disk writes. Signed registration and delegation persist in
+and disk writes.
+`/health.json` returns HTTP 503 while verification or configured delegated
+renewal has failed or stopped making successful progress. Verification has a
+two-minute freshness window; renewal has twelve minutes to allow a bounded
+batch join and cleanup. Both windows are at least three configured refresh
+intervals. Each completed player renewal advances progress during a long
+queue. The leaderboard reports delegation unavailable when either worker fails
+or becomes stale so online players can renew with their own keys. The browser
+also falls back to owner renewal within the final thirty minutes before
+expiry, even if the server remains responsive. Monitor renewal errors and keep
+both the rollover and player fee wallets funded.
+
+Signed registration and delegation persist in
 `/var/lib/woodland-server/players.json`; presence expires after 60 seconds and
 the newest 200 chat messages remain in memory only. Registration has no
 self-service deletion API. Honor removal requests by stopping the service,

@@ -1,13 +1,16 @@
-# woodland.sh Tree Protocol v3
+# woodland.sh Tree Protocol v4
 
 ## Status
 
-Protocol v3 uses signed manifest schema 3, stock arkd, and the stock Arkade
-Script emulator. Genesis metadata commits `game=woodland.sh`, `protocol=3`,
-`ruleset=woodland.sh/forest/v3`, one of `TREE`, `LOG`, `XP`, `STONE`, or
+Protocol v4 uses signed manifest schema 4, stock arkd, and the stock Arkade
+Script emulator. Genesis metadata commits `game=woodland.sh`, `protocol=4`,
+`ruleset=woodland.sh/forest/v4`, one of `TREE`, `LOG`, `XP`, `STONE`, or
 `IRON ORE`, and the exact deployer and rollover signers. The deployer signs
 every manifest field with BIP340; invalid, incomplete, or unknown manifests
 fail closed.
+
+Version 4 changes covenant authentication and requires a fresh genesis. Never
+reuse v3 assets, deployment outpoints, or signed manifests for a v4 world.
 
 ## Genesis
 
@@ -84,8 +87,18 @@ selected at 2% before the STONE range. A miss moves neither.
 It also requires the canonical two-input/four-output shape, ordered uncontrolled
 asset groups, one conserved TREE marker, recursive player and tree scripts,
 fixed sat values, preserved tree state, canonical player luck, and exact
-extension and anchor outputs. The player covenant pins this exact tree script,
-so both halves authorize the same transaction.
+extension and anchor outputs. The player covenant pins the immutable world
+TREE AssetId rather than this tree P2TR, breaking the circular dependency
+between player construction and tree authentication.
+
+The tree chop witness contains the owner's 32-byte x-only public key followed
+by one byte (`0x02` or `0x03`) identifying the compressed player output key's
+parity. The tree reconstructs all six player leaves: chop, owner renewal,
+watchtower renewal, LOG withdrawal, axe crafting, and the NUMS-keyed CSV exit.
+It verifies their canonical Taproot tree and NUMS internal key against input
+zero. Merely presenting an Arkade covenant or a valid chop leaf is insufficient;
+an extra unrestricted spending leaf also fails. The equipped axe must meet its
+earned-XP threshold: 1, 16, or 97 XP asset units for Wooden, Stone, or Iron.
 
 A successful final swing simply leaves output health zero. No stump-height
 packet, block witness, or timer participates.

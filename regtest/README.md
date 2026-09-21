@@ -1,7 +1,7 @@
 # woodland.sh Regtest
 
 This directory provides the minimal local stack used by woodland.sh protocol
-v3: Bitcoin Core, indexers, stock arkd/arkd-wallet, Redis, and the stock Arkade
+v4: Bitcoin Core, indexers, stock arkd/arkd-wallet, Redis, and the stock Arkade
 Script emulator.
 
 ## Run
@@ -15,7 +15,7 @@ Open `http://127.0.0.1:8000/`. `woodland-server` serves both `dist/` and every
 `/v1/*` API on that origin. Gameplay calls local arkd on 7070 and the stock
 emulator on 7073. A separate local renewal watcher runs alongside Axum.
 
-Protocol v3 uses signed manifest schema 3. A fresh world creates five fixed-supply
+Protocol v4 uses signed manifest schema 4. A fresh world creates five fixed-supply
 groups:
 
 ```text
@@ -25,6 +25,9 @@ group 2: 21,000,000 XP asset units
 group 3: 21,000,000 STONE
 group 4: 21,000,000 IRON ORE
 ```
+
+Version 4 requires a fresh genesis. Never reuse v3 assets, deployment outpoints,
+or manifests. Clean the local test stack before creating the v4 world.
 
 Each tree receives one TREE, 50,000 units each of LOG, XP, STONE, and IRON ORE,
 health ten, and 330 sats. Every earned XP unit represents 25 Woodcutting XP, so
@@ -40,6 +43,19 @@ XP asset remain in that state; user-facing Woodcutting XP is exactly 25 times
 the held XP asset balance.
 
 ## Commands
+
+With Go 1.26.5 or newer, run the covenant vectors through the pinned stock
+interpreter before the live profiles:
+
+```bash
+./scripts/test-covenants.sh
+```
+
+The v4 vectors cover full six-leaf player-template authentication by the tree
+and XP-backed axe tiers. Wooden requires one earned XP asset unit (25
+Woodcutting XP, one successful chop) before its one-LOG craft; Stone and Iron
+keep their existing level gates. Permissionless pre-entry roll/credit selection
+remains possible within the luck corridor, without granting a free axe.
 
 ```text
 ./scripts/regtest.sh start
@@ -72,7 +88,7 @@ c7c3184f5cd416e231023f717489a5b0550960cc
 ```
 
 The source defaults to `.cache/arkd-stock`. Startup verifies expected image tags
-and stock-emulator version before deployment. Protocol v3 requires no custom
+and stock-emulator version before deployment. Protocol v4 requires no custom
 arkd, emulator patch, or policy proxy.
 
 ## Renewal
@@ -110,7 +126,7 @@ The script writes the live manifest to its configured ignored path and builds a
 local `dist/` bundle.
 
 To publish Pages after a real deployment, copy the verified public signed
-schema-3 manifest to a deliberate tracked deployment path, then set
+schema-4 manifest to a deliberate tracked deployment path, then set
 `WOODLAND_PAGES_MANIFEST` to that path. Set `WOODLAND_SERVER_URL` to enable the
 optional social, leaderboard, and renewal-delegation UI.
 

@@ -85,6 +85,11 @@ struct CurrentTree {
     record: VtxoRecord,
     previous_tx: bitcoin::Transaction,
 }
+
+struct CurrentTrees {
+    trees: Vec<CurrentTree>,
+    pending: Vec<crate::world::PendingTreeLineage>,
+}
 fn require_mode_flag(name: &str, operation: &str) -> Result<()> {
     if std::env::var(name).as_deref() == Ok("1") {
         Ok(())
@@ -270,7 +275,7 @@ pub async fn run_cli() -> Result<()> {
             }
             let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
             let (renewed, missing_expiry) =
-                renew_world(&manifest_path, &rollover, &services).await?;
+                renew_expiring_trees(&manifest_path, &rollover, &services).await?;
             println!("{{\"renewed\":{renewed},\"missingExpiry\":{missing_expiry}}}");
             Ok(())
         }
@@ -279,19 +284,20 @@ pub async fn run_cli() -> Result<()> {
                 return Err(anyhow!("unexpected watch argument"));
             }
             let rollover = load_keys(ROLLOVER_SECRET_ENV)?;
-            let mut last_error = match renew_world(&manifest_path, &rollover, &services).await {
-                Ok((initial_renewed, _)) => {
-                    if initial_renewed > 0 {
-                        eprintln!("woodland.sh rolled over {initial_renewed} tree(s)");
+            let mut last_error =
+                match renew_expiring_trees(&manifest_path, &rollover, &services).await {
+                    Ok((initial_renewed, _)) => {
+                        if initial_renewed > 0 {
+                            eprintln!("woodland.sh rolled over {initial_renewed} tree(s)");
+                        }
+                        None
                     }
-                    None
-                }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    eprintln!("woodland.sh renewal watcher: {message}");
-                    Some(message)
-                }
-            };
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        eprintln!("woodland.sh renewal watcher: {message}");
+                        Some(message)
+                    }
+                };
             eprintln!("woodland.sh renewal watcher ready");
             let mut next_rollover = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(TREE_ROLLOVER_CHECK_SECS);
@@ -1108,33 +1114,21 @@ async fn execute_plan(
             distributed.push(wait_for_exact_vtxo(&services.rest, *outpoint).await?);
         }
     }
-    for (record, shard) in distributed.iter().zip(&plan.shards) {
-        require_asset_amount(record, world.tree_asset, shard.tree_count, "shard TREE")?;
-        require_asset_amount(
-            record,
-            world.log_asset,
-            LOG_RESERVE_PER_TREE * shard.tree_count,
-            "shard LOG",
-        )?;
-        require_asset_amount(
-            record,
-            world.xp_asset,
-            XP_PER_TREE * shard.tree_count,
-            "shard XP",
-        )?;
-        require_asset_amount(
-            record,
-            world.stone_asset,
-            STONE_RESERVE_PER_TREE * shard.tree_count,
-            "shard STONE",
-        )?;
-        require_asset_amount(
-            record,
-            world.iron_ore_asset,
-            IRON_ORE_RESERVE_PER_TREE * shard.tree_count,
-            "shard IRON ORE",
-        )?;
-    }
+    require_deployment_shards(
+        &plan.shards,
+        &distributed,
+        &[
+            (world.tree_asset, 1, "shard TREE"),
+            (world.log_asset, LOG_RESERVE_PER_TREE, "shard LOG"),
+            (world.xp_asset, XP_PER_TREE, "shard XP"),
+            (world.stone_asset, STONE_RESERVE_PER_TREE, "shard STONE"),
+            (
+                world.iron_ore_asset,
+                IRON_ORE_RESERVE_PER_TREE,
+                "shard IRON ORE",
+            ),
+        ],
+    )?;
 
     let results = stream::iter(plan.shards.iter().map(|shard| {
         execute_deployment_shard(
@@ -1164,6 +1158,37 @@ async fn execute_plan(
         plan.manifest.trees.len(),
         plan.manifest.genesis_txid
     );
+    Ok(())
+}
+
+/// Exact-outpoint lookups return records in arbitrary order, not shard order.
+fn require_deployment_shards(
+    shards: &[PlannedShard],
+    records: &[VtxoRecord],
+    assets: &[(AssetId, u64, &str)],
+) -> Result<()> {
+    let mut by_outpoint = std::collections::HashMap::with_capacity(records.len());
+    for record in records {
+        if by_outpoint.insert(record.outpoint, record).is_some() {
+            return Err(anyhow!("duplicate deployment shard {}", record.outpoint));
+        }
+    }
+    for shard in shards {
+        let source = OutPoint::from_str(&shard.source_outpoint)
+            .context("parse deployment shard outpoint")?;
+        let record = by_outpoint
+            .remove(&source)
+            .ok_or_else(|| anyhow!("missing or duplicate deployment shard {source}"))?;
+        for &(asset, per_tree, label) in assets {
+            let expected = per_tree
+                .checked_mul(shard.tree_count)
+                .ok_or_else(|| anyhow!("deployment shard asset amount overflow"))?;
+            require_asset_amount(record, asset, expected, label)?;
+        }
+    }
+    if !by_outpoint.is_empty() {
+        return Err(anyhow!("indexer returned unexpected deployment shards"));
+    }
     Ok(())
 }
 
@@ -1260,46 +1285,20 @@ async fn require_current_trees(
     manifest: &WorldManifest,
     world: &crate::world::ValidatedWorld,
 ) -> Result<()> {
-    load_current_trees(rest, manifest, world).await?;
-    Ok(())
-}
-async fn wait_for_current_trees(
-    rest: &ArkadeRest,
-    manifest: &WorldManifest,
-    world: &crate::world::ValidatedWorld,
-) -> Result<Vec<CurrentTree>> {
-    let mut last_error = None;
-    for attempt in 0..INDEX_ATTEMPTS {
-        match load_current_trees(rest, manifest, world).await {
-            Ok(trees) => return Ok(trees),
-            Err(error) => last_error = Some(error),
-        }
-        if attempt + 1 < INDEX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(INDEX_POLL_MS)).await;
-        }
+    let current = load_current_trees(rest, manifest, world).await?;
+    if let Some(pending) = current.pending.first() {
+        return Err(anyhow!(
+            "{pending} ({} pending tree lineage(s))",
+            current.pending.len()
+        ));
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("tree index reconciliation failed")))
-}
-
-async fn load_exact_tree_records(
-    rest: &ArkadeRest,
-    world: &crate::world::ValidatedWorld,
-) -> Result<Vec<VtxoRecord>> {
-    world.load_tree_lineage_records(rest, &world.trees).await
-}
-
-async fn load_exact_tree_records_for(
-    rest: &ArkadeRest,
-    world: &crate::world::ValidatedWorld,
-    declared: &[crate::world::ValidatedTree],
-) -> Result<Vec<VtxoRecord>> {
-    world.load_tree_lineage_records(rest, declared).await
+    Ok(())
 }
 async fn load_current_trees(
     rest: &ArkadeRest,
     manifest: &WorldManifest,
     world: &crate::world::ValidatedWorld,
-) -> Result<Vec<CurrentTree>> {
+) -> Result<CurrentTrees> {
     let contract = &world.contract;
     let tree_asset = world.tree_asset;
     let log_asset = world.log_asset;
@@ -1307,7 +1306,10 @@ async fn load_current_trees(
     let stone_asset = world.stone_asset;
     let iron_ore_asset = world.iron_ore_asset;
     let declared_trees = &world.trees;
-    let trees = load_exact_tree_records(rest, world).await?;
+    let resolved = world
+        .load_tree_lineage_records_partial(rest, declared_trees)
+        .await?;
+    let trees = resolved.current;
     let txids: Vec<_> = trees.iter().map(|record| record.outpoint.txid).collect();
     let transactions = rest.get_virtual_txs(&txids).await?;
     let mut seen_states = std::collections::HashMap::new();
@@ -1372,11 +1374,14 @@ async fn load_current_trees(
             previous_tx: transaction.clone(),
         });
     }
-    if seen_states.len() != declared_trees.len() {
+    if seen_states.len() + resolved.pending.len() != declared_trees.len() {
         return Err(anyhow!("not all declared trees are discoverable"));
     }
     current.sort_by_key(|tree| tree.state.tree_id);
-    Ok(current)
+    Ok(CurrentTrees {
+        trees: current,
+        pending: resolved.pending,
+    })
 }
 
 fn tree_rollover_due(
@@ -1434,9 +1439,11 @@ async fn renew_expiring_trees(
 ) -> Result<(usize, usize)> {
     let manifest = read_manifest(path)?;
     let world = manifest.validate(&participant_keys.secp, &services.params, &services.emulator)?;
-    let trees = wait_for_current_trees(&services.rest, &manifest, &world).await?;
+    let current = load_current_trees(&services.rest, &manifest, &world).await?;
+    report_pending_tree_lineages(&current.pending);
     let now = crate::arkade::now_unix();
-    let (candidates, missing_expiry) = partition_rollover_candidates(trees, world.log_asset, now);
+    let (candidates, missing_expiry) =
+        partition_rollover_candidates(current.trees, world.log_asset, now);
     if !missing_expiry.is_empty() {
         eprintln!(
             "woodland.sh rollover: {} live tree(s) have no indexed expiry and cannot be renewed",
@@ -1519,18 +1526,27 @@ async fn renew_expiring_trees(
             failures.join("; ")
         ));
     }
-    wait_for_current_trees(&services.rest, &manifest, &world)
+    // Validate the new frontier without waiting for unrelated accepted chops
+    // to become indexed. Each successful renewal already verifies its output.
+    let current = load_current_trees(&services.rest, &manifest, &world)
         .await
-        .context("verify the sole live lineage for every tree after rollover")?;
+        .context("verify tree lineages after rollover")?;
+    report_pending_tree_lineages(&current.pending);
     Ok((renewed, missing_expiry.len()))
 }
 
-async fn renew_world(
-    path: &Path,
-    participant_keys: &Keys,
-    services: &Services,
-) -> Result<(usize, usize)> {
-    renew_expiring_trees(path, participant_keys, services).await
+fn report_pending_tree_lineages(pending: &[crate::world::PendingTreeLineage]) {
+    if !pending.is_empty() {
+        eprintln!(
+            "woodland.sh rollover: {} tree lineage(s) deferred: {}",
+            pending.len(),
+            pending
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
 }
 
 fn clean_funding_balance(records: &[VtxoRecord]) -> Result<u64> {
@@ -1829,8 +1845,9 @@ async fn renew_tree(
         .iter()
         .find(|tree| tree.state.tree_id == tree_id)
         .ok_or_else(|| anyhow!("no declared tree {tree_id} in this world"))?;
-    let mut records =
-        load_exact_tree_records_for(&services.rest, &world, std::slice::from_ref(declared)).await?;
+    let mut records = world
+        .load_tree_lineage_records(&services.rest, std::slice::from_ref(declared))
+        .await?;
     let record = records
         .pop()
         .ok_or_else(|| anyhow!("no live tree {tree_id} in this world"))?;
@@ -2010,6 +2027,64 @@ mod tests {
         records.push(asset_bearing);
         assert_eq!(clean_funding_balance(&records).unwrap(), 158_000);
         assert_eq!(select_funding(&records, 158_000).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deployment_shards_match_exact_sources_in_arbitrary_index_order() {
+        let assets = [
+            (0, 1, "shard TREE"),
+            (1, LOG_RESERVE_PER_TREE, "shard LOG"),
+            (2, XP_PER_TREE, "shard XP"),
+            (3, STONE_RESERVE_PER_TREE, "shard STONE"),
+            (4, IRON_ORE_RESERVE_PER_TREE, "shard IRON ORE"),
+        ]
+        .map(|(group_index, amount, label)| {
+            (
+                AssetId {
+                    txid: funding_record(42, 0).outpoint.txid,
+                    group_index,
+                },
+                amount,
+                label,
+            )
+        });
+        let mut shards = Vec::new();
+        let mut records = Vec::new();
+        for index in 0..9 {
+            let tree_count = if index == 8 { 20 } else { 50 };
+            let mut record = funding_record(43, PROTOCOL_DUST_SATS * tree_count);
+            record.outpoint.vout = index;
+            record.assets = assets
+                .iter()
+                .map(|&(asset_id, per_tree, _)| Asset {
+                    asset_id,
+                    amount: per_tree * tree_count,
+                })
+                .collect();
+            shards.push(PlannedShard {
+                source_outpoint: record.outpoint.to_string(),
+                tree_count,
+                deployments: Vec::new(),
+            });
+            records.push(record);
+        }
+        records.reverse();
+        require_deployment_shards(&shards, &records, &assets).unwrap();
+        records.rotate_left(3);
+        require_deployment_shards(&shards, &records, &assets).unwrap();
+
+        assert!(require_deployment_shards(&shards, &records[..8], &assets).is_err());
+        let mut duplicate = records.clone();
+        duplicate[0] = duplicate[1].clone();
+        assert!(require_deployment_shards(&shards, &duplicate, &assets).is_err());
+        let mut unexpected = records.clone();
+        unexpected[0].outpoint.vout = 9;
+        assert!(require_deployment_shards(&shards, &unexpected, &assets).is_err());
+        for asset_index in 0..assets.len() {
+            let mut wrong_asset = records.clone();
+            wrong_asset[0].assets[asset_index].amount -= 1;
+            assert!(require_deployment_shards(&shards, &wrong_asset, &assets).is_err());
+        }
     }
 
     #[test]

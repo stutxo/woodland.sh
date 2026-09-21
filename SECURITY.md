@@ -2,19 +2,25 @@
 
 ## Supported versions
 
-Security fixes target protocol v3 and the latest source.
+Security fixes target protocol v4 and the latest source.
 
 | Version | Supported |
 | --- | --- |
-| v3 | Yes |
+| v4 | Yes |
+| v3 and earlier | No |
 
 ## Project status
 
-woodland.sh v3 has an experimental mainnet deployment path. The repository
+woodland.sh v4 has an experimental mainnet deployment path. The repository
 ships no live deployment manifest. Mainnet availability is not a claim of
 production-grade browser custody or an independent security audit. Documented
 trust assumptions and known boundaries are part of the protocol design rather
 than guarantees provided by this policy.
+
+Package 4.0.0 requires protocol 4, signed schema 4, and ruleset
+`woodland.sh/forest/v4`. Launch a fresh v4 genesis. Never reuse v3 assets,
+deployment outpoints, or manifests: these covenant changes cannot upgrade an
+existing world in place.
 
 ## Report a vulnerability
 
@@ -47,6 +53,13 @@ Security-sensitive areas include:
 
 - Arkade Script bypasses in player chop, tree chop, tree regrowth or
   maintenance, player renewal, or LOG withdrawal.
+- Player-template authentication bypasses: accepting an arbitrary script,
+  changed spending leaf, extra escape leaf, or spendable internal key instead
+  of the canonical six-leaf player contract. Tree authentication uses the owner
+  key and compressed-output prefix witness; player covenants bind the immutable
+  TREE AssetId to avoid a circular script dependency.
+- Axe progression bypasses, including equipping or crafting Wooden before one
+  earned XP asset unit (25 Woodcutting XP), or bypassing Stone/Iron level gates.
 - TREE, LOG, XP, or PLAYER_ID inflation, substitution, assignment, control,
   metadata, or conservation failures.
 - Soulbound-XP bypasses: any path that moves XP out of player state, derives
@@ -98,6 +111,8 @@ custody are known boundaries documented in [`README.md`](README.md),
 prevents choosing a favorable tree but does not make permissionless identities
 unique. An intermediate marker output can select any starting roll and credit
 within the corridor; the recursive rate budget and streak bounds remain enforced.
+Equipped axes remain constrained by their earned-XP thresholds, so pre-entry
+luck selection does not authorize a free starting axe.
 Funded-stump regrowth is permissionless apart from its operator and tweaked
 emulator closure; no project-held lifecycle key gates it. Active-tree and
 terminal-stump maintenance additionally requires the low-authority rollover

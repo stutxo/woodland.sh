@@ -17,11 +17,11 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 pub(crate) const GAME_ID: &str = "woodland.sh";
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
-pub(crate) const RULESET_ID: &str = "woodland.sh/forest/v3";
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
+pub(crate) const RULESET_ID: &str = "woodland.sh/forest/v4";
 /// No-vault world: every fixed-issuance resource starts on 420 recursive
 /// trees, and funded stumps regrow in one permissionless renewal batch.
-pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 3;
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 4;
 pub(crate) const PROTOCOL_DUST_SATS: u64 = 330;
 pub(crate) const ACTIVE_LOGS_PER_TREE: u64 = 10;
 pub(crate) const LOG_RESERVE_PER_TREE: u64 = 50_000;
@@ -196,6 +196,151 @@ pub struct ValidatedTree {
     pub deployment_txid: Txid,
 }
 
+/// An exact lineage endpoint which the indexer has not exposed yet. These
+/// gaps are safe to defer during upkeep, unlike malformed or forked lineages.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PendingTreeLineage {
+    Deployment { tree_id: u32, outpoint: OutPoint },
+    Successor { tree_id: u32, outpoint: OutPoint },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Display for PendingTreeLineage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deployment { tree_id, outpoint } => {
+                write!(
+                    formatter,
+                    "tree {tree_id} deployment {outpoint} is not indexed yet"
+                )
+            }
+            Self::Successor { tree_id, outpoint } => {
+                write!(
+                    formatter,
+                    "tree {tree_id} successor of {outpoint} is not indexed yet"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct TreeLineageRecords {
+    pub current: Vec<crate::arkade::VtxoRecord>,
+    pub pending: Vec<PendingTreeLineage>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct TreeLineageScan {
+    records: TreeLineageRecords,
+    states: std::collections::HashMap<OutPoint, TreeState>,
+    visited: HashSet<OutPoint>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TreeLineageScan {
+    fn new(declared: &[ValidatedTree], current: Vec<crate::arkade::VtxoRecord>) -> Result<Self> {
+        let mut states = std::collections::HashMap::with_capacity(declared.len());
+        for tree in declared {
+            let outpoint = OutPoint {
+                txid: tree.deployment_txid,
+                vout: 0,
+            };
+            if states.insert(outpoint, tree.state).is_some() {
+                return Err(anyhow!("duplicate declared tree lineage {outpoint}"));
+            }
+        }
+        let mut visited = HashSet::with_capacity(current.len());
+        for record in &current {
+            if !states.contains_key(&record.outpoint) || !visited.insert(record.outpoint) {
+                return Err(anyhow!(
+                    "unexpected or duplicate exact tree lineage {}",
+                    record.outpoint
+                ));
+            }
+        }
+        let mut pending = Vec::new();
+        for tree in declared {
+            let outpoint = OutPoint {
+                txid: tree.deployment_txid,
+                vout: 0,
+            };
+            if !visited.contains(&outpoint) {
+                states.remove(&outpoint);
+                pending.push(PendingTreeLineage::Deployment {
+                    tree_id: tree.state.tree_id,
+                    outpoint,
+                });
+            }
+        }
+        Ok(Self {
+            records: TreeLineageRecords { current, pending },
+            states,
+            visited,
+        })
+    }
+
+    fn advance(
+        &mut self,
+        mut successors: Vec<(TreeState, crate::arkade::VtxoRecord)>,
+    ) -> Result<()> {
+        let mut next = Vec::with_capacity(self.records.current.len());
+        for record in self.records.current.drain(..) {
+            if !record.is_spent {
+                next.push(record);
+                continue;
+            }
+            let state = self
+                .states
+                .remove(&record.outpoint)
+                .ok_or_else(|| anyhow!("tree lineage lost its identity"))?;
+            let mut matching = successors
+                .iter()
+                .enumerate()
+                .filter(|(_, (candidate_state, candidate))| {
+                    *candidate_state == state
+                        && record
+                            .spent_by
+                            .is_none_or(|txid| candidate.outpoint.txid == txid)
+                })
+                .map(|(index, _)| index);
+            let index = matching.next();
+            if matching.next().is_some() {
+                return Err(anyhow!(
+                    "tree {} has multiple indexed successors",
+                    state.tree_id
+                ));
+            }
+            let Some(index) = index else {
+                if record.spent_by.is_some_and(|txid| {
+                    successors
+                        .iter()
+                        .any(|(_, candidate)| candidate.outpoint.txid == txid)
+                }) {
+                    return Err(anyhow!(
+                        "tree {} successor has the wrong identity",
+                        state.tree_id
+                    ));
+                }
+                self.records.pending.push(PendingTreeLineage::Successor {
+                    tree_id: state.tree_id,
+                    outpoint: record.outpoint,
+                });
+                continue;
+            };
+            let (_, successor) = successors.swap_remove(index);
+            if !self.visited.insert(successor.outpoint) {
+                return Err(anyhow!("tree {} lineage contains a cycle", state.tree_id));
+            }
+            self.states.insert(successor.outpoint, state);
+            next.push(successor);
+        }
+        self.records.current = next;
+        Ok(())
+    }
+}
+
 /// Manifest-pinned Arkade service identity. Batch validation and forfeit
 /// signing use these values instead of endpoint-supplied parameters, so a
 /// spoofed or redirected Arkade endpoint cannot substitute its own operator
@@ -355,7 +500,7 @@ impl WorldManifest {
         let mut canonical = Vec::new();
         write_canonical_json(&value, &mut canonical)?;
         let mut engine = sha256::Hash::engine();
-        engine.input(b"woodland.sh/world-manifest/v3\0");
+        engine.input(b"woodland.sh/world-manifest/v4\0");
         engine.input(&canonical);
         Ok(Message::from_digest(
             sha256::Hash::from_engine(engine).to_byte_array(),
@@ -664,18 +809,36 @@ fn indexed_supply_is_valid(current: u64, genesis: u64, burnable: bool) -> bool {
 }
 
 impl ValidatedWorld {
-    /// Follow every declared tree's indexed lineage from its deployment
-    /// outpoint to the current live record. Each hop requires exactly one
-    /// successor that preserves the tree identity packet and matches the
-    /// indexer's spent-by pointer; forks, cycles, and indexing gaps fail
-    /// closed. This is the single implementation every host (operator,
-    /// server, headless client) uses to reconcile tree state.
+    /// Follow every declared tree to its current record, failing closed on
+    /// indexing gaps as well as invalid lineages. Strict gameplay callers must
+    /// not treat a temporarily absent successor as an absent tree.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn load_tree_lineage_records(
         &self,
         rest: &crate::arkade::ArkadeRest,
         declared: &[ValidatedTree],
     ) -> Result<Vec<crate::arkade::VtxoRecord>> {
+        let records = self
+            .load_tree_lineage_records_partial(rest, declared)
+            .await?;
+        if let Some(pending) = records.pending.first() {
+            return Err(anyhow!(
+                "{pending} ({} pending tree lineage(s))",
+                records.pending.len()
+            ));
+        }
+        Ok(records.current)
+    }
+
+    /// Resolve independent tree lineages for operator maintenance. Only absent
+    /// exact deployment/successor records are returned as `pending`; transport,
+    /// decoding, identity, fork, and cycle errors still fail the entire call.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn load_tree_lineage_records_partial(
+        &self,
+        rest: &crate::arkade::ArkadeRest,
+        declared: &[ValidatedTree],
+    ) -> Result<TreeLineageRecords> {
         let outpoints = declared
             .iter()
             .map(|tree| OutPoint {
@@ -683,79 +846,36 @@ impl ValidatedWorld {
                 vout: 0,
             })
             .collect::<Vec<_>>();
-        let mut current = rest.get_vtxos_by_outpoints(&outpoints).await?;
-        if current.len() != declared.len() {
-            return Err(anyhow!(
-                "index returned {} of {} exact tree lineages",
-                current.len(),
-                declared.len()
-            ));
-        }
-        let mut lineage_states = declared
-            .iter()
-            .map(|tree| {
-                (
-                    OutPoint {
-                        txid: tree.deployment_txid,
-                        vout: 0,
-                    },
-                    tree.state,
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut visited = current
-            .iter()
-            .map(|record| record.outpoint)
-            .collect::<std::collections::HashSet<_>>();
+        let mut scan =
+            TreeLineageScan::new(declared, rest.get_vtxos_by_outpoints(&outpoints).await?)?;
         let tree_script = self.contract.vtxo.script_pubkey();
         loop {
-            let spent = current
+            for record in &scan.records.current {
+                if record.script != tree_script || record.asset_amount(self.tree_asset) != Some(1) {
+                    return Err(anyhow!("invalid tree lineage record {}", record.outpoint));
+                }
+            }
+            let spent = scan
+                .records
+                .current
                 .iter()
                 .filter(|record| record.is_spent)
                 .cloned()
                 .collect::<Vec<_>>();
             if spent.is_empty() {
-                return Ok(current);
+                return Ok(scan.records);
             }
             let candidates = rest
                 .get_vtxo_successor_candidates(&spent, &tree_script, self.tree_asset)
                 .await?;
             let mut successors = Vec::with_capacity(candidates.len());
             for (record, transaction) in candidates {
+                record.validate_creating_transaction(&transaction)?;
                 let state = tree::tree_state_from_tx(&transaction)?
                     .ok_or_else(|| anyhow!("tree successor has no identity packet"))?;
                 successors.push((state, record));
             }
-            for record in &mut current {
-                if !record.is_spent {
-                    continue;
-                }
-                let state = lineage_states
-                    .remove(&record.outpoint)
-                    .ok_or_else(|| anyhow!("tree lineage lost its identity"))?;
-                let direct_txid = record.spent_by;
-                let mut matching = successors
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (candidate_state, candidate))| {
-                        *candidate_state == state
-                            && direct_txid.is_none_or(|txid| candidate.outpoint.txid == txid)
-                    })
-                    .map(|(index, _)| index);
-                let index = matching
-                    .next()
-                    .ok_or_else(|| anyhow!("tree successor is not indexed yet"))?;
-                if matching.next().is_some() {
-                    return Err(anyhow!("tree has multiple indexed successors"));
-                }
-                drop(matching);
-                let (_, successor) = successors.swap_remove(index);
-                if !visited.insert(successor.outpoint) {
-                    return Err(anyhow!("tree lineage contains a cycle"));
-                }
-                lineage_states.insert(successor.outpoint, state);
-                *record = successor;
-            }
+            scan.advance(successors)?;
         }
     }
 
@@ -786,13 +906,13 @@ impl ValidatedWorld {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::{Keypair, SecretKey};
     use bitcoin::{Address, Network, PublicKey, Sequence};
 
-    fn fixture() -> (
+    pub(crate) fn fixture() -> (
         Secp256k1<bitcoin::secp256k1::All>,
         ServerParams,
         EmulatorParams,
@@ -972,6 +1092,22 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_previous_protocol_assets_and_ruleset() {
+        let (_, _, _, manifest) = fixture();
+        for mutate in [
+            |manifest: &mut WorldManifest| manifest.schema_version = 3,
+            |manifest: &mut WorldManifest| manifest.protocol_version = 3,
+            |manifest: &mut WorldManifest| manifest.ruleset_id = "woodland.sh/forest/v3".into(),
+        ] {
+            let mut legacy = manifest.clone();
+            mutate(&mut legacy);
+            let json = serde_json::to_string(&legacy).unwrap();
+            let error = WorldManifest::from_json(&json).unwrap_err();
+            assert!(error.to_string().contains("unsupported signed ruleset"));
+        }
+    }
+
+    #[test]
     fn manifest_deserialization_rejects_unsigned_or_tampered_authority() {
         let (_, _, _, manifest) = fixture();
 
@@ -1089,6 +1225,122 @@ mod tests {
         let (_, _, _, mut manifest) = fixture();
         manifest.iron_ore_asset = manifest.stone_asset.clone();
         assert!(manifest.validate(&secp, &params, &emulator).is_err());
+    }
+
+    fn lineage_record(byte: u8) -> crate::arkade::VtxoRecord {
+        crate::arkade::VtxoRecord {
+            outpoint: OutPoint {
+                txid: Txid::from_byte_array([byte; 32]),
+                vout: 0,
+            },
+            script: bitcoin::ScriptBuf::new(),
+            amount_sats: PROTOCOL_DUST_SATS,
+            assets: Vec::new(),
+            created_at: Some(1),
+            expires_at: Some(10_001),
+            is_preconfirmed: false,
+            is_swept: false,
+            spent_by: None,
+            settled_by: None,
+            is_unrolled: false,
+            is_spent: false,
+        }
+    }
+
+    fn declared_lineage(byte: u8) -> ValidatedTree {
+        ValidatedTree {
+            state: TreeState {
+                tree_id: u32::from(byte),
+                x: 1,
+                y: 1,
+            },
+            deployment_txid: Txid::from_byte_array([byte; 32]),
+        }
+    }
+
+    #[test]
+    fn pending_tree_does_not_block_other_live_or_advancing_lineages() {
+        let declared = [
+            declared_lineage(1),
+            declared_lineage(2),
+            declared_lineage(3),
+        ];
+        let due = lineage_record(1);
+        let mut pending = lineage_record(2);
+        pending.is_spent = true;
+        pending.spent_by = Some(Txid::from_byte_array([4; 32]));
+        let mut advancing = lineage_record(3);
+        advancing.is_spent = true;
+        advancing.spent_by = Some(Txid::from_byte_array([5; 32]));
+        let successor = lineage_record(5);
+        let mut scan =
+            TreeLineageScan::new(&declared, vec![advancing, pending.clone(), due.clone()]).unwrap();
+        scan.advance(vec![(declared[2].state, successor.clone())])
+            .unwrap();
+        let mut current = scan
+            .records
+            .current
+            .iter()
+            .map(|record| record.outpoint)
+            .collect::<Vec<_>>();
+        current.sort_unstable();
+        let mut expected = vec![due.outpoint, successor.outpoint];
+        expected.sort_unstable();
+        assert_eq!(current, expected);
+        assert_eq!(
+            scan.records.pending,
+            [PendingTreeLineage::Successor {
+                tree_id: 2,
+                outpoint: pending.outpoint,
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_deployment_is_pending_but_duplicate_records_are_invalid() {
+        let declared = [declared_lineage(1), declared_lineage(2)];
+        let live = lineage_record(1);
+        let scan = TreeLineageScan::new(&declared, vec![live.clone()]).unwrap();
+        assert_eq!(scan.records.current[0].outpoint, live.outpoint);
+        assert_eq!(
+            scan.records.pending,
+            [PendingTreeLineage::Deployment {
+                tree_id: 2,
+                outpoint: lineage_record(2).outpoint,
+            }]
+        );
+        assert!(TreeLineageScan::new(&declared, vec![live.clone(), live]).is_err());
+        assert!(TreeLineageScan::new(&declared, vec![lineage_record(3)]).is_err());
+    }
+
+    #[test]
+    fn pending_lineages_do_not_hide_forks_cycles_or_changed_identity() {
+        let declared = [declared_lineage(1), declared_lineage(2)];
+        let mut spent = lineage_record(1);
+        spent.is_spent = true;
+        spent.spent_by = Some(Txid::from_byte_array([3; 32]));
+        let first = lineage_record(3);
+        let mut fork = first.clone();
+        fork.outpoint.vout = 1;
+        let mut scan = TreeLineageScan::new(&declared, vec![spent.clone()]).unwrap();
+        assert!(scan
+            .advance(vec![
+                (declared[0].state, first.clone()),
+                (declared[0].state, fork),
+            ])
+            .is_err());
+
+        let mut scan = TreeLineageScan::new(&declared, vec![spent.clone()]).unwrap();
+        assert!(scan
+            .advance(vec![(declared[1].state, first.clone())])
+            .is_err());
+
+        let mut scan = TreeLineageScan::new(&declared, vec![spent.clone()]).unwrap();
+        let mut cyclic = first;
+        cyclic.is_spent = true;
+        cyclic.spent_by = Some(spent.outpoint.txid);
+        scan.advance(vec![(declared[0].state, cyclic)]).unwrap();
+        assert!(scan.advance(vec![(declared[0].state, spent)]).is_err());
     }
 
     #[test]

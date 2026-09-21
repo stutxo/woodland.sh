@@ -3,9 +3,20 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WASM_FEATURES=${WOODLAND_WASM_FEATURES:-woodland-app}
-WORLD_MANIFEST=${WOODLAND_WORLD_MANIFEST:-$ROOT/regtest/_build/woodland-world.json}
+: "${WOODLAND_WORLD_MANIFEST:?set WOODLAND_WORLD_MANIFEST to the verified world manifest to publish}"
+WORLD_MANIFEST=$WOODLAND_WORLD_MANIFEST
 OUTPUT_DIR=${WOODLAND_WEB_OUTPUT_DIR:-$ROOT/dist}
 cd "$ROOT"
+
+# Reject a stale test-network manifest before building a mainnet artifact.
+node --input-type=module - "$WORLD_MANIFEST" <<'JS'
+import { readFileSync } from 'node:fs';
+const manifest = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const network = (process.env.WOODLAND_NETWORK || '').toLowerCase();
+if (['bitcoin', 'mainnet'].includes(network) && manifest.network !== 'bitcoin') {
+  throw new Error('mainnet web build requires a bitcoin world manifest');
+}
+JS
 
 if [[ -z "${CC_wasm32_unknown_unknown:-}" ]]; then
   # Reuse the repository LLVM when present, otherwise fall back to PATH.

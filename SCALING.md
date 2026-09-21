@@ -1,20 +1,27 @@
-# Scaling Decision: Protocol v3 Permissionless Player State
+# Scaling Decision: Protocol v4 Permissionless Player State
 
 ## Status
 
-Protocol v3 uses signed schema 3, stock arkd and the stock Arkade Script
+Protocol v4 uses signed schema 4, stock arkd and the stock Arkade Script
 emulator, self-issued PLAYER_ID markers, unlimited permissionless activation,
 owner renewal, permissionless funded-stump regrowth, rollover-authorized tree
 maintenance, and fixed world LOG/XP supply.
+
+Version 4 requires a fresh genesis and schema-4 manifest. Never reuse v3 world
+assets or manifests. Trees authenticate the complete six-leaf player Taproot
+template and NUMS internal key using a 32-byte owner key plus one compressed
+output prefix byte (`0x02` or `0x03`). Players bind the immutable TREE AssetId
+rather than tree P2TR, so authentication introduces no circular script
+dependency or shared mutable input.
 
 ## State Partitioning
 
 The world contains:
 
 - one recursive VTXO per player, holding 330 sats, one PLAYER_ID, player luck,
-  LOG, and XP;
-- one recursive VTXO per tree, holding TREE, remaining local LOG/XP, immutable
-  state, and health;
+  axe tier, LOG, XP, STONE, and IRON ORE;
+- one recursive VTXO per tree, holding TREE, remaining local LOG/XP/STONE/IRON
+  ORE, immutable state, and health;
 - no shared supply vault, global player reserve, PLAYER_TICKET, allocator, or
   protocol registry.
 
@@ -81,12 +88,13 @@ A swing has two inputs and four outputs:
 ```text
 inputs:  player, tree
 outputs: player, tree, extension, anchor
-groups:  PLAYER_ID, TREE, LOG, XP
+groups:  PLAYER_ID, TREE, LOG, XP, STONE, IRON ORE
 ```
 
 A miss has the same shape and signature cost as a hit. Player state has exactly
-one marker and at most two inventory holdings, so per-player parsing remains
-bounded.
+one marker and at most four inventory holdings, so per-player parsing remains
+bounded. The tree authenticates the same fixed six-leaf player template on
+every swing; its cost does not grow with the number of players.
 
 ## Activation
 
@@ -175,4 +183,8 @@ prevent tree-target grinding and bounded credit limits streaks; both remain
 public game mechanics, not fair hidden randomness.
 Permissionless PLAYER_ID creation means Sybil and identity grinding remain
 possible, and an intermediate marker output can choose any starting roll and
-credit within the corridor before the recursive covenant takes control.
+credit within the corridor before the recursive covenant takes control. Equipped
+axes remain constrained by earned XP. Wooden requires one XP asset unit (25
+Woodcutting XP, one successful chop) as well as its one-LOG craft cost; Stone
+and Iron retain their existing level gates. Pre-entry luck selection does not
+grant a free starting axe.

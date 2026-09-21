@@ -473,6 +473,42 @@ struct SubmitTxResponse {
     signed_checkpoint_txs: Option<Vec<String>>,
 }
 
+impl SubmitTxResponse {
+    fn decode(self) -> Result<(Txid, bitcoin::Psbt, Vec<bitcoin::Psbt>)> {
+        use base64::Engine;
+        let base64 = base64::engine::general_purpose::STANDARD;
+        let final_ark = self
+            .final_ark_tx
+            .ok_or_else(|| anyhow!("transaction response missing finalArkTx"))?;
+        let signed_ark = bitcoin::Psbt::deserialize(
+            &base64
+                .decode(&final_ark)
+                .context("decode finalArkTx base64")?,
+        )
+        .context("decode finalArkTx PSBT")?;
+        let txid = match self.ark_txid.as_deref().filter(|value| !value.is_empty()) {
+            Some(value) => value.parse().context("parse response Ark transaction ID")?,
+            None => signed_ark.unsigned_tx.compute_txid(),
+        };
+        let checkpoints = self
+            .signed_checkpoint_txs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|encoded| {
+                let bytes = base64.decode(encoded).context("decode checkpoint base64")?;
+                bitcoin::Psbt::deserialize(&bytes).context("decode checkpoint PSBT")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((txid, signed_ark, checkpoints))
+    }
+}
+
+#[derive(Deserialize)]
+struct GetPendingTxsResponse {
+    #[serde(rename = "pendingTxs")]
+    pending_txs: Option<Vec<SubmitTxResponse>>,
+}
+
 #[derive(serde::Serialize)]
 struct EmulatorSubmitTxRequest<'a> {
     #[serde(rename = "arkTx")]
@@ -1089,6 +1125,46 @@ impl ArkadeRest {
         Ok(records.into_values().collect())
     }
 
+    /// Observe an exact completed output even if another action has spent it.
+    /// Input selection must separately check the returned record's liveness.
+    pub async fn find_settled_vtxo(
+        &self,
+        script: &ScriptBuf,
+        outpoint: OutPoint,
+    ) -> Result<Option<VtxoRecord>> {
+        let Some(record) = self
+            .get_vtxos_by_outpoints(&[outpoint])
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        if record.script != *script {
+            return Err(anyhow!("settled VTXO {outpoint} has an unexpected script"));
+        }
+        let transactions = self.get_virtual_txs(&[outpoint.txid]).await?;
+        let transaction = transactions
+            .get(&outpoint.txid)
+            .ok_or_else(|| anyhow!("settled VTXO {outpoint} has no creating transaction"))?;
+        record.validate_creating_transaction(transaction)?;
+        Ok(Some(record))
+    }
+
+    pub async fn wait_for_settled_vtxo(
+        &self,
+        script: &ScriptBuf,
+        outpoint: OutPoint,
+    ) -> Result<VtxoRecord> {
+        for _ in 0..80 {
+            if let Some(record) = self.find_settled_vtxo(script, outpoint).await? {
+                return Ok(record);
+            }
+            crate::txbuild::sleep_ms(250).await;
+        }
+        Err(anyhow!("indexer did not expose settled VTXO {outpoint}"))
+    }
+
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     async fn get_vtxos_by_outpoint_chunk(&self, outpoints: &[OutPoint]) -> Result<Vec<VtxoRecord>> {
         let requested = outpoints
@@ -1394,31 +1470,38 @@ impl ArkadeRest {
         )
         .await?;
         let resp: SubmitTxResponse = serde_json::from_str(&text).context("parse submit resp")?;
-        let final_ark = resp
-            .final_ark_tx
-            .ok_or_else(|| anyhow!("submit response missing finalArkTx"))?;
-        let signed_ark = bitcoin::Psbt::deserialize(
-            &b64.decode(&final_ark).context("decode finalArkTx base64")?,
+        resp.decode()
+    }
+
+    pub(crate) async fn get_pending_txs(
+        &self,
+        message: &ark_core::intent::IntentMessage,
+        proof: &bitcoin::Psbt,
+    ) -> Result<Vec<(Txid, bitcoin::Psbt, Vec<bitcoin::Psbt>)>> {
+        use base64::Engine;
+        let body = serde_json::json!({
+            "intent": {
+                "message": message.encode().map_err(|error| anyhow!("encode pending proof message: {error}"))?,
+                "proof": base64::engine::general_purpose::STANDARD.encode(proof.serialize()),
+            },
+        })
+        .to_string();
+        let text = fetch_text(
+            &self.client,
+            "POST",
+            &format!("{}/v1/tx/pending", self.base),
+            Some(body),
+            FetchCache::NoStore,
         )
-        .context("decode finalArkTx psbt")?;
-        // The ark txid is the txid of the (cosigned) ark tx itself; the
-        // server's arkTxid field may be empty over REST, so compute it.
-        let txid = match resp.ark_txid.as_deref().filter(|s| s.len() == 64) {
-            Some(s) => s
-                .parse()
-                .unwrap_or_else(|_| signed_ark.unsigned_tx.compute_txid()),
-            None => signed_ark.unsigned_tx.compute_txid(),
-        };
-        let checkpoints = resp
-            .signed_checkpoint_txs
+        .await?;
+        let response: GetPendingTxsResponse =
+            serde_json::from_str(&text).context("parse pending transactions response")?;
+        response
+            .pending_txs
             .unwrap_or_default()
             .into_iter()
-            .map(|s| {
-                let raw = b64.decode(&s).context("decode checkpoint base64")?;
-                bitcoin::Psbt::deserialize(&raw).context("decode checkpoint psbt")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok((txid, signed_ark, checkpoints))
+            .map(SubmitTxResponse::decode)
+            .collect()
     }
 
     pub async fn finalize_tx(

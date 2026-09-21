@@ -6,11 +6,16 @@ independent VTXOs, so unrelated players and trees do not share a mutable input.
 
 The reference browser is a client, not an authority. Arkade Script, fixed Asset
 V1 supplies, indexed lineage, the pinned stock emulator, and the signed schema
-3 world manifest define the game.
+4 world manifest define the game.
 
-## Protocol v3
+## Protocol v4
 
-Protocol v3 uses permissionless activation with a self-issued PLAYER_ID.
+Package 4.0.0 targets protocol 4, signed manifest schema 4, and ruleset
+`woodland.sh/forest/v4`. Deploy a fresh v4 genesis with new world assets and a
+new signed manifest. Never reuse v3 assets, deployment outpoints, or manifests:
+the v4 player and tree covenants are incompatible with v3 state.
+
+Protocol v4 uses permissionless activation with a self-issued PLAYER_ID.
 A player deposits exactly 330 sats, issues one uncontrolled marker in that same
 transaction, and sends both into an owner-specific recursive player contract.
 There is no allocator, invitation, protocol registry, player cap, or extra transaction.
@@ -25,8 +30,8 @@ One genesis transaction creates five uncontrolled, fixed-supply assets:
 | 3 | STONE | 21,000,000 | 50,000 in each tree-local reserve |
 | 4 | IRON ORE | 21,000,000 | 50,000 in each tree-local reserve |
 
-Genesis metadata commits `game=woodland.sh`, `protocol=3`,
-`ruleset=woodland.sh/forest/v3`, the asset name, and the exact deployer and
+Genesis metadata commits `game=woodland.sh`, `protocol=4`,
+`ruleset=woodland.sh/forest/v4`, the asset name, and the exact deployer and
 rollover signers. All groups have `control_asset=None`; stock arkd rejects
 reissuance.
 
@@ -62,8 +67,9 @@ equipped axe adds 2% / 5% / 8% for Wooden / Stone / Iron, for an absolute 38%
 cap. Reward entropy belongs to the player lineage, not the selected tree, so
 changing targets cannot search for a better next outcome. A bounded luck-credit
 accumulator keeps realized rewards within two LOG of accumulated expected
-value, permits at most two consecutive successes, and limits the base rate to
-ten consecutive misses (at least one reward per eleven swings). The roll
+value, permits up to three consecutive successes at higher axe-enhanced rates
+(two at rates up to one third), and limits the base rate to ten consecutive
+misses (at least one reward per eleven swings). The roll
 remains public and predictable; this is variance control, not hidden
 randomness. XP, materials, and the equipped axe are soulbound. LOG is liquid
 and the protocol can withdraw it to any destination. The alpha browser
@@ -82,6 +88,11 @@ unspent inventory asset, and burns exactly:
 | Wooden | 1 | 1 LOG | 2% |
 | Stone | 5 | 2 LOG + 2 STONE | 5% |
 | Iron | 15 | 5 LOG + 2 IRON ORE | 8% |
+
+Wooden additionally requires one earned XP asset unit (25 Woodcutting XP), so
+the player must land one successful chop before crafting it. XP is preserved,
+not burned. Stone and Iron retain their level-5 and level-15 thresholds.
+Every equipped axe must also satisfy its XP threshold on subsequent actions.
 
 There is no downgrade, skipped tier, unequip path, or client-selected recipe.
 Crafting requires owner, Arkade operator, and script-tweaked emulator
@@ -112,6 +123,12 @@ metadata/control fields, and anchor. Both covenants additionally enforce:
 
 The player tapleaf requires player, Arkade operator, and script-tweaked emulator
 signatures. The shared tree tapleaf requires operator and tweaked emulator.
+The tree also authenticates the player's complete six-leaf Taproot template,
+including its NUMS internal key, using a witness containing the 32-byte owner
+key and one compressed-output prefix byte (`0x02` or `0x03`). An arbitrary
+player script or an extra escape leaf cannot collect world rewards. The player
+covenant pins the immutable TREE AssetId rather than the tree P2TR, avoiding a
+circular dependency when the tree authenticates the player template.
 
 ## Stumps and One-Batch Regrowth
 
@@ -137,9 +154,12 @@ Activation is permissionless and browser-owned:
 3. issue one uncontrolled `PLAYER_ID` into the personalized player state while
    attaching a roll derived from the player contract's P2TR witness program,
    8,000 luck credit, and axe tier `None`;
-4. derive its AssetId from the activation txid and persist that exact ID before
-   submission;
+4. derive its AssetId from the activation txid and persist that exact ID and
+   the original transaction journal before submission;
 5. index only state carrying that one-unit marker.
+
+Refresh, reload, and retry resume that same transaction and its checkpoint
+finalization. An unresolved activation does not require another deposit.
 
 For the direct issuance-to-state transaction above, every player covenant leaf
 recognizes the first recursive spend because the PLAYER_ID issuance txid equals
@@ -150,8 +170,9 @@ direct activation.
 The covenant cannot inspect ancestry from before a marker entered player state.
 A malicious owner can route a newly issued marker through an unconstrained
 intermediate output and choose any valid starting roll and credit in the
-0–20,000 corridor. After entry, every swing still enforces the exact rate
-budget, corridor, streak bounds, and hash transition. This is part of the
+0–20,000 corridor. Equipped axes remain constrained by earned XP, so this does
+not grant a free starting axe. After entry, every swing still enforces the exact
+rate budget, corridor, streak bounds, and hash transition. This is part of the
 permissionless identity-grinding boundary, not a route to tree-target or supply
 inflation. The reference activation never creates that shape.
 
@@ -262,6 +283,9 @@ The server independently verifies:
 The browser polls viewport-bounded `/v1/presence` once per second, bounded chat
 every two seconds, and a paginated leaderboard every 15 seconds. Presence is
 indexed in 32×32 map chunks, expires after 60 seconds, and is capped per response.
+Stationary active players send a presence heartbeat every 30 seconds. Delegation
+suppresses owner renewal only while its availability observation is under
+45 seconds old; a stalled server poll does not indefinitely prevent renewal.
 Chat accepts one signed line of at most 280 characters every two seconds and
 retains only the newest 200 messages in memory.
 
@@ -301,13 +325,14 @@ trees, and nearby player clusters; the player remains a separate fixed overlay
 while the canvas camera moves underneath. Player details and social UI are
 collapsible, with level, XP, LOG, and online count kept in the map HUD.
 
-Browser storage uses `woodland.sh:web:v2:*`. **New test wallet** clears the
-local key, profile (including PLAYER_ID), pending swing, and position. It does
-not delete a durable server registration. Player backups use the persisted
+Browser storage uses `woodland.sh:web:v2:*`. When no transaction is pending,
+**New test wallet** clears the local key, profile (including PLAYER_ID), pending
+swing, and position. It does not delete a durable server registration. Player
+backups include any unfinished activation journal and use the persisted
 profile's PLAYER_ID rather than the last rendered snapshot, so a failed
 post-activation refresh cannot omit the selected identity.
 
-For a public protocol-v3 Mutinynet world, `run-mutinynet.sh` deploys or resumes
+For a public protocol-v4 Mutinynet world, `run-mutinynet.sh` deploys or resumes
 the world, builds the same-origin bundle, and runs the renewal watcher and Axum:
 
 ```bash
@@ -315,7 +340,7 @@ the world, builds the same-origin bundle, and runs the renewal watcher and Axum:
 ```
 
 GitHub Pages deployment is available as a separate-static-host alternative.
-Set `WOODLAND_PAGES_MANIFEST` to a verified, signed schema-3 manifest and
+Set `WOODLAND_PAGES_MANIFEST` to a verified, signed schema-4 manifest and
 `WOODLAND_SERVER_URL` to the canonical external Axum origin. With no manifest
 variable the Pages jobs stay disabled. Deployment tools write their live
 manifest as ignored runtime output; copy a verified public manifest to a
@@ -329,6 +354,13 @@ Native protocol tests:
 
 ```bash
 cargo test --locked --features woodland-app
+```
+
+Execute covenant acceptance and rejection vectors against the pinned stock
+Arkade interpreter with Go 1.26.5 or newer:
+
+```bash
+./scripts/test-covenants.sh
 ```
 
 Destructive stock-arkd smoke profile:
@@ -358,7 +390,7 @@ Long configurable same-tree contention profile:
 It defaults to 12 players and 30 rounds. See [`TESTING.md`](TESTING.md) for
 bounded remote-service settings and report output.
 
-Eight-hour v3 release soak. It rotates fresh worlds through the full,
+Eight-hour v4 release soak. It rotates fresh worlds through the full,
 contention, burst, fanout, reload, renewal, and one-batch regrowth profiles,
 with per-cycle manifests and artifacts:
 
@@ -402,6 +434,8 @@ Player activation and owner renewal are browser operations, not operator APIs.
 Mainnet is an explicit, experimental deployment option. It is not a claim that
 the reference browser provides production-grade custody. Before funding a world,
 independently verify every service URL, signer, version, and fee policy.
+Use a fresh protocol-v4 genesis; existing v3 assets or signed manifests cannot
+be upgraded in place or reused for this deployment.
 
 Generate the deployer and operations roots offline with `woodland-keygen` and
 complete the recovery rehearsal in [`mainnet/README.md`](mainnet/README.md)
@@ -471,7 +505,7 @@ The reference browser stores its signing key and PLAYER_ID profile in
 integration. Arkade Script is evaluated by the pinned stock emulator, not
 Bitcoin consensus. Bitcoin Taproot still enforces every signer closure.
 
-Protocol v3 does not claim hidden randomness, covenant-enforced movement,
+Protocol v4 does not claim hidden randomness, covenant-enforced movement,
 unique humans, Sybil resistance, pre-covenant PLAYER_ID ancestry, a canonical
 leaderboard, or service availability.
 

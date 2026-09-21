@@ -1,0 +1,43 @@
+# Vendored from https://github.com/arkade-os/rust-sdk at
+# adcb5a8c76ebb14145cddcb0bb685973bc2a981c, ark-fees/Cargo.toml.
+# Workspace metadata/lints are expanded below; the sole runtime patch is the
+# wasm32 js-sys clock in src/lib.rs. The upstream MIT license is in LICENSE.
+[package]
+name = "ark-fees"
+version = "0.10.1"
+categories = ["cryptography::cryptocurrencies"]
+edition = "2021"
+keywords = ["ark", "arkade", "bitcoin", "wallet"]
+license = "MIT"
+repository = "https://github.com/arkade-os/rust-sdk"
+rust-version = "1.86"
+description = "Fee library using CEL for calculating Arkade transaction fees"
+
+[lints.rust]
+unused-import-braces = "warn"
+unused-qualifications = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(genproto)'] }
+
+[lints.clippy]
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+unnecessary_wraps = "warn"
+unused_async = "warn"
+wildcard_enum_match_arm = "warn"
+redundant_else = "warn"
+redundant_clone = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+too_many_arguments = "allow" # Don't care.
+large_enum_variant = "allow" # Don't care.
+
+[dependencies]
+cel = "0.12.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

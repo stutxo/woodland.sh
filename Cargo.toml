@@ -1,6 +1,6 @@
 [package]
 name = "woodland"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
 rust-version = "1.88"
 publish = false
@@ -30,6 +30,11 @@ required-features = ["keygen"]
 name = "woodland-server"
 path = "src/bin/woodland-server.rs"
 required-features = ["server"]
+
+[[example]]
+name = "woodland-agent"
+path = "examples/woodland-agent.rs"
+required-features = ["woodland-app"]
 
 
 [features]
@@ -74,6 +79,12 @@ tower-http = { version = "0.6", optional = true, features = ["cors", "fs"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers = { version = "0.3", features = ["futures"] }
+
+# ark-fees 0.10.1 from the SDK revision above, with only its wasm32 clock fixed.
+# Provenance and the upstream MIT license are retained in vendor/ark-fees.
+# All other SDK crates keep their original git pin.
+[patch."https://github.com/arkade-os/rust-sdk"]
+ark-fees = { path = "vendor/ark-fees" }
 
 [profile.release]
 strip = true

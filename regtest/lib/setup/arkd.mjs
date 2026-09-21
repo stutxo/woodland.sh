@@ -90,28 +90,36 @@ const FEE_FREE = {
   onchainOutputFee: '0.0',
 };
 
-function postIntentFees(fees) {
-  return fetchText(`${arkdAdminUrl()}/v1/admin/intentFees`, {
+async function postIntentFees(fees) {
+  const result = await fetchText(`${arkdAdminUrl()}/v1/admin/intentFees`, {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ fees }),
   });
+  if (!result.ok) {
+    throw new Error(`Failed to set arkd intent fees (HTTP ${result.status}): ${result.text}`, {
+      cause: result.error,
+    });
+  }
 }
 
 export async function applyArkdFees() {
   log('Configuring arkd intent fees...');
-  try {
-    await postIntentFees({
-      offchainInputFee: env('ARK_OFFCHAIN_INPUT_FEE'),
-      onchainInputFee: env('ARK_ONCHAIN_INPUT_FEE'),
-      offchainOutputFee: env('ARK_OFFCHAIN_OUTPUT_FEE'),
-      onchainOutputFee: env('ARK_ONCHAIN_OUTPUT_FEE'),
-    });
-    const { text } = await fetchText(`${arkdAdminUrl()}/v1/admin/intentFees`);
-    log(`arkd fees configured: ${text}`);
-  } catch {
-    warn('Failed to set arkd fees (admin endpoint unavailable?)');
+  const fees = {
+    offchainInputFee: env('ARK_OFFCHAIN_INPUT_FEE'),
+    onchainInputFee: env('ARK_ONCHAIN_INPUT_FEE'),
+    offchainOutputFee: env('ARK_OFFCHAIN_OUTPUT_FEE'),
+    onchainOutputFee: env('ARK_ONCHAIN_OUTPUT_FEE'),
+  };
+  await postIntentFees(fees);
+  const { ok, status, json } = await fetchJson(`${arkdAdminUrl()}/v1/admin/intentFees`);
+  if (!ok) {
+    throw new Error(`Failed to read back arkd intent fees (HTTP ${status})`);
   }
+  if (!json?.fees || Object.entries(fees).some(([field, value]) => json.fees[field] !== value)) {
+    throw new Error(`arkd intent fee readback does not match configured fees: ${JSON.stringify(json)}`);
+  }
+  log(`arkd fees configured: ${JSON.stringify(json)}`);
 }
 
 // Initialize the `ark` client CLI inside the arkd container so `ark receive`,

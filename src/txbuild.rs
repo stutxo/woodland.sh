@@ -44,6 +44,194 @@ pub enum RunTxStatus {
     SubmissionUnknown(UnknownSubmission),
 }
 
+/// Original signed bytes retained before submitting a direct wallet transaction.
+/// A lost response can be recovered from arkd using the checkpoint input proofs.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingTransaction {
+    schema_version: u32,
+    ark_tx: String,
+    checkpoint_txs: Vec<String>,
+}
+
+impl PendingTransaction {
+    pub fn new(keys: &Keys, ark_tx: Psbt, checkpoint_txs: Vec<Psbt>) -> Result<Self> {
+        use base64::Engine;
+        validate_pending_transactions(&ark_tx, &checkpoint_txs)?;
+        let (ark_tx, checkpoint_txs) = prepare_tx(keys, ark_tx, checkpoint_txs)?;
+        let base64 = base64::engine::general_purpose::STANDARD;
+        Ok(Self {
+            schema_version: 1,
+            ark_tx: base64.encode(ark_tx.serialize()),
+            checkpoint_txs: checkpoint_txs
+                .iter()
+                .map(|checkpoint| base64.encode(checkpoint.serialize()))
+                .collect(),
+        })
+    }
+
+    pub fn txid(&self) -> Result<Txid> {
+        Ok(self.ark_tx()?.unsigned_tx.compute_txid())
+    }
+
+    pub fn ark_tx(&self) -> Result<Psbt> {
+        if self.schema_version != 1 {
+            return Err(anyhow!("unsupported pending transaction journal"));
+        }
+        decode_pending_psbt(&self.ark_tx)
+    }
+
+    pub fn checkpoint_txs(&self) -> Result<Vec<Psbt>> {
+        if self.schema_version != 1 {
+            return Err(anyhow!("unsupported pending transaction journal"));
+        }
+        self.checkpoint_txs
+            .iter()
+            .map(|encoded| decode_pending_psbt(encoded))
+            .collect()
+    }
+
+    fn validated_psbts(&self, keys: &Keys) -> Result<(Psbt, Vec<Psbt>)> {
+        let ark_tx = self.ark_tx()?;
+        let checkpoints = self.checkpoint_txs()?;
+        validate_pending_transactions(&ark_tx, &checkpoints)?;
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            let (_, (script, _)) = checkpoint.inputs[0]
+                .tap_scripts
+                .first_key_value()
+                .expect("validated checkpoint signing metadata");
+            if !ark_core::script::extract_checksig_pubkeys(script).contains(&keys.owner_pk()) {
+                return Err(anyhow!("pending transaction is not owned by this wallet"));
+            }
+            // Ark inputs were signed before the journal was saved. Checkpoint
+            // owner signatures are intentionally added only at finalization.
+            verified_signature_for_key(
+                keys,
+                &ark_tx,
+                &ark_tx,
+                index,
+                keys.owner_pk(),
+                "saved owner",
+            )?;
+        }
+        Ok((ark_tx, checkpoints))
+    }
+}
+
+/// Validate imported activation journals before replacing browser custody or
+/// accepting an already-indexed output during native/browser recovery.
+#[cfg(feature = "woodland-app")]
+pub(crate) fn validate_activation_journal(
+    keys: &Keys,
+    params: &ServerParams,
+    prepared: &crate::chop::PreparedActivation,
+    contract: &crate::player::PlayerContract,
+) -> Result<Txid> {
+    let (mut ark_tx, checkpoints) = prepared.transaction.validated_psbts(keys)?;
+    let transaction = &ark_tx.unsigned_tx;
+    let txid = transaction.compute_txid();
+    if prepared.player_asset
+        != (ark_core::asset::AssetId {
+            txid,
+            group_index: crate::protocol::PLAYER_ID_ASSET_GROUP_INDEX as u16,
+        })
+        || transaction
+            .output
+            .get(usize::from(crate::protocol::ACTIVATION_STATE_OUTPUT_INDEX))
+            .is_none_or(|output| output.script_pubkey != contract.vtxo.script_pubkey())
+    {
+        return Err(anyhow!(
+            "activation journal does not match this player contract and PLAYER_ID"
+        ));
+    }
+    // Reconstruct the one supported activation from its original funding
+    // outpoint. In particular, the saved Ark signature does not authenticate
+    // the checkpoint's source value, control block, or full-tree metadata used
+    // for recovery proofs. Validate those against our canonical wallet too.
+    // Liveness is checked against the server when submitting; these synthetic
+    // dates only allow deterministic validation of an already-saved journal.
+    let funding = VtxoRecord {
+        outpoint: checkpoints[0].unsigned_tx.input[0].previous_output,
+        script: player_vtxo(keys, params)?.script_pubkey(),
+        amount_sats: params.dust_sats,
+        assets: Vec::new(),
+        created_at: Some(1),
+        expires_at: Some(i64::MAX),
+        is_preconfirmed: false,
+        is_swept: false,
+        spent_by: None,
+        settled_by: None,
+        is_unrolled: false,
+        is_spent: false,
+    };
+    let expected = crate::chop::prepare_activation(keys, params, contract, &funding)?;
+    let mut expected_ark = expected.transaction.ark_tx()?;
+    // Owner signatures have already been verified above. Their signing nonce
+    // can differ across builds, while every other saved field must match.
+    for input in &mut ark_tx.inputs {
+        input.tap_script_sigs.clear();
+    }
+    for input in &mut expected_ark.inputs {
+        input.tap_script_sigs.clear();
+    }
+    if ark_tx != expected_ark || checkpoints != expected.transaction.checkpoint_txs()? {
+        return Err(anyhow!(
+            "activation journal does not match the canonical wallet transaction"
+        ));
+    }
+    Ok(txid)
+}
+
+fn decode_pending_psbt(encoded: &str) -> Result<Psbt> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| anyhow!("decode pending transaction: {error}"))?;
+    Psbt::deserialize(&bytes).map_err(|error| anyhow!("decode pending PSBT: {error}"))
+}
+
+fn validate_pending_transactions(ark_tx: &Psbt, checkpoints: &[Psbt]) -> Result<()> {
+    if checkpoints.is_empty()
+        || checkpoints.len() != ark_tx.unsigned_tx.input.len()
+        || ark_tx.inputs.len() != checkpoints.len()
+    {
+        return Err(anyhow!("pending transaction has inconsistent input counts"));
+    }
+    let mut sources = std::collections::HashSet::new();
+    for (index, checkpoint) in checkpoints.iter().enumerate() {
+        if checkpoint.unsigned_tx.input.len() != 1
+            || checkpoint.inputs.len() != 1
+            || checkpoint.inputs[0].tap_scripts.len() != 1
+            || checkpoint.inputs[0].witness_script.is_none()
+            || checkpoint.inputs[0].witness_utxo.is_none()
+            || ark_tx.inputs[index].tap_scripts.len() != 1
+            || ark_tx.inputs[index].witness_script.is_none()
+        {
+            return Err(anyhow!(
+                "pending checkpoint {index} has invalid signing metadata"
+            ));
+        }
+        let output = checkpoint
+            .unsigned_tx
+            .output
+            .first()
+            .ok_or_else(|| anyhow!("pending checkpoint {index} has no output"))?;
+        if ark_tx.unsigned_tx.input[index].previous_output
+            != (bitcoin::OutPoint {
+                txid: checkpoint.unsigned_tx.compute_txid(),
+                vout: 0,
+            })
+            || ark_tx.inputs[index].witness_utxo.as_ref() != Some(output)
+            || !sources.insert(checkpoint.unsigned_tx.input[0].previous_output)
+        {
+            return Err(anyhow!(
+                "pending checkpoint {index} does not match its Ark input"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Everything the builders need from `server::Info`, reconstructed from the
 /// REST `/v1/info` payload. Fields the builders never read are placeholders.
 pub fn server_info(params: &ServerParams) -> server::Info {
@@ -258,6 +446,148 @@ pub async fn run_tx(
 ) -> Result<RunTxStatus> {
     let (signed_ark, checkpoints) = prepare_tx(keys, ark_tx, checkpoint_txs)?;
     submit_prepared(keys, rest, signed_ark, checkpoints).await
+}
+
+/// Resume the exact saved transaction, including accepted-but-unfinalized sends.
+/// The journal must be persisted before calling this function.
+pub async fn resume_tx(
+    keys: &Keys,
+    rest: &ArkadeRest,
+    transaction: &PendingTransaction,
+) -> Result<RunTxStatus> {
+    let (ark_tx, checkpoints) = transaction.validated_psbts(keys)?;
+    let txid = ark_tx.unsigned_tx.compute_txid();
+    let first_output = ark_tx
+        .unsigned_tx
+        .output
+        .first()
+        .ok_or_else(|| anyhow!("pending transaction has no outputs"))?;
+    if rest
+        .find_settled_vtxo(
+            &first_output.script_pubkey,
+            bitcoin::OutPoint { txid, vout: 0 },
+        )
+        .await?
+        .is_some()
+    {
+        return Ok(RunTxStatus::Finalized(txid));
+    }
+
+    let (message, proof) = pending_transaction_proof(keys, &checkpoints)?;
+    let mut pending = rest.get_pending_txs(&message, &proof).await?.into_iter();
+    let recovered = pending.next();
+    if pending.next().is_some() {
+        return Err(anyhow!(
+            "saved transaction inputs belong to multiple pending transactions"
+        ));
+    }
+    if let Some((returned_txid, returned_ark, returned_checkpoints)) = recovered {
+        if returned_txid != txid {
+            return Err(anyhow!(
+                "activation funding belongs to a different pending transaction"
+            ));
+        }
+        let (_, verified_checkpoints) = verify_submit_response(
+            keys,
+            &ark_tx,
+            &checkpoints,
+            returned_txid,
+            returned_ark,
+            returned_checkpoints,
+        )?;
+        return finalize_verified_response(keys, rest, txid, verified_checkpoints).await;
+    }
+
+    let sources = checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.unsigned_tx.input[0].previous_output)
+        .collect::<Vec<_>>();
+    let records = rest.get_vtxos_by_outpoints(&sources).await?;
+    for (checkpoint, source) in checkpoints.iter().zip(&sources) {
+        let Some(record) = records.iter().find(|record| record.outpoint == *source) else {
+            return Ok(RunTxStatus::SubmissionUnknown(UnknownSubmission {
+                txid,
+                last_error: format!("waiting for submission state of input {source}"),
+            }));
+        };
+        if record.is_spent {
+            return Ok(RunTxStatus::SubmissionUnknown(UnknownSubmission {
+                txid,
+                last_error: format!(
+                    "input {source} is spent; waiting for its accepted transaction"
+                ),
+            }));
+        }
+        let previous = checkpoint.inputs[0]
+            .witness_utxo
+            .as_ref()
+            .expect("validated");
+        if record.script != previous.script_pubkey || record.amount_sats != previous.value.to_sat()
+        {
+            return Err(anyhow!("pending transaction input changed at {source}"));
+        }
+        record.ensure_live(
+            crate::arkade::now_unix(),
+            crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+        )?;
+    }
+    submit_prepared(keys, rest, ark_tx, checkpoints).await
+}
+
+fn pending_transaction_proof(
+    keys: &Keys,
+    checkpoints: &[Psbt],
+) -> Result<(ark_core::intent::IntentMessage, Psbt)> {
+    use ark_core::intent::{self, IntentMessage};
+    let mut inputs = Vec::with_capacity(checkpoints.len());
+    for checkpoint in checkpoints {
+        let metadata = &checkpoint.inputs[0];
+        let (control_block, (script, _)) =
+            metadata.tap_scripts.first_key_value().expect("validated");
+        if !ark_core::script::extract_checksig_pubkeys(script).contains(&keys.owner_pk()) {
+            return Err(anyhow!("pending transaction is not owned by this wallet"));
+        }
+        inputs.push(intent::Input::new(
+            checkpoint.unsigned_tx.input[0].previous_output,
+            bitcoin::Sequence::MAX,
+            None,
+            metadata.witness_utxo.clone().expect("validated"),
+            vec![script.clone()],
+            (script.clone(), control_block.clone()),
+            false,
+            false,
+            Vec::new(),
+        ));
+    }
+    let expire_at = u64::try_from(crate::arkade::now_unix())
+        .map_err(|_| anyhow!("system clock is before the Unix epoch"))?
+        .checked_add(60)
+        .ok_or_else(|| anyhow!("pending transaction proof expiry overflow"))?;
+    let message = IntentMessage::GetPendingTx { expire_at };
+    let mut intent = intent::make_intent(
+        |_, message| Ok(keys.sign_msg(&message)),
+        |_, _| {
+            Err(ark_core::Error::ad_hoc(
+                "pending recovery has no onchain inputs",
+            ))
+        },
+        inputs,
+        Vec::new(),
+        message.clone(),
+    )
+    .map_err(|error| anyhow!("build pending transaction ownership proof: {error}"))?;
+    // Preserve the original full tap tree, rather than the selected leaf used
+    // to construct the proof's signing inputs.
+    let tree_key = bitcoin::psbt::raw::Key {
+        type_value: ARK_PSBT_FIELD_TYPE,
+        key: ark_core::VTXO_TAPROOT_KEY.to_vec(),
+    };
+    for (input, checkpoint) in intent.proof.inputs.iter_mut().skip(1).zip(checkpoints) {
+        if let Some(tree) = checkpoint.inputs[0].unknown.get(&tree_key) {
+            input.unknown.insert(tree_key.clone(), tree.clone());
+        }
+    }
+    Ok((message, intent.proof))
 }
 
 fn prepare_tx(
@@ -850,5 +1180,452 @@ mod tests {
             &mut ark,
             "field already exists on input 1",
         );
+    }
+
+    #[cfg(feature = "woodland-app")]
+    fn activation_fixture() -> (
+        Keys,
+        Keys,
+        ServerParams,
+        crate::player::PlayerContract,
+        VtxoRecord,
+        crate::chop::PreparedActivation,
+    ) {
+        let owner = Keys::from_hex(&"03".repeat(32)).unwrap();
+        let operator = Keys::from_hex(&"04".repeat(32)).unwrap();
+        let emulator = Keys::from_hex(&"05".repeat(32)).unwrap();
+        let rollover = Keys::from_hex(&"06".repeat(32)).unwrap();
+        let params = ServerParams {
+            version: String::new(),
+            signer_pk: operator.owner_pk(),
+            forfeit_pk: bitcoin::PublicKey::new(
+                operator
+                    .owner_pk()
+                    .public_key(bitcoin::secp256k1::Parity::Even),
+            ),
+            network: Network::Regtest,
+            dust_sats: 330,
+            vtxo_min_sats: 330,
+            unilateral_exit_delay: Sequence::from_height(144),
+            max_tx_weight: 400_000,
+            max_op_return_outputs: 1,
+            zero_offchain_fees: true,
+            checkpoint_tapscript: ScriptBuf::builder()
+                .push_int(144)
+                .push_opcode(bitcoin::opcodes::all::OP_CSV)
+                .push_opcode(bitcoin::opcodes::all::OP_DROP)
+                .push_x_only_key(&operator.owner_pk())
+                .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
+                .into_script(),
+            forfeit_address: bitcoin::Address::p2tr(
+                &owner.secp,
+                operator.owner_pk(),
+                None,
+                Network::Regtest,
+            ),
+        };
+        let wallet = player_vtxo(&owner, &params).unwrap();
+        let asset = |group_index| AssetId {
+            txid: Txid::from_byte_array([9; 32]),
+            group_index,
+        };
+        let contract = crate::player::build_player_contract(
+            &owner.secp,
+            owner.owner_pk(),
+            operator.owner_pk(),
+            emulator.owner_pk(),
+            rollover.owner_pk(),
+            params.unilateral_exit_delay,
+            params.network,
+            asset(0),
+            asset(1),
+            asset(2),
+            asset(3),
+            asset(4),
+            330,
+            &wallet.script_pubkey(),
+        )
+        .unwrap();
+        let funding = VtxoRecord {
+            outpoint: OutPoint {
+                txid: Txid::from_byte_array([10; 32]),
+                vout: 0,
+            },
+            script: wallet.script_pubkey(),
+            amount_sats: 330,
+            assets: Vec::new(),
+            created_at: Some(1),
+            expires_at: Some(i64::MAX),
+            is_preconfirmed: false,
+            is_swept: false,
+            spent_by: None,
+            settled_by: None,
+            is_unrolled: false,
+            is_spent: false,
+        };
+        let prepared =
+            crate::chop::prepare_activation(&owner, &params, &contract, &funding).unwrap();
+        (owner, operator, params, contract, funding, prepared)
+    }
+
+    #[cfg(feature = "woodland-app")]
+    fn corrupted_activation_backups(
+        owner: &Keys,
+        prepared: &crate::chop::PreparedActivation,
+    ) -> Vec<(&'static str, crate::chop::PreparedActivation)> {
+        use base64::Engine;
+        let mut missing = serde_json::to_value(prepared).unwrap();
+        missing["transaction"]["checkpointTxs"] = serde_json::json!([]);
+        let mut corrupt = serde_json::to_value(prepared).unwrap();
+        corrupt["transaction"]["checkpointTxs"][0] = serde_json::json!("not base64!");
+        let mut invalid_signature = prepared.clone();
+        let mut ark = invalid_signature.transaction.ark_tx().unwrap();
+        ark.inputs[0]
+            .tap_script_sigs
+            .values_mut()
+            .next()
+            .unwrap()
+            .signature = owner
+            .secp
+            .sign_schnorr_no_aux_rand(&Message::from_digest([42; 32]), &owner.keypair);
+        invalid_signature.transaction.ark_tx =
+            base64::engine::general_purpose::STANDARD.encode(ark.serialize());
+        let mut missing_signature = prepared.clone();
+        ark.inputs[0].tap_script_sigs.clear();
+        missing_signature.transaction.ark_tx =
+            base64::engine::general_purpose::STANDARD.encode(ark.serialize());
+        vec![
+            (
+                "empty checkpoints",
+                serde_json::from_value(missing).unwrap(),
+            ),
+            (
+                "corrupt checkpoint bytes",
+                serde_json::from_value(corrupt).unwrap(),
+            ),
+            ("invalid owner signature", invalid_signature),
+            ("missing owner signature", missing_signature),
+        ]
+    }
+
+    #[cfg(feature = "woodland-app")]
+    #[test]
+    fn activation_import_rejects_corrupt_checkpoints_and_owner_signatures() {
+        let (owner, _, params, contract, _, prepared) = activation_fixture();
+        let saved = serde_json::to_string(&prepared).unwrap();
+        let imported: crate::chop::PreparedActivation = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            validate_activation_journal(&owner, &params, &imported, &contract).unwrap(),
+            prepared.player_asset.txid
+        );
+        assert!(imported
+            .transaction
+            .checkpoint_txs()
+            .unwrap()
+            .iter()
+            .all(|checkpoint| checkpoint.inputs[0].tap_script_sigs.is_empty()));
+        for (name, corrupted) in corrupted_activation_backups(&owner, &prepared) {
+            // These objects all deserialize successfully and retain the exact
+            // activation txid and receiving script, so the old import check
+            // accepted them despite an unusable recovery journal.
+            assert_eq!(
+                corrupted.transaction.txid().unwrap(),
+                prepared.player_asset.txid
+            );
+            assert!(
+                validate_activation_journal(&owner, &params, &corrupted, &contract).is_err(),
+                "accepted imported backup with {name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "woodland-app")]
+    #[test]
+    fn activation_import_rejects_unauthenticated_checkpoint_metadata() {
+        use base64::Engine;
+        let (owner, _, params, contract, _, prepared) = activation_fixture();
+        let original = prepared.transaction.checkpoint_txs().unwrap().remove(0);
+        let tree_key = bitcoin::psbt::raw::Key {
+            type_value: ARK_PSBT_FIELD_TYPE,
+            key: ark_core::VTXO_TAPROOT_KEY.to_vec(),
+        };
+        let mut missing_tree = original.clone();
+        assert!(missing_tree.inputs[0].unknown.remove(&tree_key).is_some());
+        let mut corrupt_tree = original.clone();
+        corrupt_tree.inputs[0].unknown.insert(tree_key, vec![0xff]);
+        let mut wrong_value = original.clone();
+        wrong_value.inputs[0].witness_utxo.as_mut().unwrap().value =
+            Amount::from_sat(params.dust_sats + 1);
+        let mut wrong_script = original.clone();
+        wrong_script.inputs[0].witness_script = Some(ScriptBuf::new());
+        let mut wrong_control = original.clone();
+        let (mut control, script) = wrong_control.inputs[0].tap_scripts.pop_first().unwrap();
+        control.output_key_parity = match control.output_key_parity {
+            bitcoin::secp256k1::Parity::Even => bitcoin::secp256k1::Parity::Odd,
+            bitcoin::secp256k1::Parity::Odd => bitcoin::secp256k1::Parity::Even,
+        };
+        wrong_control.inputs[0].tap_scripts.insert(control, script);
+        for (name, checkpoint) in [
+            ("missing full source tree", missing_tree),
+            ("corrupt full source tree", corrupt_tree),
+            ("wrong source value", wrong_value),
+            ("wrong source witness script", wrong_script),
+            ("wrong source control block", wrong_control),
+        ] {
+            let mut corrupted = prepared.clone();
+            corrupted.transaction.checkpoint_txs[0] =
+                base64::engine::general_purpose::STANDARD.encode(checkpoint.serialize());
+            // These fields are not covered by the valid saved Ark signature:
+            // byte decoding, linked transaction IDs, and signature checks alone
+            // cannot establish that the imported journal is recoverable.
+            corrupted.transaction.validated_psbts(&owner).unwrap();
+            assert!(
+                validate_activation_journal(&owner, &params, &corrupted, &contract).is_err(),
+                "accepted imported backup with {name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn saved_activation_recovers_lost_submit_and_finalize_responses() {
+        use axum::body::Bytes;
+        use axum::extract::{Query, State};
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::response::{IntoResponse, Response};
+        use axum::{Json, Router};
+        use base64::Engine;
+        use bitcoin::hex::DisplayHex;
+        use serde_json::{json, Value};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        struct Ledger {
+            owner: Keys,
+            operator: Keys,
+            funding: VtxoRecord,
+            prepared: crate::chop::PreparedActivation,
+            response: Value,
+            accepted: bool,
+            finalized: bool,
+            allow_finalize: bool,
+            submissions: usize,
+            recoveries: usize,
+            lookups: usize,
+        }
+
+        fn indexed_record(outpoint: OutPoint, output: &TxOut, assets: Value, spent: bool) -> Value {
+            json!({
+                "outpoint": {"txid": outpoint.txid.to_string(), "vout": outpoint.vout},
+                "script": output.script_pubkey.as_bytes().to_lower_hex_string(),
+                "amount": output.value.to_sat().to_string(),
+                "assets": assets,
+                "createdAt": "1",
+                "expiresAt": i64::MAX.to_string(),
+                "isSpent": spent,
+            })
+        }
+
+        async fn serve(
+            State(state): State<Arc<Mutex<Ledger>>>,
+            method: Method,
+            uri: Uri,
+            body: Bytes,
+        ) -> Response {
+            let mut ledger = state.lock().await;
+            let original = ledger.prepared.transaction.ark_tx().unwrap();
+            let txid = original.unsigned_tx.compute_txid();
+            let base64 = base64::engine::general_purpose::STANDARD;
+            if method == Method::GET && uri.path() == "/v1/indexer/vtxos" {
+                ledger.lookups += 1;
+                let Query(query) =
+                    Query::<std::collections::HashMap<String, String>>::try_from_uri(&uri).unwrap();
+                let requested = &query["outpoints"];
+                let record = if requested == &ledger.funding.outpoint.to_string() {
+                    Some(indexed_record(
+                        ledger.funding.outpoint,
+                        &TxOut {
+                            script_pubkey: ledger.funding.script.clone(),
+                            value: Amount::from_sat(ledger.funding.amount_sats),
+                        },
+                        json!([]),
+                        ledger.accepted,
+                    ))
+                } else if ledger.finalized && requested == &format!("{txid}:0") {
+                    // Another action has already consumed the activation output.
+                    // Its historical existence must still settle this journal.
+                    Some(indexed_record(
+                        OutPoint { txid, vout: 0 },
+                        &original.unsigned_tx.output[0],
+                        json!([{"assetId": ledger.prepared.player_asset.to_string(), "amount": "1"}]),
+                        true,
+                    ))
+                } else {
+                    None
+                };
+                return Json(json!({"vtxos": record.into_iter().collect::<Vec<_>>()}))
+                    .into_response();
+            }
+            if method == Method::GET && uri.path() == format!("/v1/indexer/virtualTx/{txid}") {
+                return Json(json!({"txs": [base64.encode(original.serialize())]})).into_response();
+            }
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            match uri.path() {
+                "/v1/tx/submit" => {
+                    ledger.submissions += 1;
+                    if ledger.accepted {
+                        return (StatusCode::CONFLICT, Json(json!({"error": "input spent"})))
+                            .into_response();
+                    }
+                    let submitted =
+                        decode_pending_psbt(request["signedArkTx"].as_str().unwrap()).unwrap();
+                    assert_eq!(submitted.unsigned_tx, original.unsigned_tx);
+                    verified_signature_for_key(
+                        &ledger.owner,
+                        &original,
+                        &submitted,
+                        0,
+                        ledger.owner.owner_pk(),
+                        "owner",
+                    )
+                    .unwrap();
+                    ledger.accepted = true;
+                    // Acceptance reached arkd; its response was lost.
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "response lost"})),
+                    )
+                        .into_response()
+                }
+                "/v1/tx/pending" => {
+                    if !ledger.accepted {
+                        return Json(json!({"pendingTxs": []})).into_response();
+                    }
+                    let proof =
+                        decode_pending_psbt(request["intent"]["proof"].as_str().unwrap()).unwrap();
+                    assert_eq!(
+                        proof.unsigned_tx.input[1].previous_output,
+                        ledger.funding.outpoint
+                    );
+                    for index in 0..proof.inputs.len() {
+                        verified_signature_for_key(
+                            &ledger.owner,
+                            &proof,
+                            &proof,
+                            index,
+                            ledger.owner.owner_pk(),
+                            "recovery owner",
+                        )
+                        .unwrap();
+                    }
+                    ledger.recoveries += 1;
+                    Json(json!({"pendingTxs": [ledger.response.clone()]})).into_response()
+                }
+                "/v1/tx/finalize" => {
+                    if !ledger.allow_finalize {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "offline"})),
+                        )
+                            .into_response();
+                    }
+                    let expected = ledger.prepared.transaction.checkpoint_txs().unwrap();
+                    for (index, encoded) in request["finalCheckpointTxs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                    {
+                        let finalized = decode_pending_psbt(encoded.as_str().unwrap()).unwrap();
+                        for signer in [ledger.owner.owner_pk(), ledger.operator.owner_pk()] {
+                            verified_signature_for_key(
+                                &ledger.owner,
+                                &expected[index],
+                                &finalized,
+                                0,
+                                signer,
+                                "checkpoint signer",
+                            )
+                            .unwrap();
+                        }
+                    }
+                    ledger.finalized = true;
+                    Json(json!({})).into_response()
+                }
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        let (owner, operator, _, _, funding, prepared) = activation_fixture();
+        let saved = serde_json::to_string(&prepared).unwrap();
+        let mut returned_ark = prepared.transaction.ark_tx().unwrap();
+        let mut returned_checkpoints = prepared.transaction.checkpoint_txs().unwrap();
+        sign_ark_transaction(make_sign_fn(&operator), &mut returned_ark, 0).unwrap();
+        for checkpoint in &mut returned_checkpoints {
+            sign_checkpoint_transaction(make_sign_fn(&operator), checkpoint).unwrap();
+        }
+        let base64 = base64::engine::general_purpose::STANDARD;
+        let state = Arc::new(Mutex::new(Ledger {
+            owner: owner.clone(),
+            operator,
+            funding,
+            response: json!({
+                "arkTxid": prepared.player_asset.txid.to_string(),
+                "finalArkTx": base64.encode(returned_ark.serialize()),
+                "signedCheckpointTxs": returned_checkpoints.iter()
+                    .map(|checkpoint| base64.encode(checkpoint.serialize())).collect::<Vec<_>>(),
+            }),
+            prepared,
+            accepted: false,
+            finalized: false,
+            allow_finalize: false,
+            submissions: 0,
+            recoveries: 0,
+            lookups: 0,
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().fallback(serve).with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rest = ArkadeRest::new(&format!("http://{address}"));
+        let load = || serde_json::from_str::<crate::chop::PreparedActivation>(&saved).unwrap();
+
+        assert!(matches!(
+            resume_tx(&owner, &rest, &load().transaction).await.unwrap(),
+            RunTxStatus::SubmissionUnknown(_)
+        ));
+        assert!(matches!(
+            resume_tx(&owner, &rest, &load().transaction).await.unwrap(),
+            RunTxStatus::Pending(_)
+        ));
+        state.lock().await.allow_finalize = true;
+        let expected = load().player_asset.txid;
+        for _ in 0..2 {
+            assert!(matches!(
+                resume_tx(&owner, &rest, &load().transaction).await.unwrap(),
+                RunTxStatus::Finalized(txid) if txid == expected
+            ));
+        }
+        let before_invalid_recovery = state.lock().await.lookups;
+        for (name, corrupted) in corrupted_activation_backups(&owner, &load()) {
+            assert!(
+                resume_tx(&owner, &rest, &corrupted.transaction)
+                    .await
+                    .is_err(),
+                "an indexed output masked {name} during recovery"
+            );
+        }
+        let ledger = state.lock().await;
+        assert_eq!(
+            ledger.lookups, before_invalid_recovery,
+            "invalid journals must be rejected before checking settled outputs"
+        );
+        assert_eq!(
+            ledger.submissions, 1,
+            "accepted transaction was resubmitted"
+        );
+        assert_eq!(ledger.recoveries, 2);
+        assert!(ledger.finalized);
+        server.abort();
     }
 }

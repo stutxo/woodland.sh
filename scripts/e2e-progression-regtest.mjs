@@ -219,9 +219,9 @@ try {
   });
   assert.equal(manifestResponse.ok, true, `world manifest returned ${manifestResponse.status}`);
   const manifest = await manifestResponse.json();
-  assert.equal(manifest.schemaVersion, 3);
-  assert.equal(manifest.protocolVersion, 3);
-  assert.equal(manifest.rulesetId, 'woodland.sh/forest/v3');
+  assert.equal(manifest.schemaVersion, 4);
+  assert.equal(manifest.protocolVersion, 4);
+  assert.equal(manifest.rulesetId, 'woodland.sh/forest/v4');
   assert.equal(manifest.trees.length, TREE_COUNT);
   assert.equal(manifest.woodcuttingXpPerLog, 25);
   assert.deepEqual(manifest.axeRecipes, [

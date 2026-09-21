@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Batches are frequent on regtest; a stalled stream or skipped intent must
 /// still fail with a clear error instead of hanging a renewal loop.
 const BATCH_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const BATCH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const INTENT_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_BATCH_GRAPH_NODES: usize = 512;
 const MAX_SSE_FRAME_BYTES: usize = 1_048_576;
@@ -62,10 +63,7 @@ impl BatchServices {
             .map_err(|error| anyhow!("build arkd REST client: {error}"))?;
         // The typed client tracks the server digest for guarded calls; keep a
         // copy for the raw SSE request, which must present the same headers.
-        let info = ark
-            .get_info()
-            .await
-            .map_err(|error| anyhow!("read arkd REST info: {error}"))?;
+        let info = read_batch_info(&ark, BATCH_CONNECT_TIMEOUT).await?;
         require_matching_server_params(&info, &params, &pins)?;
         let fee_estimators = build_fee_estimators(&info)?;
         Ok(Self {
@@ -136,6 +134,22 @@ impl BatchServices {
             crate::renewal::approve(authorizer_keys, &self.emulator, emulator_pk, prepared).await?;
         join_batch_with_intent(self, authorizer_keys, &cosigner, emulator_pk, &approved).await
     }
+}
+
+/// The SDK's unary client has no transport deadline. Bound its initial info
+/// request as well as the later batch join, so a stalled endpoint cannot stop
+/// the watcher before it reaches the join's timeout.
+async fn read_batch_info(
+    ark: &ark_rest::Client,
+    timeout: std::time::Duration,
+) -> Result<ark_core::server::Info> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let response = tokio::time::timeout(timeout, ark.get_info()).await.ok();
+    #[cfg(target_arch = "wasm32")]
+    let response = browser_timeout_for(ark.get_info(), timeout).await;
+    response
+        .ok_or_else(|| anyhow!("timed out reading arkd REST info before renewal"))?
+        .map_err(|error| anyhow!("read arkd REST info: {error}"))
 }
 
 pub struct RenewalFeeSource<'a> {
@@ -1318,7 +1332,13 @@ fn validate_connector_tree(
     validate_graph(chunks, commitment, 1, "connector tree")?;
     let mut leaf_count = 0_usize;
     for chunk in chunks {
-        for output in chunk.unsigned_outputs_without_anchor()? {
+        let (_, outputs) = chunk
+            .tx
+            .unsigned_tx
+            .output
+            .split_last()
+            .ok_or_else(|| anyhow!("tree transaction has no outputs"))?;
+        for output in outputs {
             if output.value.to_sat() == 0 || !output.script_pubkey.is_p2tr() {
                 return Err(anyhow!(
                     "connector tree contains a non-canonical spendable output"
@@ -1341,21 +1361,6 @@ fn validate_connector_tree(
         ));
     }
     Ok(())
-}
-
-trait TxGraphChunkOutputs {
-    fn unsigned_outputs_without_anchor(&self) -> Result<&[TxOut]>;
-}
-
-impl TxGraphChunkOutputs for TxGraphChunk {
-    fn unsigned_outputs_without_anchor(&self) -> Result<&[TxOut]> {
-        self.tx
-            .unsigned_tx
-            .output
-            .split_last()
-            .map(|(_, outputs)| outputs)
-            .ok_or_else(|| anyhow!("tree transaction has no outputs"))
-    }
 }
 
 fn forfeit_sign_fn(
@@ -1741,6 +1746,42 @@ mod tests {
             &"INVALID_INTENT_PROOF: no matching intents found for intent proof"
         ));
         assert!(!is_missing_intent(&"INTENT_NOT_FOUND: unrelated id"));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn batch_info_deadline_stops_an_endpoint_that_never_responds() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = Router::new().route(
+            "/v1/info",
+            axum::routing::get(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, AtomicOrdering::SeqCst);
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let ark = ark_rest::Client::new(format!("http://{address}")).unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_batch_info(&ark, std::time::Duration::from_millis(500)),
+        )
+        .await
+        .expect("info request must have its own deadline")
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("timed out reading arkd REST info"));
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
+        let _ = server.await;
     }
 
     #[cfg(feature = "server")]

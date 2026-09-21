@@ -239,7 +239,7 @@
             </div>
           </div>
           <div class="stats-actions">
-            <span id="axe-recipe" class="muted">1 LOG required for Wooden Axe</span>
+            <span id="axe-recipe" class="muted">First successful chop and 1 LOG required for Wooden Axe</span>
             <button id="craft-axe" type="button" disabled>Craft Wooden Axe</button>
             <button id="renew-player" type="button" disabled>Renew player</button>
           </div>
@@ -293,7 +293,7 @@
           </div>
         </details>
       <button id="reset-profile" type="button" hidden>Forget saved PLAYER</button>
-      <button id="reset" type="button">New test wallet</button>
+      <button id="reset" type="button" hidden>New test wallet</button>
       <dl id="details" class="detail-grid" hidden>
         <div><dt>Tree</dt><dd id="tree-id"></dd></div>
         <div><dt>Health</dt><dd id="tree-health"></dd></div>
@@ -408,11 +408,11 @@ INSPECTNUMOUTPUTS      4  EQUALVERIFY</pre>
             <h2>Player covenant programs</h2>
             <section class="covenant-script">
               <h3>1. Player chop — <code>player_chop_covenant_script</code></h3>
-              <p>The player half proves owner-specific state continuity. It requires player input zero, the two-input/four-output swing shape, the same player P2TR and 330 sats, and the manifest-pinned tree P2TR and value at both tree endpoints.</p>
+              <p>The player half proves owner-specific state continuity. It requires player input zero, the two-input/four-output swing shape, the same player P2TR and 330 sats, and one genuine world TREE marker with unchanged tree P2TR and value at both tree endpoints.</p>
               <pre class="about-flow" aria-label="Player chop covenant checks">preserve: player P2TR, 330 sats, PLAYER_ID, XP asset
 advance:  roll = SHA256(previous roll), canonical luck credit
 derive:   reward threshold from input XP asset balance
-pin:      merged extension, canonical anchor, exact tree contract</pre>
+pin:      merged extension, canonical anchor, immutable TREE asset</pre>
               <p>It validates the canonical reward calculation but leaves the actual health, LOG, and XP deltas to the reciprocal tree script. This keeps owner continuity on the player side and global supply accounting on the tree side.</p>
             </section>
 
@@ -441,7 +441,7 @@ player state value              = 330 sats before and after</pre>
             <h2>Tree covenant programs</h2>
             <section class="covenant-script">
               <h3>4. Tree chop — <code>tree_covenant_script</code></h3>
-              <p>This is the main game-rule program. It requires tree input one, two inputs, four outputs, and four ordered asset groups: PLAYER_ID, TREE, LOG, and XP. Player and tree scripts, sat values, immutable tree state, the extension, and the anchor must all be canonical.</p>
+              <p>This is the main game-rule program. It requires tree input one, two inputs, four outputs, and the canonical PLAYER_ID, TREE, LOG, XP, STONE, and IRON ORE asset groups when present. It authenticates all six spending leaves and the NUMS internal key of the owner-specific player contract, rejecting alternate escape paths. Player and tree scripts, sat values, immutable tree state, the extension, and the anchor must all be canonical.</p>
               <p>The script hashes the previous player roll, converts the new roll into a bucket modulo 10,000, derives probability from the input XP asset balance, applies bounded luck credit, and leaves one canonical reward bit <code>G</code>.</p>
               <pre class="about-flow" aria-label="Tree chop covenant equations">tree health in         = tree health out + G
 tree LOG in            = tree LOG out + G
@@ -470,7 +470,8 @@ active or terminal maintenance:
 
             <h2>Activation and manifest checks</h2>
             <p>Activation is not a separate covenant leaf: it spends an ordinary wallet VTXO and creates the first player state. On the first recursive spend, every player leaf recognizes the direct-activation shape and requires the P2TR-witness-program-derived roll, PLAYER_ID group zero, and initial luck credit 8,000.</p>
-            <p>The signed schema 3 world manifest binds endpoints, service and lifecycle signers, ruleset, asset IDs, layout, and raw tree script commitments to the deployer key. Clients verify its BIP340 signature, rebuild the contract, and require every P2TR and Arkade Script byte to match before using any manifest URL.</p>
+            <p>A custom client can choose roll and luck before entering the player contract. Every recursive path checks that the axe tier is backed by earned XP: Wooden requires the first successful chop, Stone requires level 5, and Iron requires level 15. Once entered, the complete player contract preserves progression and enforces state transitions.</p>
+            <p>The signed schema 4 world manifest binds endpoints, service and lifecycle signers, ruleset, asset IDs, layout, and raw tree script commitments to the deployer key. Clients verify its BIP340 signature, rebuild the contract, and require every P2TR and Arkade Script byte to match before using any manifest URL. Protocol v4 requires a fresh world with its entire initial asset supply locked in the tree contracts.</p>
           </div>
         </details>
       </div>

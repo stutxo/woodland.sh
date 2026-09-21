@@ -178,10 +178,10 @@ async function main() {
   assert.notEqual(blockedRenewal.status, 0, 'interactive renewal unexpectedly ran');
   assert.match(blockedRenewal.stderr, /renew-world is pre-game only/);
   const manifest = JSON.parse(fs.readFileSync(MANIFEST, 'utf8'));
-  assert.equal(manifest.schemaVersion, 3, 'world manifest must be schema 3');
-  assert.equal(manifest.protocolVersion, 3, 'world manifest must declare protocol v3');
+  assert.equal(manifest.schemaVersion, 4, 'world manifest must be schema 4');
+  assert.equal(manifest.protocolVersion, 4, 'world manifest must declare protocol v4');
   assert.equal(manifest.gameId, 'woodland.sh');
-  assert.equal(manifest.rulesetId, 'woodland.sh/forest/v3');
+  assert.equal(manifest.rulesetId, 'woodland.sh/forest/v4');
   assert.match(manifest.deployerSigner, /^[0-9a-f]{64}$/);
   assert.match(manifest.manifestSignature, /^[0-9a-f]{128}$/);
   assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');

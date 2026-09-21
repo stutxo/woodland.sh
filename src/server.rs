@@ -50,6 +50,11 @@ const MAX_LEADERBOARD_LIMIT: usize = 200;
 const ACTION_CLOCK_SKEW_MS: u64 = 300_000;
 const LOCATION_INTERVAL_MS: u64 = 500;
 const CHAT_INTERVAL_MS: u64 = 2_000;
+const MIN_WORKER_FRESHNESS_SECS: i64 = 120;
+// A healthy renewal can spend ten minutes joining a batch and another minute
+// cleaning up an abandoned intent. Give that work time to finish before an
+// online owner takes over, without extending the verification freshness gate.
+const MIN_RENEWAL_FRESHNESS_SECS: i64 = 720;
 
 #[derive(Clone)]
 struct Verifier {
@@ -77,6 +82,53 @@ struct RegisteredPlayer {
     delegation_updated_at_ms: u64,
     #[serde(skip)]
     state: Option<LeaderboardPlayer>,
+}
+
+impl RegisteredPlayer {
+    fn same_registration(&self, snapshot: &Self) -> bool {
+        self.owner == snapshot.owner
+            && self.player_asset == snapshot.player_asset
+            && self.registration_signature == snapshot.registration_signature
+            && self.registered_at == snapshot.registered_at
+    }
+
+    /// Async verification may finish after a renewal or another request has
+    /// published newer state. Only update the cache that was actually read.
+    fn apply_verified_state(
+        &mut self,
+        snapshot: &Self,
+        verified: Option<LeaderboardPlayer>,
+        now: i64,
+    ) -> bool {
+        if !self.same_registration(snapshot) || self.state != snapshot.state {
+            return false;
+        }
+        if let Some(player) = verified {
+            self.state = Some(player);
+        } else if let Some(player) = &mut self.state {
+            player.active = false;
+            player.updated_at = now;
+        }
+        true
+    }
+
+    fn renewal_due(&self, now: i64, force: bool) -> bool {
+        self.delegated_renewal
+            && self.state.as_ref().is_some_and(|player| {
+                player.active
+                    && (force
+                        || player.expires_at.is_some_and(|expires_at| {
+                            let remaining = expires_at - now;
+                            remaining > 0 && remaining < player.rollover_margin_seconds
+                        }))
+            })
+    }
+
+    fn queued_renewal_authorized(&self, queued: &Self, now: i64, force: bool) -> bool {
+        self.same_registration(queued)
+            && self.delegation_updated_at_ms == queued.delegation_updated_at_ms
+            && self.renewal_due(now, force)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -230,6 +282,31 @@ impl Default for MultiplayerState {
 struct RefreshStatus {
     last_refresh_at: Option<i64>,
     last_error: Option<String>,
+    last_renewal_at: Option<i64>,
+    last_renewal_error: Option<String>,
+}
+
+impl RefreshStatus {
+    fn fresh(timestamp: Option<i64>, now: i64, max_age: i64) -> bool {
+        timestamp.is_some_and(|timestamp| (0..=max_age).contains(&now.saturating_sub(timestamp)))
+    }
+
+    fn ready(&self, now: i64, max_age: i64, renewal_configured: bool) -> bool {
+        self.last_error.is_none()
+            && Self::fresh(self.last_refresh_at, now, max_age)
+            && (!renewal_configured || self.renewal_available(now, max_age))
+    }
+
+    fn renewal_available(&self, now: i64, max_age: i64) -> bool {
+        self.last_error.is_none()
+            && self.last_renewal_error.is_none()
+            && Self::fresh(self.last_refresh_at, now, max_age)
+            && Self::fresh(
+                self.last_renewal_at,
+                now,
+                max_age.max(MIN_RENEWAL_FRESHNESS_SECS),
+            )
+    }
 }
 
 struct AppState {
@@ -239,6 +316,7 @@ struct AppState {
     registry_path: PathBuf,
     persist_lock: Mutex<()>,
     refresh_status: RwLock<RefreshStatus>,
+    worker_freshness_secs: i64,
     multiplayer: RwLock<MultiplayerState>,
     force_renewal_once: AtomicBool,
     refresh_cursor: AtomicUsize,
@@ -337,6 +415,7 @@ struct HealthResponse {
     registered_players: usize,
     last_refresh_at: Option<i64>,
     last_error: Option<String>,
+    last_renewal_at: Option<i64>,
     online_players: usize,
     delegation_available: bool,
 }
@@ -680,7 +759,7 @@ async fn authorize_action(
         )
         .map_err(|_| ApiError::bad_request("signature does not authorize this server action"))?;
     let key = player_asset.to_string();
-    let (registered_at, active) = {
+    let (snapshot, active) = {
         let registry = state.registry.read().await;
         let entry = registry
             .players
@@ -693,17 +772,17 @@ async fn authorize_action(
                     .expires_at
                     .is_none_or(|expires_at| expires_at > now_unix())
         });
-        (entry.registered_at, active)
+        (entry.clone(), active)
     };
     if !active {
         let verified = state
             .verifier
-            .verify(owner, player_asset, registered_at)
+            .verify(owner, player_asset, snapshot.registered_at)
             .await
             .map_err(ApiError::upstream)?
             .ok_or_else(|| ApiError::not_found("player has no live registered state"))?;
         if let Some(entry) = state.registry.write().await.players.get_mut(&key) {
-            entry.state = Some(verified);
+            entry.apply_verified_state(&snapshot, Some(verified), now_unix());
         }
     }
     if now_ms().abs_diff(request.timestamp_ms) > ACTION_CLOCK_SKEW_MS {
@@ -870,6 +949,43 @@ fn replayed_registration(
     Some(player)
 }
 
+fn merge_verified_registration(
+    registry: &mut RegistryFile,
+    snapshot: Option<&RegisteredPlayer>,
+    signature: String,
+    mut verified: LeaderboardPlayer,
+) -> Result<LeaderboardPlayer, ApiError> {
+    if let Some(entry) = registry.players.get_mut(&verified.player_asset) {
+        if entry.owner != verified.owner {
+            return Err(ApiError::bad_request("registered player owner changed"));
+        }
+        // Preserve concurrent consent updates and the original registration
+        // time. A slow registration must not resurrect revoked delegation.
+        verified.registered_at = entry.registered_at;
+        if let Some(snapshot) = snapshot {
+            entry.apply_verified_state(snapshot, Some(verified.clone()), now_unix());
+        }
+        entry.registration_signature = signature;
+        return Ok(entry.state.clone().unwrap_or(verified));
+    }
+    if registry.players.len() >= MAX_REGISTERED_PLAYERS {
+        return Err(ApiError::bad_request("server registration limit reached"));
+    }
+    registry.players.insert(
+        verified.player_asset.clone(),
+        RegisteredPlayer {
+            owner: verified.owner.clone(),
+            player_asset: verified.player_asset.clone(),
+            registration_signature: signature,
+            delegated_renewal: false,
+            delegation_updated_at_ms: 0,
+            registered_at: verified.registered_at,
+            state: Some(verified.clone()),
+        },
+    );
+    Ok(verified)
+}
+
 async fn register_player(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterPlayerRequest>,
@@ -901,17 +1017,10 @@ async fn register_player(
     ) {
         return Ok(Json(player));
     }
-    let (registered_at, delegated_renewal, delegation_updated_at_ms) =
-        state.registry.read().await.players.get(&key).map_or_else(
-            || (now_unix(), false, 0),
-            |entry| {
-                (
-                    entry.registered_at,
-                    entry.delegated_renewal,
-                    entry.delegation_updated_at_ms,
-                )
-            },
-        );
+    let snapshot = state.registry.read().await.players.get(&key).cloned();
+    let registered_at = snapshot
+        .as_ref()
+        .map_or_else(now_unix, |entry| entry.registered_at);
     let verified = state
         .verifier
         .verify(owner, player_asset, registered_at)
@@ -919,25 +1028,15 @@ async fn register_player(
         .map_err(ApiError::upstream)?
         .ok_or_else(|| ApiError::not_found("no live state for this owner and PLAYER_ID"))?;
 
-    {
+    let verified = {
         let mut registry = state.registry.write().await;
-        if !registry.players.contains_key(&key) && registry.players.len() >= MAX_REGISTERED_PLAYERS
-        {
-            return Err(ApiError::bad_request("server registration limit reached"));
-        }
-        registry.players.insert(
-            key,
-            RegisteredPlayer {
-                owner: owner.to_string(),
-                player_asset: player_asset.to_string(),
-                registration_signature: signature.to_string(),
-                delegated_renewal,
-                delegation_updated_at_ms,
-                registered_at,
-                state: Some(verified.clone()),
-            },
-        );
-    }
+        merge_verified_registration(
+            &mut registry,
+            snapshot.as_ref(),
+            signature.to_string(),
+            verified,
+        )?
+    };
     persist(&state).await.map_err(ApiError::internal)?;
     Ok(Json(verified))
 }
@@ -987,12 +1086,18 @@ async fn leaderboard(
         .filter(|entry| entry.delegated_renewal)
         .map(|entry| entry.player_asset.clone())
         .collect();
+    let delegation_available = state.rollover_keys.is_some()
+        && state
+            .refresh_status
+            .read()
+            .await
+            .renewal_available(now_unix(), state.worker_freshness_secs);
     Json(LeaderboardResponse {
         generated_at: now_unix(),
         total,
         players,
         delegated_player_assets,
-        delegation_available: state.rollover_keys.is_some(),
+        delegation_available,
     })
 }
 
@@ -1048,7 +1153,7 @@ async fn chat(State(state): State<Arc<AppState>>) -> Json<ChatResponse> {
     })
 }
 
-async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
     let registry = state.registry.read().await;
     let status = state.refresh_status.read().await;
     let cutoff = now_ms().saturating_sub(PRESENCE_TTL_MS);
@@ -1061,14 +1166,38 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         .values()
         .filter(|location| location.updated_at_ms >= cutoff)
         .count();
-    Json(HealthResponse {
-        ready: true,
-        registered_players: registry.players.len(),
-        last_refresh_at: status.last_refresh_at,
-        last_error: status.last_error.clone(),
-        online_players,
-        delegation_available: state.rollover_keys.is_some(),
-    })
+    let now = now_unix();
+    let ready = status.ready(
+        now,
+        state.worker_freshness_secs,
+        state.rollover_keys.is_some(),
+    );
+    let last_error = status
+        .last_error
+        .clone()
+        .or_else(|| status.last_renewal_error.clone())
+        .or_else(|| {
+            (!ready).then(|| {
+                "server verification or renewal worker has no recent successful progress".to_owned()
+            })
+        });
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(HealthResponse {
+            ready,
+            registered_players: registry.players.len(),
+            last_refresh_at: status.last_refresh_at,
+            last_error,
+            last_renewal_at: status.last_renewal_at,
+            online_players,
+            delegation_available: state.rollover_keys.is_some()
+                && status.renewal_available(now, state.worker_freshness_secs),
+        }),
+    )
 }
 
 async fn refresh_batch(state: Arc<AppState>) -> Result<()> {
@@ -1109,7 +1238,7 @@ async fn refresh_batch(state: Arc<AppState>) -> Result<()> {
                 let result = verifier
                     .verify(owner, player_asset, entry.registered_at)
                     .await;
-                Ok::<_, anyhow::Error>((entry.player_asset, result))
+                Ok::<_, anyhow::Error>((entry, result))
             }
         })
         .buffer_unordered(VERIFY_CONCURRENCY)
@@ -1122,21 +1251,14 @@ async fn refresh_batch(state: Arc<AppState>) -> Result<()> {
         let mut registry = state.registry.write().await;
         for result in results {
             match result {
-                Ok((key, Ok(Some(player)))) => {
-                    if let Some(entry) = registry.players.get_mut(&key) {
-                        entry.state = Some(player);
+                Ok((snapshot, Ok(verified))) => {
+                    if let Some(entry) = registry.players.get_mut(&snapshot.player_asset) {
+                        entry.apply_verified_state(&snapshot, verified, now);
                     }
                 }
-                Ok((key, Ok(None))) => {
-                    if let Some(entry) = registry.players.get_mut(&key) {
-                        if let Some(player) = &mut entry.state {
-                            player.active = false;
-                            player.updated_at = now;
-                        }
-                    }
-                }
-                Ok((key, Err(error))) => {
-                    first_error.get_or_insert_with(|| format!("{key}: {error:#}"));
+                Ok((snapshot, Err(error))) => {
+                    first_error
+                        .get_or_insert_with(|| format!("{}: {error:#}", snapshot.player_asset));
                 }
                 Err(error) => {
                     first_error.get_or_insert_with(|| format!("{error:#}"));
@@ -1162,24 +1284,8 @@ async fn renew_delegated_players(state: Arc<AppState>) -> Result<()> {
         .await
         .players
         .values()
-        .filter(|entry| {
-            entry.delegated_renewal
-                && entry.state.as_ref().is_some_and(|player| {
-                    player.active
-                        && (force_requested
-                            || player.expires_at.is_some_and(|expires_at| {
-                                let remaining = expires_at - now;
-                                remaining > 0 && remaining < player.rollover_margin_seconds
-                            }))
-                })
-        })
-        .map(|entry| {
-            (
-                entry.owner.clone(),
-                entry.player_asset.clone(),
-                entry.registered_at,
-            )
-        })
+        .filter(|entry| entry.renewal_due(now, force_requested))
+        .cloned()
         .collect::<Vec<_>>();
     if due.is_empty() {
         return Ok(());
@@ -1187,10 +1293,23 @@ async fn renew_delegated_players(state: Arc<AppState>) -> Result<()> {
     let force = force_requested && state.force_renewal_once.swap(false, Ordering::Relaxed);
     let mut first_error = None;
     let mut changed = false;
-    for (owner_text, player_asset_text, registered_at) in due {
-        let owner = XOnlyPublicKey::from_str(&owner_text).context("parse delegated owner")?;
+    for queued in due {
+        // Another player's batch can take minutes. Honor revocation and newer
+        // state before starting queued work; an already submitted intent is
+        // allowed to finish its exact-state renewal.
+        let still_authorized = state
+            .registry
+            .read()
+            .await
+            .players
+            .get(&queued.player_asset)
+            .is_some_and(|entry| entry.queued_renewal_authorized(&queued, now_unix(), force));
+        if !still_authorized {
+            continue;
+        }
+        let owner = XOnlyPublicKey::from_str(&queued.owner).context("parse delegated owner")?;
         let player_asset =
-            AssetId::from_str(&player_asset_text).context("parse delegated PLAYER_ID")?;
+            AssetId::from_str(&queued.player_asset).context("parse delegated PLAYER_ID")?;
         let result = watchtower::renew_player(
             &rollover_keys,
             WatchtowerServices {
@@ -1212,21 +1331,30 @@ async fn renew_delegated_players(state: Arc<AppState>) -> Result<()> {
                     "woodland.sh server renewed player {}: {} -> {}",
                     player_asset, outcome.old_outpoint, outcome.new_outpoint
                 );
+                let snapshot = state
+                    .registry
+                    .read()
+                    .await
+                    .players
+                    .get(&queued.player_asset)
+                    .cloned();
                 match state
                     .verifier
-                    .verify(owner, player_asset, registered_at)
+                    .verify(owner, player_asset, queued.registered_at)
                     .await
                 {
                     Ok(Some(player)) => {
-                        if let Some(entry) = state
-                            .registry
-                            .write()
-                            .await
-                            .players
-                            .get_mut(&player_asset_text)
-                        {
-                            entry.state = Some(player);
-                            changed = true;
+                        if let (Some(snapshot), Some(entry)) = (
+                            snapshot.as_ref(),
+                            state
+                                .registry
+                                .write()
+                                .await
+                                .players
+                                .get_mut(&queued.player_asset),
+                        ) {
+                            changed |=
+                                entry.apply_verified_state(snapshot, Some(player), now_unix());
                         }
                     }
                     Ok(None) => {
@@ -1243,12 +1371,48 @@ async fn renew_delegated_players(state: Arc<AppState>) -> Result<()> {
                 first_error.get_or_insert_with(|| format!("{player_asset}: {error:#}"));
             }
         }
+        let mut status = state.refresh_status.write().await;
+        if let Some(error) = &first_error {
+            // Publish failures immediately, even if a later player's batch is
+            // slow. A working HTTP listener is not proof of working renewal.
+            status.last_renewal_error = Some(error.clone());
+        } else {
+            status.last_renewal_at = Some(now_unix());
+        }
     }
     if changed {
         persist(&state).await?;
     }
     if let Some(error) = first_error {
         bail!("delegated renewal failed: {error}");
+    }
+    Ok(())
+}
+
+async fn run_renewal_pass(state: Arc<AppState>) {
+    let result = renew_delegated_players(state.clone()).await;
+    let mut status = state.refresh_status.write().await;
+    match result {
+        Ok(()) => {
+            status.last_renewal_at = Some(now_unix());
+            status.last_renewal_error = None;
+        }
+        Err(error) => {
+            eprintln!("woodland.sh server delegated renewal: {error:#}");
+            status.last_renewal_error = Some(format!("delegated renewal: {error:#}"));
+        }
+    }
+}
+
+fn validate_web_manifest(root: &Path, manifest: &WorldManifest) -> Result<()> {
+    let path = root.join("world.json");
+    let bundled = WorldManifest::from_json(
+        &std::fs::read_to_string(&path)
+            .with_context(|| format!("read bundled world manifest {}", path.display()))?,
+    )
+    .context("validate bundled world manifest")?;
+    if serde_json::to_value(&bundled)? != serde_json::to_value(manifest)? {
+        bail!("bundled world.json does not match WOODLAND_WORLD_MANIFEST; rebuild the web bundle with the configured manifest");
     }
     Ok(())
 }
@@ -1322,6 +1486,9 @@ pub async fn run_cli() -> Result<()> {
         &std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("read world manifest {}", manifest_path.display()))?,
     )?;
+    if let Some(root) = &web_root {
+        validate_web_manifest(root, &manifest)?;
+    }
     let map_width = manifest.map_width;
     let map_height = manifest.map_height;
     let arkade_url = manifest.arkade_service_url.clone();
@@ -1387,31 +1554,35 @@ pub async fn run_cli() -> Result<()> {
         registry_path,
         persist_lock: Mutex::new(()),
         refresh_status: RwLock::new(RefreshStatus::default()),
+        worker_freshness_secs: i64::try_from(refresh_secs.saturating_mul(3))
+            .unwrap_or(i64::MAX)
+            .max(MIN_WORKER_FRESHNESS_SECS),
         multiplayer: RwLock::new(MultiplayerState::default()),
         force_renewal_once: AtomicBool::new(force_renewal_once),
         refresh_cursor: AtomicUsize::new(0),
     });
-    if let Err(error) = refresh_batch(state.clone()).await {
-        eprintln!("woodland.sh server initial refresh: {error:#}");
-    }
-    if let Err(error) = renew_delegated_players(state.clone()).await {
-        eprintln!("woodland.sh server initial delegated renewal: {error:#}");
-    }
-
     let refresh_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
-        interval.tick().await;
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             if let Err(error) = refresh_batch(refresh_state.clone()).await {
                 eprintln!("woodland.sh server refresh: {error:#}");
-            }
-            if let Err(error) = renew_delegated_players(refresh_state.clone()).await {
-                eprintln!("woodland.sh server delegated renewal: {error:#}");
                 refresh_state.refresh_status.write().await.last_error =
-                    Some(format!("delegated renewal: {error:#}"));
+                    Some(format!("verification: {error:#}"));
             }
+        }
+    });
+    // Bind HTTP without draining a correlated renewal wave first, and keep
+    // verification independent of the potentially long-running batch joins.
+    let renewal_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            run_renewal_pass(renewal_state.clone()).await;
         }
     });
 
@@ -1475,6 +1646,218 @@ mod tests {
             registered_at,
             updated_at: 1,
         }
+    }
+
+    fn registered_player() -> RegisteredPlayer {
+        let state = player("player", 1, true, 1);
+        RegisteredPlayer {
+            owner: state.owner.clone(),
+            player_asset: state.player_asset.clone(),
+            registration_signature: "initial registration".into(),
+            registered_at: state.registered_at,
+            delegated_renewal: true,
+            delegation_updated_at_ms: 1,
+            state: Some(state),
+        }
+    }
+
+    #[test]
+    fn stale_verification_cannot_overwrite_a_completed_renewal() {
+        let mut entry = registered_player();
+        let before = entry.clone();
+        let mut renewed = before.state.clone().unwrap();
+        renewed.state_outpoint = format!("{}:0", "01".repeat(32));
+        renewed.expires_at = Some(10_000);
+        renewed.updated_at = 2;
+        assert!(entry.apply_verified_state(&before, Some(renewed.clone()), 2));
+
+        // An earlier refresh may report either the old input or the temporary
+        // indexing gap between it and the renewed output. Neither may win.
+        assert!(!entry.apply_verified_state(&before, before.state.clone(), 3));
+        assert!(!entry.apply_verified_state(&before, None, 3));
+        assert_eq!(entry.state, Some(renewed));
+
+        // The same guard covers a renewal verification overtaken by a newer
+        // refresh, even when both operations complete in the same second.
+        let pending_renewal = entry.clone();
+        let mut latest = entry.state.clone().unwrap();
+        latest.state_outpoint = format!("{}:0", "02".repeat(32));
+        assert!(entry.apply_verified_state(&pending_renewal, Some(latest.clone()), 3));
+        assert!(!entry.apply_verified_state(&pending_renewal, pending_renewal.state.clone(), 3));
+        assert_eq!(entry.state, Some(latest));
+    }
+
+    #[test]
+    fn queued_renewal_rechecks_consent_identity_and_current_expiry() {
+        let queued = registered_player();
+        assert!(queued.queued_renewal_authorized(&queued, 1, false));
+        let mut current = queued.clone();
+        current.delegated_renewal = false;
+        current.delegation_updated_at_ms = 2;
+        assert!(!current.queued_renewal_authorized(&queued, 1, false));
+        current.delegated_renewal = true;
+        current.delegation_updated_at_ms = 3;
+        assert!(!current.queued_renewal_authorized(&queued, 1, false));
+
+        current = queued.clone();
+        current.registration_signature = "new registration".into();
+        assert!(!current.queued_renewal_authorized(&queued, 1, false));
+        current = queued.clone();
+        current.state.as_mut().unwrap().expires_at = Some(10_000);
+        assert!(!current.queued_renewal_authorized(&queued, 1, false));
+    }
+
+    #[test]
+    fn slow_registration_preserves_revocation_and_newer_cached_state() {
+        let snapshot = registered_player();
+        let mut current = snapshot.clone();
+        current.delegated_renewal = false;
+        current.delegation_updated_at_ms = 2;
+        let mut renewed = current.state.clone().unwrap();
+        renewed.state_outpoint = format!("{}:0", "01".repeat(32));
+        renewed.expires_at = Some(10_000);
+        current.state = Some(renewed.clone());
+        let mut registry = RegistryFile::default();
+        registry
+            .players
+            .insert(current.player_asset.clone(), current);
+        let response = merge_verified_registration(
+            &mut registry,
+            Some(&snapshot),
+            "new registration".into(),
+            snapshot.state.clone().unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        let entry = &registry.players[&snapshot.player_asset];
+        assert!(!entry.delegated_renewal);
+        assert_eq!(entry.delegation_updated_at_ms, 2);
+        assert_eq!(entry.registered_at, snapshot.registered_at);
+        assert_eq!(entry.registration_signature, "new registration");
+        assert_eq!(entry.state, Some(renewed.clone()));
+        assert_eq!(response, renewed);
+    }
+
+    fn app_state() -> Arc<AppState> {
+        let (secp, params, emulator, manifest) = crate::world::tests::fixture();
+        let world = Arc::new(manifest.validate(&secp, &params, &emulator).unwrap());
+        Arc::new(AppState {
+            verifier: Arc::new(Verifier {
+                rest: ArkadeRest::new(&manifest.arkade_service_url),
+                arkade_url: manifest.arkade_service_url.clone(),
+                emulator_rest: EmulatorRest::new(&manifest.emulator_url),
+                params,
+                emulator,
+                world,
+                server_url: "https://server.example".to_owned(),
+                map_width: manifest.map_width,
+                map_height: manifest.map_height,
+            }),
+            rollover_keys: Some(Arc::new(Keys::from_hex(&"07".repeat(32)).unwrap())),
+            registry: RwLock::new(RegistryFile::default()),
+            registry_path: PathBuf::from("unused-test-registry.json"),
+            persist_lock: Mutex::new(()),
+            refresh_status: RwLock::new(RefreshStatus::default()),
+            worker_freshness_secs: MIN_WORKER_FRESHNESS_SECS,
+            multiplayer: RwLock::new(MultiplayerState::default()),
+            force_renewal_once: AtomicBool::new(false),
+            refresh_cursor: AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn delegation_and_readiness_require_recent_successful_worker_progress() {
+        let state = app_state();
+        assert_eq!(
+            health(State(state.clone())).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let now = now_unix();
+        *state.refresh_status.write().await = RefreshStatus {
+            last_refresh_at: Some(now),
+            last_renewal_at: Some(now),
+            ..Default::default()
+        };
+        assert_eq!(health(State(state.clone())).await.0, StatusCode::OK);
+        // A normal batch join may outlast the shorter verification lease.
+        state.refresh_status.write().await.last_renewal_at = Some(now - 600);
+        assert_eq!(health(State(state.clone())).await.0, StatusCode::OK);
+        for failure in ["renewal error", "renewal stalled", "verification stalled"] {
+            {
+                let mut status = state.refresh_status.write().await;
+                status.last_refresh_at = Some(now);
+                status.last_renewal_at = Some(now);
+                status.last_renewal_error = None;
+                match failure {
+                    "renewal error" => {
+                        status.last_renewal_error = Some("missing fee funding".into())
+                    }
+                    "renewal stalled" => {
+                        status.last_renewal_at = Some(now - MIN_RENEWAL_FRESHNESS_SECS - 1)
+                    }
+                    _ => status.last_refresh_at = Some(now - MIN_WORKER_FRESHNESS_SECS - 1),
+                }
+            }
+            let (code, Json(health)) = health(State(state.clone())).await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{failure}");
+            assert!(!health.ready && !health.delegation_available, "{failure}");
+            let Json(board) = leaderboard(
+                State(state.clone()),
+                Query(LeaderboardQuery {
+                    limit: None,
+                    offset: None,
+                }),
+            )
+            .await;
+            assert!(!board.delegation_available, "{failure}");
+        }
+        state.refresh_status.write().await.last_refresh_at = Some(now);
+        run_renewal_pass(state.clone()).await;
+        assert_eq!(health(State(state.clone())).await.0, StatusCode::OK);
+    }
+
+    #[test]
+    fn served_world_must_match_the_configured_signed_manifest() {
+        let (secp, params, emulator, manifest) = crate::world::tests::fixture();
+        let world = manifest.validate(&secp, &params, &emulator).unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("woodland-web-manifest-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("world.json");
+        std::fs::write(&path, manifest.to_json().unwrap()).unwrap();
+        validate_web_manifest(&root, &manifest).unwrap();
+
+        // A separately signed, internally valid manifest must still be rejected.
+        let deployments = world
+            .trees
+            .iter()
+            .map(|tree| (tree.state, tree.deployment_txid))
+            .collect::<Vec<_>>();
+        let other = WorldManifest::new(
+            &params,
+            &emulator,
+            &Keys::from_hex(&"08".repeat(32)).unwrap(),
+            "http://different-world.example",
+            &manifest.emulator_url,
+            world.rollover_signer,
+            world.tree_asset,
+            world.log_asset,
+            world.xp_asset,
+            world.stone_asset,
+            world.iron_ore_asset,
+            &world.contract,
+            world.genesis_txid,
+            &deployments,
+        )
+        .unwrap();
+        std::fs::write(&path, other.to_json().unwrap()).unwrap();
+        let error = validate_web_manifest(&root, &manifest).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match WOODLAND_WORLD_MANIFEST"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

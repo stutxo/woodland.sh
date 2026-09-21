@@ -1,4 +1,7 @@
-# woodland.sh Player Protocol v3
+# woodland.sh Player Protocol v4
+
+Protocol v4 requires a fresh genesis and schema-4 manifest. Never reuse v3
+assets, player state, tree deployment outpoints, or manifests with this version.
 
 ## Purpose
 
@@ -22,16 +25,18 @@ exact `D`-sat VTXO. Activation is an owner-signed offchain transaction that both
 issues a marker and creates the personalized player state. It attaches:
 
 - one uncontrolled, one-unit `PLAYER_ID` at fresh asset group zero;
-- metadata `game=woodland.sh`, `protocol=3`, `asset=PLAYER_ID`, and the owner;
+- metadata `game=woodland.sh`, `protocol=4`, `asset=PLAYER_ID`, and the owner;
 - roll `SHA256("woodland.sh/player-roll/v2" || p2tr_witness_program)`;
 - luck credit 8,000.
 - axe tier packet `None`.
 
 The PLAYER_ID AssetId is `(activation_txid, 0)`. The browser persists that exact
-ID before submission, then discovers only state containing that one-unit asset.
-A failed submission can be rebuilt deterministically; a submitted-but-unknown
-transaction can be reconciled by the same marker. Anyone may fund more players
-or mint a decoy marker, but cannot reproduce an existing transaction-derived ID.
+ID and the original signed Ark PSBT plus checkpoints before submission, then
+discovers only state containing that one-unit asset. Reload and retry resume the
+same journal, including checkpoint finalization after an accepted submission.
+Historical settlement still proves activation if a later action has spent its
+output. Anyone may fund more players or mint a decoy marker, but cannot reproduce
+an existing transaction-derived ID.
 For the reference client's direct issuance-to-state shape, every player
 covenant leaf recognizes the first recursive spend because the PLAYER_ID
 AssetId txid equals the state input's outpoint txid. On that spend it requires
@@ -80,9 +85,10 @@ Cnext = Q - 10,000*G
 Credit is canonical, fixed-width, and constrained to 0–20,000. The identity
 `Cnext + 10,000*G = C+p` keeps cumulative rewards within two units of expected
 value. At 20%, every eleven-swing window contains a reward, so no miss run
-exceeds ten; no rate permits more than two consecutive successes. The hash
-chain is public and predictable. This prevents tree-target grinding and bounds
-variance; it does not prevent PLAYER_ID Sybils or provide hidden randomness.
+exceeds ten. Success runs are bounded at two for rates up to one third and at
+three for higher axe-enhanced rates, including the 38% cap. The hash chain is
+public and predictable. This prevents tree-target grinding and bounds variance;
+it does not prevent PLAYER_ID Sybils or provide hidden randomness.
 
 ## Successful-Swing Materials
 
@@ -150,7 +156,7 @@ The player covenant requires:
 - the current input is player-state input zero;
 - exactly two inputs and four outputs;
 - recursive preservation of player script and `D` sats;
-- the exact shared tree script and fixed tree value;
+- the immutable world TREE AssetId and fixed tree value;
 - canonical initial luck on the first recursive spend;
 - exact roll hash successor and bounded luck-credit transition;
 - player input/output assets contain exactly one PLAYER_ID and only optional
@@ -158,7 +164,12 @@ The player covenant requires:
 - equipped axe preservation;
 - canonical extension and anchor.
 
-The reciprocal tree covenant enforces the actual inventory and XP deltas.
+The reciprocal tree covenant enforces the actual inventory and XP deltas and
+authenticates the complete player Taproot template. Its witness supplies the
+32-byte owner key and one compressed-output prefix byte (`0x02` or `0x03`).
+The tree reconstructs all six canonical leaves and the NUMS internal key,
+rejecting alternate scripts or additional escape paths. Pinning TREE rather
+than tree P2TR in the player covenant breaks the otherwise circular dependency.
 
 ## Authorization
 
@@ -186,6 +197,11 @@ burns exactly the covenant-selected recipe:
 | Wooden | 1 | 1 LOG | 2% |
 | Stone | 5 | 2 LOG + 2 STONE | 5% |
 | Iron | 15 | 5 LOG + 2 IRON ORE | 8% |
+
+Wooden also requires one earned XP asset unit (25 Woodcutting XP, one
+successful chop). The minimum held XP balances are 1, 16, and 97 units for
+Wooden, Stone, and Iron. XP is never burned, and every equipped tier must remain
+backed by its minimum XP balance. Stone and Iron keep their existing levels.
 
 The craft leaf preserves state sats, P2TR, PLAYER_ID, XP, roll, luck, and every
 unspent inventory asset. The next tier is permanent and automatically equipped;
@@ -260,6 +276,7 @@ transaction-derived marker changes.
 A covenant sees the current transaction, not arbitrary ancestry from before a
 marker entered player state. An owner can issue a marker to an unconstrained
 intermediate output and later choose any valid starting roll and credit. This
-can bias reward timing inside the corridor, but every recursive transition still
+can bias reward timing inside the corridor, but cannot equip an axe without
+the corresponding earned XP balance. Every recursive transition still
 enforces player binding, the exact rate budget, the credit corridor, and streak
 limits. The reference client always uses direct canonical activation.

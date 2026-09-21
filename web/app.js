@@ -6,11 +6,13 @@ const SERVER_URL = SERVER_SETTING === 'self'
   ? location.origin
   : SERVER_SETTING.replace(/\/+$/, '');
 const STORAGE_SCOPE = location.origin;
+const WALLET_WRITER_LOCK = `woodland.sh:web:wallet-writer:${STORAGE_SCOPE}`;
 const KEY = `woodland.sh:web:v2:key:${STORAGE_SCOPE}`;
 const PROFILE = `woodland.sh:web:v2:profile:${STORAGE_SCOPE}`;
 let profileStorageKey = PROFILE;
 let pendingStorageKey = `woodland.sh:web:v2:pending:${STORAGE_SCOPE}`;
 const POSITION = `woodland.sh:web:v2:position:${STORAGE_SCOPE}`;
+const RESTORE_JOURNAL = `woodland.sh:web:v2:restore:${STORAGE_SCOPE}`;
 const PLAYER_BACKUP_FORMAT = 'woodland.sh/player-backup';
 const PLAYER_BACKUP_VERSION = 1;
 const MAX_PLAYER_BACKUP_BYTES = 64 * 1024;
@@ -84,6 +86,11 @@ const CHOP_FLASH_MS = 340;
 const CHOP_CADENCE_MS = 1_000;
 const CHOP_FEEDBACK_MS = 1_000;
 const LOCATION_POST_INTERVAL_MS = 750;
+const LOCATION_HEARTBEAT_MS = 30_000;
+const DELEGATION_FRESHNESS_MS = 45_000;
+// Leave at least 30 minutes for owner-funded renewal on long-lived batches,
+// even if the watchtower keeps answering HTTP while making no progress.
+const OWNER_RENEWAL_FALLBACK_SECONDS = 1_800;
 const LOG_FLASH_MS = 800;
 const DIRECTIONS = [[0, -1], [-1, 0], [1, 0], [0, 1]];
 const TREE_GLYPH = '🌲';
@@ -99,6 +106,8 @@ const player = { x: 3, y: 17 };
 
 let app;
 let state;
+let walletWriterOwned = false;
+let walletWriterPromise;
 let busy = false;
 let polling = false;
 let chopping = false;
@@ -127,10 +136,12 @@ let remoteLocations = [];
 let chatMessages = [];
 let delegatedRenewal = false;
 let delegationAvailable = false;
+let delegationObservedAt = null;
 let lastRenewalError = null;
 let socialPosting = false;
 let locationPosting = false;
 let lastPublishedLocation = null;
+let lastPublishedLocationAt = 0;
 let nextLocationPostAt = 0;
 let lastRenderedChatId = null;
 let mapFrame = null;
@@ -141,8 +152,85 @@ let treeViewportOverride = null;
 
 let pendingRetryAfter = 0;
 let nextWorldRefreshAt = 0;
+
+function acquireWalletWriter() {
+  if (walletWriterOwned) return Promise.resolve();
+  if (walletWriterPromise) return walletWriterPromise;
+  if (!globalThis.navigator?.locks?.request) {
+    return Promise.reject(new Error('This browser cannot safely coordinate the player wallet. Open the game in a browser with Web Locks support over HTTPS or localhost.'));
+  }
+  walletWriterPromise = new Promise((resolve, reject) => {
+    // Hold the lock until this document is destroyed. This also covers Rust's
+    // localStorage journal writes, bootstrap, restores, and direct WASM calls.
+    // A second tab must never initialize a stale copy of the signing wallet.
+    navigator.locks.request(WALLET_WRITER_LOCK, { ifAvailable: true }, async (lock) => {
+      if (!lock) {
+        reject(new Error('This player wallet is already open in another tab. Close that tab, then press Refresh here.'));
+        return;
+      }
+      walletWriterOwned = true;
+      resolve();
+      await new Promise(() => {});
+    }).catch(reject);
+  }).catch((error) => {
+    walletWriterPromise = undefined;
+    throw error;
+  });
+  return walletWriterPromise;
+}
+
+function requireWalletWriter() {
+  if (!walletWriterOwned) throw new Error('This tab does not control the player wallet. Press Refresh after closing the other game tab.');
+  if (localStorage.getItem(RESTORE_JOURNAL)) {
+    throw new Error('A wallet restore is unfinished. Press Refresh to recover it before using the player.');
+  }
+}
+
+function hasPendingWalletTransaction() {
+  if (state?.pendingChopTxid || state?.pendingActivationTxid) return true;
+  // Submission may have saved a journal and thrown before a new WASM snapshot
+  // reached the UI. Never allow key replacement based only on rendered state.
+  try {
+    if (localStorage.getItem(RESTORE_JOURNAL) || localStorage.getItem(pendingStorageKey)) return true;
+    const profile = JSON.parse(localStorage.getItem(profileStorageKey) || 'null');
+    return Boolean(profile?.pendingActivation);
+  } catch {
+    return true;
+  }
+}
+
+function recoverWalletRestore() {
+  const encoded = localStorage.getItem(RESTORE_JOURNAL);
+  if (!encoded) return;
+  const journal = JSON.parse(encoded);
+  const profile = typeof journal.profile === 'string' ? JSON.parse(journal.profile) : null;
+  if (
+    journal.version !== 1
+    || !/^[0-9a-f]{64}$/u.test(journal.genesisTxid || '')
+    || !/^[0-9a-f]{64}$/u.test(journal.secretKey || '')
+    || profile?.genesisTxid !== journal.genesisTxid
+    || typeof journal.pendingKey !== 'string'
+    || !journal.pendingKey.startsWith('woodland.sh:web:v2:pending:')
+    || !journal.pendingKey.endsWith(`:${journal.genesisTxid}`)
+    || (journal.position !== null && typeof journal.position !== 'string')
+  ) {
+    throw new Error('Saved wallet restore journal is invalid; preserve browser storage for recovery.');
+  }
+  const restoredProfileKey = `${PROFILE}:${journal.genesisTxid}`;
+  // Keep the complete target in one atomic localStorage entry until every
+  // replacement succeeds. Free the old entries first to minimize quota use.
+  for (const key of [KEY, PROFILE, restoredProfileKey, journal.pendingKey, POSITION]) {
+    localStorage.removeItem(key);
+  }
+  localStorage.setItem(KEY, journal.secretKey);
+  localStorage.setItem(restoredProfileKey, journal.profile);
+  if (journal.position !== null) localStorage.setItem(POSITION, journal.position);
+  localStorage.removeItem(RESTORE_JOURNAL);
+}
+
 function withApp(action) {
   const invoke = () => {
+    requireWalletWriter();
     syncAppTreeViewport();
     return action();
   };
@@ -167,13 +255,29 @@ function axeRecipeSummary(recipe) {
     recipe.stoneCost ? `${recipe.stoneCost} STONE` : '',
     recipe.ironOreCost ? `${recipe.ironOreCost} IRON ORE` : '',
   ].filter(Boolean);
-  return `Level ${recipe.requiredLevel} · ${costs.join(' + ')}`;
+  const requirement = recipe.axe === 'wooden'
+    ? 'First successful chop (25 XP)'
+    : `Level ${recipe.requiredLevel}`;
+  return `${requirement} · ${costs.join(' + ')}`;
 }
 
 function setBusy(value, message = '') {
   busy = value;
   if (message) status.textContent = message;
+  renderSocialControls();
   render();
+}
+
+function renderSocialControls() {
+  const playerActive = Boolean(state?.playerActive);
+  leaderboardPanel.hidden = !SERVER_URL;
+  delegateRenewalButton.hidden = !playerActive || !serverRegistered || !delegationAvailable;
+  delegateRenewalButton.disabled = busy || socialPosting;
+  delegateRenewalButton.textContent = delegatedRenewal
+    ? 'Stop delegated renewals'
+    : 'Delegate renewals';
+  chatInput.disabled = !playerActive || !serverRegistered || socialPosting;
+  sendChatButton.disabled = chatInput.disabled || !chatInput.value.trim();
 }
 
 
@@ -283,9 +387,17 @@ function syncAppTreeViewport() {
 }
 
 function adoptState(nextState) {
+  const socialIdentityChanged = state?.playerAsset !== nextState.playerAsset
+    || state?.playerActive !== nextState.playerActive;
   for (const tree of nextState.trees || []) treeViews.set(tree.treeId, tree);
   nextState.trees = treeLayout.map((tree) => treeViews.get(tree.treeId) || tree);
   state = nextState;
+  if (socialIdentityChanged) {
+    delegatedRenewal = delegationAvailable && delegatedPlayerAssets.includes(state.playerAsset);
+    renderLeaderboard();
+    renderChat();
+    renderSocialControls();
+  }
   return state;
 }
 
@@ -333,6 +445,7 @@ async function refreshChat() {
 }
 
 async function refreshLeaderboard() {
+  const requestedAt = Date.now();
   if (!SERVER_URL) return;
   try {
     const response = await fetch(`${SERVER_URL}/v1/leaderboard?limit=100`, {
@@ -341,20 +454,26 @@ async function refreshLeaderboard() {
     });
     if (!response.ok) throw new Error(`leaderboard returned ${response.status}`);
     const payload = await response.json();
+    if (delegationObservedAt != null && requestedAt < delegationObservedAt) return;
     leaderboardPlayers = Array.isArray(payload.players) ? payload.players : [];
     leaderboardTotal = Number(payload.total) || leaderboardPlayers.length;
     delegationAvailable = payload.delegationAvailable === true;
+    delegationObservedAt = requestedAt;
     delegatedPlayerAssets = Array.isArray(payload.delegatedPlayerAssets)
       ? payload.delegatedPlayerAssets
       : [];
     delegatedRenewal = delegationAvailable && delegatedPlayerAssets.includes(state?.playerAsset);
     updateServerStatus();
     publishSocialSnapshot();
-    render();
+    renderLeaderboard();
+    renderSocialControls();
   } catch (error) {
+    if (delegationObservedAt != null && requestedAt < delegationObservedAt) return;
     delegationAvailable = false;
+    delegationObservedAt = requestedAt;
     delegatedRenewal = false;
-    render();
+    publishSocialSnapshot();
+    renderSocialControls();
     leaderboardStatus.textContent = `Server unavailable: ${error}`;
   }
 }
@@ -383,6 +502,8 @@ async function syncServerRegistration(force = false) {
     if (!response.ok) throw new Error(payload.error || `registration returned ${response.status}`);
     serverRegistrationOutpoint = state.playerStateOutpoint;
     serverRegistered = true;
+    renderChat();
+    renderSocialControls();
     void Promise.all([refreshLeaderboard(), refreshPresence(), refreshChat()]);
     void publishLocation(true);
     serverRegistrationRetryAfter = 0;
@@ -413,16 +534,22 @@ async function publishLocation(force = false) {
     || locationPosting
     || now < nextLocationPostAt
   ) return;
-  const location = `${player.x}:${player.y}`;
-  if (!force && location === lastPublishedLocation) return;
+  const { x, y } = player;
+  const location = `${x}:${y}`;
+  if (
+    !force
+    && location === lastPublishedLocation
+    && now - lastPublishedLocationAt < LOCATION_HEARTBEAT_MS
+  ) return;
   locationPosting = true;
   nextLocationPostAt = now + LOCATION_POST_INTERVAL_MS;
   try {
     const locationRequest = await withApp(() => (
-      app.serverLocation(SERVER_URL, player.x, player.y, Date.now())
+      app.serverLocation(SERVER_URL, x, y, Date.now())
     ));
     await postServerAction('/v1/location', locationRequest);
     lastPublishedLocation = location;
+    lastPublishedLocationAt = now;
   } catch (error) {
     leaderboardStatus.textContent = `Location update failed: ${error}`;
   } finally {
@@ -433,7 +560,7 @@ async function publishLocation(force = false) {
 async function submitChat(message) {
   if (!SERVER_URL || !serverRegistered || !state?.playerActive || socialPosting) return;
   socialPosting = true;
-  render();
+  renderSocialControls();
   try {
     const chatRequest = await withApp(() => app.serverChat(SERVER_URL, message, Date.now()));
     await postServerAction('/v1/chat', chatRequest);
@@ -444,7 +571,7 @@ async function submitChat(message) {
     chatStatus.textContent = String(error);
   } finally {
     socialPosting = false;
-    render();
+    renderSocialControls();
   }
 }
 
@@ -457,7 +584,7 @@ async function updateDelegation() {
     || socialPosting
   ) return;
   socialPosting = true;
-  render();
+  renderSocialControls();
   const enabled = !delegatedRenewal;
   try {
     const delegationRequest = await withApp(() => (
@@ -465,6 +592,8 @@ async function updateDelegation() {
     ));
     await postServerAction('/v1/delegation', delegationRequest);
     delegatedRenewal = enabled;
+    delegationObservedAt = Date.now();
+    renderSocialControls();
     chatStatus.textContent = enabled
       ? 'Server renewal delegation enabled.'
       : 'Server renewal delegation disabled.';
@@ -473,7 +602,7 @@ async function updateDelegation() {
     chatStatus.textContent = String(error);
   } finally {
     socialPosting = false;
-    render();
+    renderSocialControls();
   }
 }
 
@@ -579,6 +708,7 @@ async function handleMapPosition(x, y) {
     return;
   }
   if (busy) return;
+  cancelWalking();
   const tree = worldTrees().find((candidate) => candidate.x === x && candidate.y === y);
   if (tree?.health === 0) {
     focusedTreeId = tree.treeId;
@@ -610,9 +740,13 @@ async function handleMapPosition(x, y) {
           candidate.x === position.x && candidate.y === position.y
         ))
       ));
-    if (await walkTo(destinations, tree.treeId)) {
+    const movement = walkTo(destinations, tree.treeId);
+    const generation = walkGeneration;
+    const arrived = await movement;
+    if (generation !== walkGeneration) return;
+    if (arrived) {
       if (state.fundingReady) {
-        attemptChop();
+        attemptChop(tree.treeId);
       } else {
         lockedTreeId = null;
         status.textContent = 'Player state is reconciling.';
@@ -702,9 +836,7 @@ function drawRemotePlayers(context, visible, screenX, screenY) {
   for (const location of remoteLocations) {
     if (location.playerAsset === state?.playerAsset || !visible(location.x, location.y)) continue;
     const key = coordinateKey(location.x, location.y);
-    const present = playersByPosition.get(key) || [];
-    present.push(location.playerAsset);
-    playersByPosition.set(key, present);
+    playersByPosition.set(key, (playersByPosition.get(key) || 0) + 1);
   }
   for (const [key, present] of playersByPosition) {
     const [x, y] = key.split(':').map(Number);
@@ -716,7 +848,7 @@ function drawRemotePlayers(context, visible, screenX, screenY) {
     context.fill();
     context.fillStyle = '#091014';
     context.font = 'bold 10px ui-monospace';
-    context.fillText(present.length === 1 ? '&' : String(present.length), centerX, centerY);
+    context.fillText(present === 1 ? '&' : String(present), centerX, centerY);
   }
   return playersByPosition;
 }
@@ -869,7 +1001,7 @@ function renderMap() {
     standingTreeCount,
     stumpCount,
     remotePlayerCount: [...playersByPosition.values()]
-      .reduce((total, players) => total + players.length, 0),
+      .reduce((total, count) => total + count, 0),
     clusterCount: playersByPosition.size,
   };
   globalThis.__WOODLAND_E2E_MAP_FRAME = mapFrame;
@@ -944,7 +1076,26 @@ async function copyAddress() {
 function render() {
   renderMap();
   refreshButton.disabled = busy || walking;
-  if (!state) return;
+  if (!state) {
+    address.textContent = '';
+    copyAddressButton.disabled = true;
+    fundingInstructionElement.textContent = '';
+    onboardingNote.textContent = '';
+    walletSats.textContent = '-';
+    playerState.textContent = 'Unavailable';
+    playerSession.textContent = '-';
+    element('player-asset').textContent = '';
+    hudLevel.textContent = '-';
+    hudXp.textContent = '-';
+    hudLogs.textContent = '-';
+    dashboard.classList.remove('player-active');
+    bagPanel.hidden = true;
+    statsPanel.hidden = true;
+    details.hidden = true;
+    for (const button of [activateButton, renewButton, craftAxeButton, resetProfileButton,
+      resetButton, downloadBackupButton, restoreBackupButton]) button.disabled = true;
+    return;
+  }
 
   const totalLogs = worldTrees().reduce((sum, tree) => sum + tree.logReserveRemaining, 0);
   const standingTrees = worldTrees().filter((tree) => tree.health > 0).length;
@@ -960,16 +1111,6 @@ function render() {
   dashboard.classList.toggle('player-active', playerActive);
   bagPanel.hidden = !playerActive;
   statsPanel.hidden = !playerActive;
-  leaderboardPanel.hidden = !SERVER_URL;
-  delegateRenewalButton.hidden = !playerActive || !serverRegistered || !delegationAvailable;
-  delegateRenewalButton.disabled = busy || socialPosting;
-  delegateRenewalButton.textContent = delegatedRenewal
-    ? 'Stop delegated renewals'
-    : 'Delegate renewals';
-  chatInput.disabled = !playerActive || !serverRegistered || socialPosting;
-  sendChatButton.disabled = chatInput.disabled || !chatInput.value.trim();
-  renderLeaderboard();
-  renderChat();
   address.textContent = state.address;
   copyAddressButton.disabled = !state.address;
   fundingInstructionElement.textContent = fundingMessage();
@@ -1042,15 +1183,23 @@ function render() {
 
   activateButton.hidden = playerActive;
   activateButton.disabled = walking || busy || playerActive || !state.activationReady;
-  activateButton.textContent = busy && !playerActive ? 'Creating player...' : 'Create player';
-  resetProfileButton.hidden = playerActive || !localStorage.getItem(profileStorageKey);
-  resetProfileButton.disabled = walking || busy || playerActive;
-  resetButton.disabled = walking || busy;
+  activateButton.textContent = state.pendingActivationTxid
+    ? (busy ? 'Recovering player...' : 'Recover player')
+    : (busy && !playerActive ? 'Creating player...' : 'Create player');
+  const mainnet = worldManifest?.network === 'bitcoin';
+  const pendingTransaction = hasPendingWalletTransaction();
+  resetProfileButton.hidden = mainnet || playerActive || !localStorage.getItem(profileStorageKey);
+  resetProfileButton.disabled = walking || busy || polling || playerActive || pendingTransaction;
+  resetButton.hidden = mainnet;
+  resetButton.disabled = walking || busy || polling || pendingTransaction;
   downloadBackupButton.disabled = walking || busy || !app;
-  restoreBackupButton.disabled = walking || busy || !app || Boolean(state.pendingChopTxid);
-  restoreBackupButton.title = state.pendingChopTxid
-    ? 'Wait for the pending swing to reconcile before switching keys.'
-    : '';
+  restoreBackupButton.disabled = walking || busy || polling || !app
+    || pendingTransaction;
+  restoreBackupButton.title = state.pendingActivationTxid
+    ? 'Wait for the pending activation to reconcile before switching keys.'
+    : pendingTransaction
+      ? 'Wait for the saved pending transaction to reconcile before switching keys.'
+      : '';
   const nextRecipe = state.nextAxeRecipe;
   axeRecipe.textContent = axeRecipeSummary(nextRecipe);
   craftAxeButton.textContent = nextRecipe
@@ -1124,11 +1273,13 @@ async function run(label, action, completion = () => 'Success') {
 }
 
 function persistProfile() {
+  requireWalletWriter();
   if (app) localStorage.setItem(profileStorageKey, app.exportProfile());
 }
 
 function persistPosition() {
   if (!state?.playerActive) return;
+  requireWalletWriter();
   localStorage.setItem(POSITION, JSON.stringify({
     genesisTxid: state.genesisTxid,
     x: player.x,
@@ -1181,6 +1332,7 @@ function createPlayerBackup() {
     walletAddress: app.address(),
     secretKey: app.exportKey(),
     playerAsset: profile.playerAsset || null,
+    pendingActivation: profile.pendingActivation || undefined,
     position: state.playerActive ? { x: player.x, y: player.y } : null,
   };
 }
@@ -1254,7 +1406,8 @@ function parsePlayerBackup(text) {
 }
 
 async function restorePlayerBackup(file) {
-  if (busy || !file) return;
+  if (busy || polling || !file || hasPendingWalletTransaction()) return;
+  requireWalletWriter();
   let reloading = false;
   setBusy(true, 'Validating player backup...');
   setBackupStatus('Checking the key, PLAYER_ID, and current world...');
@@ -1264,6 +1417,7 @@ async function restorePlayerBackup(file) {
     const profile = JSON.stringify({
       genesisTxid: backup.genesisTxid,
       playerAsset: backup.playerAsset,
+      pendingActivation: backup.pendingActivation,
     });
     const candidate = await WoodlandApp.init(
       worldManifest.arkadeServiceUrl,
@@ -1277,7 +1431,9 @@ async function restorePlayerBackup(file) {
     }
 
     let playerCheck = 'This backup contains a wallet key with no activated PLAYER_ID.';
-    if (backup.playerAsset) {
+    if (backup.pendingActivation) {
+      playerCheck = 'This backup includes a submitted activation. It will be recovered after restoring; do not deposit again.';
+    } else if (backup.playerAsset) {
       try {
         const candidateState = await candidate.refreshPlayer();
         playerCheck = candidateState.playerActive
@@ -1294,25 +1450,33 @@ async function restorePlayerBackup(file) {
       return;
     }
 
-    localStorage.setItem(KEY, backup.secretKey);
-    localStorage.removeItem(PROFILE);
-    localStorage.setItem(profileStorageKey, profile);
-    localStorage.removeItem(pendingStorageKey);
-    if (backup.position) {
-      localStorage.setItem(POSITION, JSON.stringify({
-        genesisTxid: backup.genesisTxid,
-        x: backup.position.x,
-        y: backup.position.y,
-      }));
-    } else {
-      localStorage.removeItem(POSITION);
-    }
+    const journal = {
+      version: 1,
+      genesisTxid: backup.genesisTxid,
+      secretKey: backup.secretKey,
+      profile,
+      pendingKey: pendingStorageKey,
+      position: backup.position ? JSON.stringify({
+        genesisTxid: backup.genesisTxid, x: backup.position.x, y: backup.position.y,
+      }) : null,
+    };
+    // If staging fails, the current wallet is untouched. Once staged, stop
+    // using its in-memory key: reload/Refresh must finish this exact restore.
+    localStorage.setItem(RESTORE_JOURNAL, JSON.stringify(journal));
+    app = undefined;
+    state = undefined;
+    serverRegistered = false;
+    recoverWalletRestore();
     setBackupStatus('Backup restored. Reloading the player...');
     appendLog('Player backup restored; reloading.');
     reloading = true;
     location.reload();
   } catch (error) {
-    const message = `Backup restore failed: ${error}`;
+    reloading = false;
+    const unfinished = Boolean(localStorage.getItem(RESTORE_JOURNAL));
+    const message = unfinished
+      ? `Backup restore is saved but unfinished: ${error}. Free browser storage, then press Refresh to recover it.`
+      : `Backup restore failed: ${error}`;
     setBackupStatus(message, true);
     status.classList.add('error');
     status.textContent = message;
@@ -1361,12 +1525,18 @@ refreshButton.addEventListener('click', () => {
   run(
     resume ? 'Resuming the exact pending swing...' : 'Refreshing indexed world and wallet state...',
     () => withApp(() => (resume ? app.resumePendingChop() : app.refresh())),
-    () => (resume ? 'Pending swing reconciled.' : 'Refresh complete.'),
+    () => state.pendingActivationTxid
+      ? state.activationBlockedReason
+      : (resume ? 'Pending swing reconciled.' : 'Refresh complete.'),
   );
 });
 
 activateButton.addEventListener('click', () => (
-  run('Issuing PLAYER_ID into owner-authorized player state...', () => withApp(activatePlayer))
+  run(
+    'Issuing PLAYER_ID into owner-authorized player state...',
+    () => withApp(activatePlayer),
+    () => state.pendingActivationTxid ? state.activationBlockedReason : 'Player activated.',
+  )
 ));
 
 
@@ -1431,7 +1601,7 @@ async function chopUntilLog(treeId) {
 }
 }
 
-function attemptChop() {
+function attemptChop(selectedTreeId = null) {
   if (chopping) {
     stopChopping = true;
     status.textContent = 'Stopping after the current swing...';
@@ -1439,7 +1609,12 @@ function attemptChop() {
     return;
   }
   if (walking) cancelWalking();
-  const tree = adjacentTree();
+  const tree = selectedTreeId == null
+    ? adjacentTree()
+    : worldTrees().find((candidate) => (
+      candidate.treeId === selectedTreeId
+      && Math.abs(player.x - candidate.x) + Math.abs(player.y - candidate.y) === 1
+    ));
   if (busy || !state?.fundingReady || !tree || tree.health === 0) {
     lockedTreeId = null;
     renderMap();
@@ -1522,7 +1697,9 @@ restoreBackupFile.addEventListener('change', () => {
 });
 
 resetButton.addEventListener('click', () => {
-  if (busy || !window.confirm('Forget this local test key and create a new wallet?')) return;
+  if (!walletWriterOwned || !worldManifest || worldManifest.network === 'bitcoin'
+    || busy || polling || hasPendingWalletTransaction()
+    || !window.confirm('Forget this local test key and create a new wallet?')) return;
   localStorage.removeItem(KEY);
   localStorage.removeItem(PROFILE);
   localStorage.removeItem(profileStorageKey);
@@ -1533,8 +1710,10 @@ resetButton.addEventListener('click', () => {
 
 resetProfileButton.addEventListener('click', () => {
   if (
-    busy
+    !walletWriterOwned || !worldManifest || worldManifest.network === 'bitcoin'
+    || busy || polling
     || state?.playerActive
+    || hasPendingWalletTransaction()
     || !window.confirm('Forget the saved world profile but keep this funded wallet key?')
   ) return;
   localStorage.removeItem(profileStorageKey);
@@ -1549,6 +1728,8 @@ async function boot() {
   status.classList.remove('error');
   status.textContent = 'Connecting directly to Arkade and the emulator...';
   try {
+    await acquireWalletWriter();
+    recoverWalletRestore();
     await init();
     const worldResponse = await fetch(WORLD, { cache: 'no-store' });
     if (!worldResponse.ok) {
@@ -1603,7 +1784,11 @@ async function boot() {
         globalThis.__WOODLAND_E2E_ERROR = String(error);
       }
     }
-    if (!state.pendingChopTxid) status.textContent = 'Ready';
+    if (!state.pendingChopTxid) {
+      status.textContent = state.pendingActivationTxid
+        ? 'Recovering the submitted activation. Refresh or retry; do not deposit again.'
+        : 'Ready';
+    }
     appendLog('Connected to woodland.sh');
     globalThis.__WOODLAND_E2E_READY = true;
     globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT = (minX, minY, maxX, maxY) => {
@@ -1723,6 +1908,7 @@ async function boot() {
     }
   } finally {
     busy = false;
+    renderSocialControls();
     render();
   }
 }
@@ -1746,6 +1932,7 @@ boot().catch(reportBootError);
 setInterval(async () => {
   if (!app || busy || polling) return;
   polling = true;
+  render();
   try {
     const resumePending = Boolean(state?.pendingChopTxid)
       && Date.now() >= pendingRetryAfter;
@@ -1770,7 +1957,10 @@ setInterval(async () => {
       && state.playerStateExpiresInSeconds != null
       && state.playerRolloverMarginSeconds != null
       && state.playerStateExpiresInSeconds < state.playerRolloverMarginSeconds
-      && !delegatedRenewal
+      && !(delegatedRenewal
+        && delegationObservedAt != null
+        && Date.now() - delegationObservedAt < DELEGATION_FRESHNESS_MS
+        && state.playerStateExpiresInSeconds > OWNER_RENEWAL_FALLBACK_SECONDS)
     ) {
       status.textContent = 'Rolling player state into a fresh Arkade batch...';
       adoptState(await withApp(renewPlayer));
@@ -1781,7 +1971,10 @@ setInterval(async () => {
       leaderboardStatus.textContent = `Server registration failed: ${error}`;
     });
   } catch {}
-  finally { polling = false; }
+  finally {
+    polling = false;
+    render();
+  }
 
 }, 10_000);
 window.addEventListener('resize', renderMap);

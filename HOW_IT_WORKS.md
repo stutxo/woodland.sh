@@ -7,14 +7,14 @@ material selected by an independent public bucket.
 
 ## The Frontend Is Not the Game
 
-The map is presentation. The boundary is the signed schema 3 manifest, indexed
+The map is presentation. The boundary is the signed schema 4 manifest, indexed
 Arkade state, fixed Asset V1 supply, Bitcoin Taproot signer closures, and Arkade
 Script. The browser verifies the deployer signature before calling the
 manifest-pinned Arkade service and stock emulator directly.
 
 ## Five World Assets, One Marker per Player
 
-Protocol v3 creates:
+Protocol v4 creates:
 
 ```text
 420 TREE
@@ -23,6 +23,10 @@ Protocol v3 creates:
 21,000,000 STONE
 21,000,000 IRON ORE
 ```
+
+This version requires a fresh genesis and signed schema-4 manifest. Never reuse
+v3 assets or manifests: the changed player and tree covenants cannot upgrade
+an existing v3 world in place.
 
 Each initial tree owns one TREE and 50,000 units each of LOG, XP, STONE, and
 IRON ORE. The XP reserve represents 1,250,000 Woodcutting XP. It also starts
@@ -109,9 +113,10 @@ the public 20% candidate rather than a forced miss or reward.
 
 Therefore `Cnext + 10,000*G = C+p` on every swing and `Cnext` stays within
 0–20,000. At base rate, a reward occurs at least once per eleven swings (no
-more than ten consecutive misses), and no rate permits more than two consecutive
-successes. Selecting another tree cannot change `Rnext`, `C`, or `G`. The roll
-is public and predictable: the mechanism bounds variance; it is not a VRF.
+more than ten consecutive misses). Success runs are bounded at two for rates
+up to one third and at three for higher axe-enhanced rates. Selecting another
+tree cannot change `Rnext`, `C`, or `G`. The roll is public and predictable:
+the mechanism bounds variance; it is not a VRF.
 
 Material selection is independent of the LOG candidate:
 
@@ -133,10 +138,16 @@ shared. Both inspect the same transaction.
 
 The player half preserves its P2TR, 330 sats, PLAYER_ID, equipped axe, and every
 inventory asset while advancing the player roll and luck credit canonically. It
-pins the exact tree P2TR and fixed 330-sat value. The tree half requires a live
-Arkade covenant at player input zero, pins all five world Asset IDs to groups
-one through five, and enforces the same player-luck, reward, health, LOG, XP,
-STONE, and IRON ORE deltas. Both require the same extension and anchor shape.
+pins the immutable TREE AssetId and fixed 330-sat value. The tree half
+authenticates the complete six-leaf player Taproot template and its NUMS
+internal key at input zero. Its witness supplies the 32-byte owner key plus a
+single compressed-output prefix byte (`0x02` or `0x03`). This rejects arbitrary
+player scripts and extra escape leaves. Pinning TREE instead of tree P2TR on
+the player side avoids a circular script dependency.
+
+The tree also pins all five world AssetIds to groups one through five and
+enforces the same player-luck, reward, health, LOG, XP, STONE, and IRON ORE
+deltas. Both require the same extension and anchor shape.
 
 The player tapleaf closes over owner, Arkade operator, and script-tweaked
 emulator. The tree tapleaf closes over operator and tweaked emulator. The
@@ -151,7 +162,7 @@ anchor. The player covenant preserves sats, PLAYER_ID, XP, roll, luck, and
 unspent inventory while requiring the next axe packet and exact recipe burn:
 
 ```text
-Wooden Axe: level 1,  1 LOG
+Wooden Axe: level 1 plus 1 earned XP unit (25 XP), 1 LOG
 Stone Axe:  level 5,  2 LOG + 2 STONE
 Iron Axe:   level 15, 5 LOG + 2 IRON ORE
 ```
@@ -159,6 +170,9 @@ Iron Axe:   level 15, 5 LOG + 2 IRON ORE
 The highest crafted tier is always equipped. There is no skip, downgrade, or
 unequip transition. The craft leaf requires owner, operator, and
 script-tweaked-emulator signatures.
+The first Wooden Axe therefore requires one successful chop. XP is preserved,
+not spent, and equipped tiers remain constrained by held XP on every action.
+Stone and Iron keep their existing level thresholds.
 
 ## Stumps and One-Batch Regrowth
 
@@ -192,7 +206,7 @@ tree lineage near expiry.
 
 ## Honest Boundary
 
-Protocol v3 proves fixed world supply, sole-source and soulbound XP and
+Protocol v4 proves fixed world supply, sole-source and soulbound XP and
 materials, selected player lineage, canonical direct activation, recursive
 player-luck and axe transitions, packet canonicality, atomic reward movement,
 local-reserve preservation, and one-batch funded-stump regrowth. The signed
@@ -203,7 +217,8 @@ PLAYER_ID means “this recursive state,” not “one human”: Sybil creation 
 identity grinding remain permissionless. A covenant cannot inspect ancestry
 from before a marker entered player state, so an owner can use an intermediate
 output to choose any starting roll and credit within the corridor. This can bias
-reward timing inside the corridor; the recursive rate budget and streak bounds
-still apply after entry. Movement and adjacency are frontend policy. Randomness
+reward timing inside the corridor; it cannot provide an axe without the required
+earned XP. The recursive rate budget and streak bounds still apply after entry.
+Movement and adjacency are frontend policy. Randomness
 is public and predictable. Browser key custody and service availability are not
 solved. Arkade Script is enforced by the pinned stock emulator.

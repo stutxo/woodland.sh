@@ -209,7 +209,16 @@ pub struct AxeRecipe {
 
 impl AxeRecipe {
     pub const fn required_xp_balance(self) -> u64 {
-        xp_balance_for_woodcutting_xp(XP_FOR_LEVEL[(self.required_level - 1) as usize])
+        let level_balance =
+            xp_balance_for_woodcutting_xp(XP_FOR_LEVEL[(self.required_level - 1) as usize]);
+        // Every equipped axe must be backed by earned, soulbound progression.
+        // Otherwise a marker routed through an ordinary output could enter the
+        // player contract with a free axe before its first successful chop.
+        if level_balance == 0 {
+            1
+        } else {
+            level_balance
+        }
     }
 }
 
@@ -652,6 +661,7 @@ pub fn build_player_contract<C: Verification>(
     dust_sats: u64,
     tree_script: &ScriptBuf,
 ) -> Result<PlayerContract> {
+    crate::tree::witness_v1_program(tree_script, "tree contract")?;
     if [owner_pk, operator_pk, emulator_pk, rollover_pk]
         .into_iter()
         .collect::<HashSet<_>>()
@@ -671,12 +681,12 @@ pub fn build_player_contract<C: Verification>(
         ));
     }
     let chop_arkade_script = player_chop_covenant_script(
+        tree_asset,
         log_asset,
         xp_asset,
         stone_asset,
         iron_ore_asset,
         dust_sats,
-        tree_script,
     )?;
     let renewal_arkade_script = player_renewal_covenant_script(
         log_asset,
@@ -876,8 +886,11 @@ pub fn player_craft_covenant_script(
     .push_opcode(op::INSPECTOUTASSETCOUNT)
     .push_int(0)
     .push_opcode(OP_EQUALVERIFY);
-    let builder =
-        push_canonical_initial_player_luck(builder, crate::protocol::CRAFT_STATE_INPUT_INDEX);
+    let builder = push_canonical_initial_player_luck(
+        builder,
+        crate::protocol::CRAFT_STATE_INPUT_INDEX,
+        xp_asset,
+    );
     let builder = crate::tree::push_equal_state_packet_at(
         builder,
         PLAYER_ROLL_PACKET_TYPE,
@@ -927,6 +940,7 @@ pub fn player_craft_covenant_script(
         .push_opcode(OP_EQUAL)
         .push_opcode(OP_IF)
         .push_opcode(OP_DROP);
+    let builder = push_required_xp_balance(builder, xp_asset, AXE_RECIPES[0].required_xp_balance());
     let builder = push_exact_state_asset_burn(builder, log_asset, AXE_RECIPES[0].log_cost);
     let builder = push_exact_state_asset_burn(builder, stone_asset, 0);
     let builder = push_exact_state_asset_burn(builder, iron_ore_asset, 0)
@@ -1012,7 +1026,7 @@ pub fn player_renewal_covenant_script(
     .push_opcode(op::INSPECTINPUTVALUE)
     .push_int(dust)
     .push_opcode(OP_EQUALVERIFY);
-    let builder = push_canonical_initial_player_luck(builder, RENEWAL_STATE_INPUT_INDEX);
+    let builder = push_canonical_initial_player_luck(builder, RENEWAL_STATE_INPUT_INDEX, xp_asset);
     let builder = crate::tree::push_equal_state_packet(builder, PLAYER_ROLL_PACKET_TYPE);
     let builder = crate::tree::push_equal_state_packet(builder, PLAYER_LUCK_CREDIT_PACKET_TYPE);
     let builder = crate::tree::push_equal_state_packet(builder, PLAYER_AXE_PACKET_TYPE);
@@ -1110,8 +1124,11 @@ pub fn player_withdraw_covenant_script(
     .push_int(crate::protocol::WITHDRAW_FUNDING_INPUT_INDEX as i64)
     .push_opcode(op::INSPECTINPUTVALUE)
     .push_opcode(OP_EQUALVERIFY);
-    let builder =
-        push_canonical_initial_player_luck(builder, crate::protocol::WITHDRAW_STATE_INPUT_INDEX);
+    let builder = push_canonical_initial_player_luck(
+        builder,
+        crate::protocol::WITHDRAW_STATE_INPUT_INDEX,
+        xp_asset,
+    );
     // Roll and luck credit are the complete mutable player packet state.
     let builder = crate::tree::push_equal_state_packet_at(
         builder,
@@ -1274,33 +1291,30 @@ fn canonical_player_state_assets<'a>(
 
 /// Build the personalized half of the atomic PLAYER/TREE chop. The shared tree
 /// covenant owns every reciprocal resource delta and the player-luck
-/// transition; this half pins that tree and preserves owner continuity.
+/// transition; this half authenticates the tree by its world-issued marker and
+/// preserves owner continuity. The marker never leaves the tree covenant, so
+/// this avoids a circular commitment between the tree and player scripts.
 pub fn player_chop_covenant_script(
+    tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
     stone_asset: AssetId,
     iron_ore_asset: AssetId,
     dust_sats: u64,
-    tree_script: &ScriptBuf,
 ) -> Result<ScriptBuf> {
-    if [log_asset, xp_asset, stone_asset, iron_ore_asset]
+    if [tree_asset, log_asset, xp_asset, stone_asset, iron_ore_asset]
         .into_iter()
         .collect::<HashSet<_>>()
         .len()
-        != 4
+        != 5
     {
         return Err(anyhow!("player inventory asset IDs must differ"));
     }
     if dust_sats == 0 {
         return Err(anyhow!("player chop dust must be non-zero"));
     }
-    if !tree_script.is_p2tr() {
-        return Err(anyhow!("tree script must be P2TR"));
-    }
     let dust = i64::try_from(dust_sats)
         .map_err(|_| anyhow!("player dust exceeds script integer range"))?;
-    let tree_program = PushBytesBuf::try_from(tree_script.as_bytes()[2..].to_vec())
-        .expect("validated witness program is a bounded push");
     let tree_value = i64::try_from(crate::tree::tree_value_sats(dust_sats))
         .map_err(|_| anyhow!("tree value exceeds script integer range"))?;
     let anchor_program =
@@ -1325,18 +1339,16 @@ pub fn player_chop_covenant_script(
             .push_opcode(op::INSPECTINPUTVALUE)
             .push_int(dust)
             .push_opcode(OP_EQUALVERIFY)
-            // Pin the reciprocal shared TREE input and output.
+            // Preserve the marker-bearing tree's P2TR. Its unique world asset
+            // is authenticated below instead of embedding the tree address.
             .push_int(TREE_INPUT_INDEX as i64)
             .push_opcode(op::INSPECTINPUTSCRIPTPUBKEY)
             .push_int(1)
-            .push_opcode(OP_EQUALVERIFY)
-            .push_slice(tree_program.clone())
             .push_opcode(OP_EQUALVERIFY)
             .push_int(i64::from(TREE_OUTPUT_INDEX))
             .push_opcode(op::INSPECTOUTPUTSCRIPTPUBKEY)
             .push_int(1)
             .push_opcode(OP_EQUALVERIFY)
-            .push_slice(tree_program)
             .push_opcode(OP_EQUALVERIFY)
             .push_int(TREE_INPUT_INDEX as i64)
             .push_opcode(op::INSPECTINPUTVALUE)
@@ -1349,7 +1361,17 @@ pub fn player_chop_covenant_script(
             .push_int(TREE_INPUT_INDEX as i64)
             .push_opcode(op::INSPECTINPUTARKADESCRIPTHASH)
             .push_opcode(OP_DROP);
-    let builder = push_canonical_initial_player_luck(builder, PLAYER_STATE_INPUT_INDEX);
+    let builder = crate::tree::push_input_asset_lookup(builder, TREE_INPUT_INDEX, tree_asset)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY);
+    let builder = crate::tree::push_output_asset_lookup(builder, TREE_OUTPUT_INDEX, tree_asset)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_int(1)
+        .push_opcode(OP_EQUALVERIFY);
+    let builder = push_canonical_initial_player_luck(builder, PLAYER_STATE_INPUT_INDEX, xp_asset);
     let builder =
         push_advanced_player_luck(builder, PLAYER_STATE_INPUT_INDEX, xp_asset).push_opcode(OP_DROP);
     let builder = crate::tree::push_player_marker_group(
@@ -1493,7 +1515,20 @@ pub fn attach_player_chop_context(
         ark_core::introspector::packet::IntrospectorEntry {
             vin: TREE_INPUT_INDEX as u16,
             script: tree_contract.chop_arkade_script.clone(),
-            witness: bitcoin::Witness::default(),
+            witness: bitcoin::Witness::from_slice(&[
+                contract.owner.serialize().to_vec(),
+                vec![if contract
+                    .vtxo
+                    .get_spend_info(contract.chop_spend_script.clone())
+                    .map_err(|error| anyhow!("player template control block: {error}"))?
+                    .output_key_parity
+                    == bitcoin::key::Parity::Even
+                {
+                    2
+                } else {
+                    3
+                }],
+            ]),
         },
     ])
     .context("build player chop emulator packet")?;
@@ -1749,6 +1784,32 @@ fn push_player_axe_value(builder: Builder, input_index: Option<usize>) -> Builde
         .push_opcode(OP_VERIFY)
 }
 
+/// A player with no earned XP cannot enter through an ordinary transfer with
+/// an equipped axe. Higher tiers must also satisfy their soulbound level gate.
+/// Canonical craft transitions enforce the recipe in addition to this bound.
+fn push_player_axe_progression(
+    builder: Builder,
+    player_input_index: usize,
+    xp_asset: AssetId,
+) -> Builder {
+    let mut builder = push_player_axe_value(builder, Some(player_input_index));
+    for recipe in AXE_RECIPES {
+        builder = builder
+            .push_opcode(OP_DUP)
+            .push_int(recipe.axe as i64)
+            .push_opcode(OP_EQUAL)
+            .push_opcode(OP_IF);
+        builder =
+            crate::tree::push_optional_input_asset_lookup(builder, player_input_index, xp_asset)
+                .push_opcode(OP_DROP)
+                .push_int((recipe.required_xp_balance() - 1) as i64)
+                .push_opcode(OP_GREATERTHAN)
+                .push_opcode(OP_VERIFY)
+                .push_opcode(OP_ENDIF);
+    }
+    builder.push_opcode(OP_DROP)
+}
+
 fn push_axe_bonus_basis_points(builder: Builder, player_input_index: usize) -> Builder {
     push_player_axe_value(builder, Some(player_input_index))
         .push_opcode(OP_DUP)
@@ -1901,7 +1962,9 @@ fn push_luck_credit_value(builder: Builder, input_index: Option<usize>) -> Build
 pub(crate) fn push_canonical_initial_player_luck(
     builder: Builder,
     player_input_index: usize,
+    xp_asset: AssetId,
 ) -> Builder {
+    let builder = push_player_axe_progression(builder, player_input_index, xp_asset);
     let domain = PushBytesBuf::try_from(PLAYER_ROLL_DOMAIN.to_vec())
         .expect("player-roll domain is a bounded push");
     let builder = builder
@@ -2175,7 +2238,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(AXE_RECIPES.map(AxeRecipe::required_xp_balance), [0, 16, 97]);
+        assert_eq!(AXE_RECIPES.map(AxeRecipe::required_xp_balance), [1, 16, 97]);
         for (axe, base, capped) in [
             (AxeTier::None, 2_000, 3_000),
             (AxeTier::Wooden, 2_200, 3_200),
@@ -2264,10 +2327,22 @@ mod tests {
             LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS[3],
             LEVEL_LOG_DROP_XP_BALANCE_THRESHOLDS[4],
         ];
-        for (index, xp_balance) in xp_balances.into_iter().enumerate() {
+        for (index, (xp_balance, axe)) in xp_balances
+            .into_iter()
+            .flat_map(|balance| {
+                [
+                    AxeTier::None,
+                    AxeTier::Wooden,
+                    AxeTier::Stone,
+                    AxeTier::Iron,
+                ]
+                .map(move |axe| (balance, axe))
+            })
+            .enumerate()
+        {
             let mut luck = PlayerLuck::initial(&player_script(index as u8 + 1)).unwrap();
             let initial_credit = luck.credit.value();
-            let rate = log_drop_basis_points(xp_balance, crate::player::AxeTier::None);
+            let rate = log_drop_basis_points(xp_balance, axe);
             let mut successes = 0_u64;
             let mut miss_run = 0_u64;
             let mut success_run = 0_u64;
@@ -2275,7 +2350,7 @@ mod tests {
             let mut max_success_run = 0_u64;
             for _ in 0..100_000 {
                 let previous_credit = luck.credit.value();
-                let (next, success) = luck.advance(xp_balance, crate::player::AxeTier::None);
+                let (next, success) = luck.advance(xp_balance, axe);
                 assert!(next.credit.value() <= MAX_LUCK_CREDIT);
                 assert_eq!(
                     next.credit.value() + u64::from(success) * CHOP_ROLL_BASIS_POINTS,
@@ -2302,8 +2377,8 @@ mod tests {
                 "XP asset balance {xp_balance}: miss run {max_miss_run}"
             );
             assert!(
-                max_success_run <= 2,
-                "XP asset balance {xp_balance}: success run {max_success_run}"
+                max_success_run <= MAX_LUCK_CREDIT / (CHOP_ROLL_BASIS_POINTS - rate),
+                "XP asset balance {xp_balance}, axe {axe:?}: success run {max_success_run}"
             );
         }
     }
@@ -2639,12 +2714,12 @@ mod tests {
             Address::p2tr(&secp, xonly(&secp, 6), None, Network::Regtest).script_pubkey();
         let (tree_asset, log_asset, xp_asset) = (asset(2, 0), asset(2, 1), asset(2, 2));
         let chop = player_chop_covenant_script(
+            tree_asset,
             log_asset,
             xp_asset,
             asset(2, 3),
             asset(2, 4),
             330,
-            &tree_script,
         )
         .unwrap();
         let renewal =

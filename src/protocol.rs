@@ -1,4 +1,4 @@
-//! Canonical transaction indexes and extension packet types for protocol v3.
+//! Canonical transaction indexes and extension packet types for protocol v4.
 //!
 //! Both covenant halves, transaction builders, state discovery, and tests use
 //! these values. They are consensus-like protocol shape, not client defaults.

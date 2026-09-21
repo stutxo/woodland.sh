@@ -65,8 +65,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: actions/setup-go@v6
         with:
-          go-version: 1.26.6
-          cache: false
+          go-version: '1.26.6'
+          cache: true
+          cache-dependency-path: scripts/covenant-vm/go.sum
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
@@ -74,6 +75,8 @@ jobs:
           cache-on-failure: true
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --all-targets --features regtest-e2e
+      - name: Execute covenant vectors in the pinned stock Arkade VM
+        run: ./scripts/test-covenants.sh
       - run: cargo clippy --locked --all-targets --features regtest-e2e -- -D warnings
       - run: cargo check --locked --all-targets --features woodland-app
       - run: cargo clippy --locked --all-targets --features woodland-app -- -D warnings
@@ -85,7 +88,11 @@ jobs:
       - run: CC_wasm32_unknown_unknown=clang cargo clippy --locked --lib --target wasm32-unknown-unknown --features regtest-e2e -- -D warnings
       - run: CC_wasm32_unknown_unknown=clang cargo check --locked --lib --target wasm32-unknown-unknown --features woodland-app
       - run: CC_wasm32_unknown_unknown=clang cargo clippy --locked --lib --target wasm32-unknown-unknown --features woodland-app -- -D warnings
-      - run: bash -n scripts/*.sh
+      - name: Check shell scripts
+        run: |
+          for file in scripts/*.sh; do
+            bash -n "$file"
+          done
       - name: Check JavaScript
         run: |
           for file in scripts/*.mjs regtest/*.mjs regtest/lib/*.mjs regtest/lib/setup/*.mjs web/*.js; do

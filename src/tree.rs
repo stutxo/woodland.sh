@@ -401,6 +401,10 @@ pub fn build_tree_contract<C: Verification>(
     script_int(tree_value_sats(dust_sats), "tree value")?;
 
     let chop_arkade_script = tree_covenant_script(
+        operator_pk,
+        emulator_pk,
+        rollover_pk,
+        exit_delay,
         tree_asset,
         log_asset,
         xp_asset,
@@ -511,9 +515,14 @@ pub fn build_tree_contract<C: Verification>(
 ///
 /// This half owns the global game rule: tree identity, player-bound luck
 /// advancement, success probability, health, reward movement, and fixed supply.
-/// The personalized player half supplies the owner signature and pins this
-/// exact tree contract.
+/// The personalized player half supplies the owner signature and authenticates
+/// this world's conserved TREE marker. This half verifies its full Taproot tree.
+#[allow(clippy::too_many_arguments)]
 pub fn tree_covenant_script(
+    operator_pk: XOnlyPublicKey,
+    emulator_pk: XOnlyPublicKey,
+    rollover_pk: XOnlyPublicKey,
+    exit_delay: Sequence,
     tree_asset: AssetId,
     log_asset: AssetId,
     xp_asset: AssetId,
@@ -538,16 +547,62 @@ pub fn tree_covenant_script(
     let tree_value = script_int(tree_value_sats(dust_sats), "tree value")?;
     let anchor_program =
         witness_v1_program(&ark_core::anchor_output().script_pubkey, "Arkade anchor")?;
-    let builder = push_chop_shape(Builder::new(), TREE_INPUT_INDEX, &anchor_program)?
+    // Player programs depend on the immutable TREE marker, never this tree's
+    // P2TR address. We can therefore commit to every permitted player leaf
+    // without a circular tree/player script hash dependency.
+    let player_programs = [
+        crate::player::player_chop_covenant_script(
+            tree_asset,
+            log_asset,
+            xp_asset,
+            stone_asset,
+            iron_ore_asset,
+            dust_sats,
+        )?,
+        crate::player::player_renewal_covenant_script(
+            log_asset,
+            xp_asset,
+            stone_asset,
+            iron_ore_asset,
+            dust_sats,
+        )?,
+        crate::player::player_withdraw_covenant_script(
+            log_asset,
+            xp_asset,
+            stone_asset,
+            iron_ore_asset,
+            dust_sats,
+        )?,
+        crate::player::player_craft_covenant_script(
+            log_asset,
+            xp_asset,
+            stone_asset,
+            iron_ore_asset,
+            dust_sats,
+        )?,
+    ];
+    let mut player_emulators = [emulator_pk; 4];
+    for (key, program) in player_emulators.iter_mut().zip(&player_programs) {
+        *key = ark_script::compute_arkade_script_public_key(&emulator_pk, program)
+            .context("derive canonical player emulator signer")?;
+    }
+    let builder = crate::player_template::push_player_template(
+        Builder::new(),
+        operator_pk,
+        rollover_pk,
+        exit_delay,
+        player_emulators,
+    )?;
+    let builder = push_chop_shape(builder, TREE_INPUT_INDEX, &anchor_program)?
         .push_int(TREE_INPUT_INDEX as i64)
         .push_opcode(op::INSPECTINASSETCOUNT)
         .push_int(5)
         .push_opcode(OP_EQUALVERIFY)
-        // The player input must execute an Arkade covenant, while its own
-        // personalized leaf pins this exact shared tree.
+        // Authenticate the executed path as well as the complete contract.
         .push_int(PLAYER_STATE_INPUT_INDEX as i64)
         .push_opcode(op::INSPECTINPUTARKADESCRIPTHASH)
-        .push_opcode(OP_DROP);
+        .push_slice(ark_script::arkade_script_hash(&player_programs[0]))
+        .push_opcode(OP_EQUALVERIFY);
 
     let mut builder =
         push_player_marker_group(builder, PLAYER_STATE_INPUT_INDEX, PLAYER_STATE_OUTPUT_INDEX);
@@ -602,8 +657,11 @@ pub fn tree_covenant_script(
         .push_opcode(OP_EQUALVERIFY)
         .push_opcode(OP_EQUALVERIFY);
 
-    let builder =
-        crate::player::push_canonical_initial_player_luck(builder, PLAYER_STATE_INPUT_INDEX);
+    let builder = crate::player::push_canonical_initial_player_luck(
+        builder,
+        PLAYER_STATE_INPUT_INDEX,
+        xp_asset,
+    );
     // Compute the canonical reward once. Keep one copy on the altstack while
     // each conservation relation consumes a main-stack copy.
     let builder =
@@ -1894,11 +1952,23 @@ mod tests {
 
     #[test]
     fn scripts_commit_assets_health_and_split_regrowth_from_maintenance() {
+        let secp = Secp256k1::new();
         let tree = asset(1, 0);
         let log = asset(1, 1);
         let xp_balance = asset(1, 2);
-        let chop =
-            tree_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4), 330).unwrap();
+        let chop = tree_covenant_script(
+            xonly(&secp, 3),
+            xonly(&secp, 4),
+            xonly(&secp, 5),
+            Sequence::from_height(144),
+            tree,
+            log,
+            xp_balance,
+            asset(2, 3),
+            asset(2, 4),
+            330,
+        )
+        .unwrap();
         let regrowth =
             tree_regrowth_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4)).unwrap();
         let maintenance =
@@ -1997,8 +2067,6 @@ mod tests {
         let emulator = xonly(&secp, 4);
         let rollover = xonly(&secp, 5);
         let (tree, log, xp_balance) = (asset(1, 0), asset(1, 1), asset(1, 2));
-        let chop =
-            tree_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4), 330).unwrap();
         let regrowth =
             tree_regrowth_covenant_script(tree, log, xp_balance, asset(2, 3), asset(2, 4)).unwrap();
         let maintenance =
@@ -2006,7 +2074,9 @@ mod tests {
                 .unwrap();
         // An operator key equal to a script-tweaked emulator key could
         // satisfy the emulator position without executing the covenant.
-        for script in [&chop, &regrowth, &maintenance] {
+        // The authenticated chop template now commits to the operator key;
+        // independent collision vectors remain possible only for these leaves.
+        for script in [&regrowth, &maintenance] {
             let operator = ark_script::compute_arkade_script_public_key(&emulator, script).unwrap();
             let error = build_tree_contract(
                 &secp,

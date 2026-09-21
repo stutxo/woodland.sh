@@ -2,21 +2,29 @@
 
 ## Verification Layers
 
-woodland.sh uses three layers:
+woodland.sh uses four layers:
 
 1. native tests for packet encodings, host mirrors, builders, signature checks,
    and malformed state;
-2. production WASM and GitHub Pages artifact compilation for browser transport,
+2. executable acceptance and rejection vectors in the pinned stock Arkade
+   interpreter, including complete player-template authentication;
+3. production WASM and GitHub Pages artifact compilation for browser transport,
    storage, manifest, CSP, optional game-server origin, and static-route paths;
-3. destructive regtest profiles against stock arkd and the stock emulator.
+4. destructive regtest profiles against stock arkd and the stock emulator.
+
+Package 4.0.0 tests target protocol 4, signed schema 4, and
+`woodland.sh/forest/v4`. Recreate test worlds from a fresh genesis; never reuse
+v3 assets, deployment outpoints, or manifests when validating v4.
 
 ## Test Placement
 
 Unit tests live at the end of their corresponding protocol module. They retain
 access to private encoding and script helpers without expanding the public API.
-Cross-component behavior uses stock arkd and the stock emulator rather than
-mock transport traits. Destructive mutation hooks compile only with
-`regtest-e2e`; the production WASM build excludes them.
+Targeted local HTTP fixtures exercise lost submission responses, interrupted
+finalization, saved-journal recovery, and historical settlement after an output
+is spent. Protocol acceptance is verified against stock arkd and the stock
+emulator; HTTP fixtures do not replace those checks. Destructive mutation hooks
+compile only with `regtest-e2e`; the production WASM build excludes them.
 
 ## Static Checks
 
@@ -31,21 +39,57 @@ cargo test --locked --all-targets --features server
 cargo clippy --locked --all-targets --features server -- -D warnings
 CC_wasm32_unknown_unknown=<clang> \
   cargo check --locked --lib --target wasm32-unknown-unknown --features woodland-app
+for file in scripts/*.sh; do bash -n "$file"; done
 node --check web/app.js
 for file in scripts/*.mjs; do node --check "$file"; done
 node scripts/test-assemble-web.mjs
 node scripts/test-browser-recovery.mjs
 ```
 
+The artifact regression accepts manifest recipe keys in any object order while
+rejecting changed values, missing or extra recipe fields, and reordered tiers.
+
 The browser-state regression runs the real application module against isolated
-DOM and wallet boundaries. It covers unavailable-delegation fallback, visible
-renewal errors, and backup identity after a stale or failed activation refresh.
+DOM and wallet boundaries. It covers clicked-tree selection, obsolete movement
+cancellation, stationary presence heartbeats, expired or unavailable delegation,
+stable social DOM during movement, visible renewal errors, and preservation of
+activation journals and backup identity after stale or failed refreshes.
+It also exercises two tabs sharing storage, lock takeover, mainnet reset
+protection, owner renewal near expiry, and restore recovery after storage errors.
+Durable pending journals block key replacement even before the UI has received
+a new snapshot.
+Imported activation journals are checked against the complete canonical wallet
+transaction before custody changes. Rust regressions reject damaged checkpoint
+bytes, owner signatures, source values, control blocks, and recovery metadata.
+Server tests exercise delayed verification after renewal, registration during
+consent changes, and delegation revoked while a renewal waits in the queue.
+
+Native maintenance regressions check resumed shards by outpoint rather than
+response order and keep healthy tree lineages renewable while neighboring
+successors remain unindexed.
+
+## Execute the Covenant Interpreter
+
+With Go 1.26.5 or newer available as `go` (or set `WOODLAND_GO` to its binary),
+run:
+
+```bash
+./scripts/test-covenants.sh
+```
+
+The command exports Rust-built `template.json` and `chop.json` transaction
+vectors and evaluates them with the pinned, unmodified stock Arkade interpreter.
+It fails if either exporter produces no fixtures or acceptance differs from a
+vector's expectation. This exercises the actual script instructions, including
+the full six-leaf player template and its 32-byte owner plus `0x02`/`0x03`
+compressed-output prefix witness. It complements the native host checks and
+the live arkd/emulator profiles; it does not replace either.
 
 ## Stock arkd Boundary
 
 The regtest wrapper builds unmodified arkd commit
 `c7c3184f5cd416e231023f717489a5b0550960cc`, including the upstream atomic
-offchain-spend fix. Protocol v3 uses ordinary Asset V1 validity. TREE, LOG, XP,
+offchain-spend fix. Protocol v4 uses ordinary Asset V1 validity. TREE, LOG, XP,
 STONE, IRON ORE, and each PLAYER_ID have no control asset; a fresh issuance
 creates a different AssetId rather than reissuing an existing one. No custom
 arkd or emulator patch or policy proxy is part of the protocol.
@@ -63,7 +107,7 @@ The full profile injects a submission failure before the reloaded page starts.
 ```
 
 All four profiles clean wrapper-owned containers and volumes, start
-Bitcoin/indexers/stock arkd/emulator, deploy a fresh signed schema 3 world,
+Bitcoin/indexers/stock arkd/emulator, deploy a fresh signed schema 4 world,
 build the web bundle, and serve the bundle plus `/v1/*` API from one native
 Axum origin. Browser and renewal stages then run before teardown.
 
@@ -103,16 +147,19 @@ uploads its own report, and Pages waits for every functional leg to pass.
 
 A clean deployment verifies:
 
-- signed schema 3, protocol 3, and ruleset `woodland.sh/forest/v3`;
+- signed schema 4, protocol 4, and ruleset `woodland.sh/forest/v4`;
 - canonical BIP340 manifest authentication under the declared deployer;
 - one genesis txid with TREE/LOG/XP/STONE/IRON ORE groups 0/1/2/3/4;
 - supplies 420 and 21,000,000 for each of the four inventory assets;
 - signed rates: 25 XP per LOG, 20–30% level rate, 38% absolute axe rate,
   10% STONE, 2% IRON ORE from level 10, and exact three-tier axe recipes;
-- metadata `game=woodland.sh`, `protocol=3`, exact ruleset and label, and exact
+- metadata `game=woodland.sh`, `protocol=4`, exact ruleset and label, and exact
   deployer and rollover signers;
 - exact `treeScript`, `treeChopArkadeScript`, `treeRegrowthArkadeScript`, and
   `treeMaintenanceArkadeScript` commitments;
+- fresh v4 genesis and rejection of legacy v3 manifests;
+- complete player-template authentication by the tree, with player covenants
+  binding the immutable TREE AssetId rather than tree P2TR;
 - no retired-tree or vault fields;
 - no control asset;
 - exactly 420 tree VTXOs with one TREE, 50,000 units each of LOG, XP, STONE,
@@ -133,7 +180,7 @@ The browser stage verifies:
   while different players retain independent outcomes;
 - every swing satisfies
   `next credit + 10,000*drop = previous credit + rate`, keeps credit within
-  0–20,000, and respects the ten-miss/two-success protection bounds;
+  0–20,000, and respects the ten-miss bound and rate-dependent two/three-success bound;
 - every material delta matches the independent roll bucket, occurs only with a
   LOG, and moves at most one of STONE or IRON ORE;
 - zero-XP and nonzero-XP owner renewals preserve PLAYER_ID, all four inventory
@@ -147,7 +194,8 @@ The browser stage verifies:
 - per-asset tree/player accounting and indexed issued supplies remain exact
   after every transition;
 - `seasonXpRemaining` reports on-tree Woodcutting XP (525,000,000 at genesis);
-- a Wooden Axe craft burns exactly one LOG, preserves progression and the tree,
+- a Wooden Axe craft requires at least one earned XP unit (25 Woodcutting XP),
+  burns exactly one LOG, preserves progression and the tree,
   raises LOG chance by 200 basis points, and rejects the level-locked Stone Axe;
 - an owner LOG withdrawal through the `withdrawLog` API moves LOG out while XP,
   materials, axe, PLAYER_ID, sats, roll, and luck credit remain, and an
@@ -184,7 +232,11 @@ the protocol, so the local harness uses configurable safety limits
 
 ## Adversarial Covenant Coverage
 
-Mutation probes require emulator rejection without indexed outpoint changes for:
+Executable covenant vectors require interpreter rejection of arbitrary player
+covenants, replaced or extra leaves, noncanonical internal keys, and equipped
+axes without sufficient earned XP, including a zero-XP Wooden Axe.
+
+Live mutation probes require emulator rejection without indexed outpoint changes for:
 
 - wrong player-roll successor or luck-credit successor;
 - missing or extra XP/LOG delta or wrong STONE/IRON ORE delta;
@@ -204,6 +256,9 @@ Native tests additionally cover exact signature sets, axe packet mutation,
 craft tier/recipe enforcement, previous-transaction binding, checkpoint
 mapping, mandatory-marker renewal, decoy-marker rejection, malformed graph
 chunks, nonce/signature ordering, and forfeit combination.
+The Wooden minimum is one XP asset unit; Stone and Iron retain their existing
+level thresholds (16 and 97 units). Pre-entry luck and credit selection remains
+a documented permissionless-identity boundary, not evidence of a free axe path.
 
 ## One-Batch Regrowth
 
@@ -351,7 +406,7 @@ node scripts/e2e-soak-regtest.mjs
 Do not point the soak profile at a shared remote service without operator
 permission. Concurrency and round delay exist to bound remote load.
 
-## Overnight v3 Release Soak
+## Overnight v4 Release Soak
 
 The overnight runner repeatedly creates a fresh world and rotates the full,
 same-tree soak, 24-player burst, persistent emulator-outage chaos, multi-tree
@@ -368,8 +423,8 @@ structured scenario report.
 Defaults are eight hours, plan
 `full,soak,burst,chaos,fanout,reload,renewal,regrowth`, 12 baseline soak players,
 and 50 contention rounds per baseline soak cycle. A successful cycle
-additionally requires an exact signed schema-3/protocol-3 regtest manifest,
-ruleset `woodland.sh/forest/v3`, the 420-tree world, canonical rates and
+additionally requires an exact signed schema-4/protocol-4 regtest manifest,
+ruleset `woodland.sh/forest/v4`, the 420-tree world, canonical rates and
 reserves, and its profile's structured report. Before every
 cycle the runner refuses to continue below 5 GiB of free disk. The summary
 records the active cycle before it starts and is rewritten atomically after

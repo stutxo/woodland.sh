@@ -13,9 +13,13 @@ mod keys;
 pub mod txbuild;
 
 pub mod player;
+mod player_template;
 pub mod protocol;
 pub mod renewal;
 pub mod tree;
+
+#[cfg(all(test, feature = "woodland-app", not(target_arch = "wasm32")))]
+mod covenant_tests;
 
 pub mod batch;
 
@@ -25,7 +29,6 @@ pub mod chop;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 
-#[cfg(feature = "woodland-app")]
 pub mod world;
 
 #[cfg_attr(

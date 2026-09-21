@@ -10,7 +10,7 @@
 use crate::arkade::{ArkadeRest, EmulatorParams, EmulatorRest, ServerParams, VtxoRecord};
 
 use crate::batch::BatchServices;
-use crate::chop::{ChopMutation, ChopWorld, PlayerChopState, TreeChopState};
+use crate::chop::{ChopMutation, ChopWorld, PlayerChopState, PreparedActivation, TreeChopState};
 use crate::keys::Keys;
 use crate::player::{self, PlayerContract, PlayerState};
 use crate::tree::{self, TreeHealth, TreeState};
@@ -18,7 +18,7 @@ use crate::world::{ValidatedTree, ValidatedWorld, WorldManifest};
 use crate::{protocol, renewal, txbuild};
 use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
-use bitcoin::{Amount, OutPoint, Transaction, Txid};
+use bitcoin::{OutPoint, Transaction, Txid};
 
 const INDEX_ATTEMPTS: usize = 80;
 const INDEX_POLL_MS: u64 = 250;
@@ -338,108 +338,96 @@ impl WoodlandClient {
         })
     }
 
-    /// Permissionless activation: one exact dust-sized plain-wallet VTXO is
-    /// spent into the player covenant, issuing this owner's unique PLAYER_ID.
-    /// Persist the returned AssetId; it selects the lineage on later connects.
-    pub async fn activate(&mut self) -> Result<AssetId> {
+    /// Prepare permissionless activation without submitting it. Persist the
+    /// returned journal with the player key and PLAYER_ID before calling
+    /// [`Self::resume_activation`]. On restart, resume that same journal.
+    pub async fn prepare_activation(&mut self) -> Result<PreparedActivation> {
         if self.sync_player().await?.is_some() {
-            return self
-                .player_asset
-                .ok_or_else(|| anyhow!("player lineage exists but PLAYER_ID is unknown"));
+            return Err(anyhow!("player is already activated"));
         }
-        let funding = self
-            .wallet_records()
-            .await?
-            .into_iter()
-            .filter(|record| {
-                record.assets.is_empty() && record.amount_sats == self.params.dust_sats
-            })
-            .collect::<Vec<_>>();
-        let funding = match funding.as_slice() {
-            [record] => record.clone(),
-            [] => return Err(anyhow!("deposit one exact dust-sized VTXO first")),
-            _ => return Err(anyhow!("multiple activation VTXOs are available")),
-        };
         let wallet = txbuild::player_vtxo(&self.keys, &self.params)?;
-        let inputs = [txbuild::vtxo_input(&funding, &wallet)?];
-        let mut activation = ark_core::send::build_offchain_transactions(
-            &[ark_core::send::SendReceiver::bitcoin(
-                self.contract.vtxo.to_ark_address(),
-                Amount::from_sat(self.params.dust_sats),
-            )],
-            &wallet.to_ark_address(),
-            &inputs,
-            &self.info(),
+        let wallet_script = wallet.script_pubkey();
+        let records = self.wallet_records().await?;
+        let now = crate::arkade::now_unix();
+        let mut funding = records.iter().filter(|record| {
+            record.assets.is_empty()
+                && record.amount_sats == self.params.dust_sats
+                && record.script == wallet_script
+                && record
+                    .ensure_live(now, crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS)
+                    .is_ok()
+        });
+        let record = funding.next().ok_or_else(|| {
+            anyhow!(
+            "deposit one clean, live, exact {}-sat wallet VTXO first; balances are not combined",
+            self.params.dust_sats
         )
-        .map_err(|error| anyhow!("build permissionless player activation: {error}"))?;
-        ark_core::asset::packet::add_asset_packet_to_psbt(
-            &mut activation.ark_tx,
-            &ark_core::asset::packet::Packet {
-                groups: vec![ark_core::asset::packet::AssetGroup {
-                    asset_id: None,
-                    control_asset: None,
-                    metadata: Some(vec![
-                        ("game".to_owned(), crate::world::GAME_ID.to_owned()),
-                        (
-                            "protocol".to_owned(),
-                            crate::world::PROTOCOL_VERSION.to_string(),
-                        ),
-                        ("asset".to_owned(), "PLAYER_ID".to_owned()),
-                        ("owner".to_owned(), self.keys.owner_pk().to_string()),
-                    ]),
-                    inputs: Vec::new(),
-                    outputs: vec![ark_core::asset::packet::AssetOutput {
-                        output_index: protocol::ACTIVATION_STATE_OUTPUT_INDEX,
-                        amount: 1,
-                    }],
-                }],
-            },
-        )
-        .map_err(|error| anyhow!("attach PLAYER_ID issuance packet: {error}"))?;
-        let initial_luck = player::PlayerLuck::initial(&self.contract.vtxo.script_pubkey())?;
-        player::attach_player_state_packets(
-            &mut activation.ark_tx,
-            PlayerState {
-                luck: initial_luck,
-                axe: player::AxeTier::None,
-            },
-        )?;
-        if activation.ark_tx.unsigned_tx.output.len() != protocol::ACTIVATION_OUTPUT_COUNT {
-            return Err(anyhow!("activation transaction has an invalid shape"));
+        })?;
+        if funding.next().is_some() {
+            return Err(anyhow!(
+                "multiple activation VTXOs are available; keep exactly one"
+            ));
         }
-        let txid = activation.ark_tx.unsigned_tx.compute_txid();
-        let player_asset = AssetId {
-            txid,
-            group_index: protocol::PLAYER_ID_ASSET_GROUP_INDEX as u16,
-        };
-        if let Some(expected) = self.player_asset {
-            if expected != player_asset {
-                return Err(anyhow!(
-                    "activation retry does not reproduce the pending PLAYER_ID"
-                ));
-            }
+        let prepared =
+            crate::chop::prepare_activation(&self.keys, &self.params, &self.contract, record)?;
+        if self
+            .player_asset
+            .is_some_and(|asset| asset != prepared.player_asset)
+        {
+            return Err(anyhow!(
+                "resume the saved activation journal for the selected PLAYER_ID"
+            ));
         }
-        self.player_asset = Some(player_asset);
-        txbuild::run_tx(
+        self.player_asset = Some(prepared.player_asset);
+        Ok(prepared)
+    }
+
+    /// Resume a previously persisted activation. Keep the original journal on
+    /// errors, Pending, and SubmissionUnknown; only Finalized confirms the exact
+    /// activation output, even if that output has since been spent.
+    pub async fn resume_activation(
+        &mut self,
+        prepared: &PreparedActivation,
+    ) -> Result<txbuild::RunTxStatus> {
+        let txid = txbuild::validate_activation_journal(
             &self.keys,
-            &self.rest,
-            activation.ark_tx,
-            activation.checkpoint_txs,
-        )
-        .await
-        .context("submit permissionless player activation")?;
-        self.wait_for_vtxo(
-            &self.contract.vtxo.script_pubkey(),
-            OutPoint {
-                txid,
-                vout: u32::from(protocol::ACTIVATION_STATE_OUTPUT_INDEX),
-            },
-        )
-        .await?;
-        if self.sync_player().await?.is_none() {
-            return Err(anyhow!("activated player state was not discovered"));
+            &self.params,
+            prepared,
+            &self.contract,
+        )?;
+        if self
+            .player_asset
+            .is_some_and(|asset| asset != prepared.player_asset)
+        {
+            return Err(anyhow!(
+                "activation journal does not match the selected PLAYER_ID"
+            ));
         }
-        Ok(player_asset)
+        self.player_asset = Some(prepared.player_asset);
+        let script = self.contract.vtxo.script_pubkey();
+        let outpoint = OutPoint {
+            txid,
+            vout: u32::from(protocol::ACTIVATION_STATE_OUTPUT_INDEX),
+        };
+        if self
+            .rest
+            .find_settled_vtxo(&script, outpoint)
+            .await?
+            .is_some()
+        {
+            return Ok(txbuild::RunTxStatus::Finalized(txid));
+        }
+        match txbuild::resume_tx(&self.keys, &self.rest, &prepared.transaction).await? {
+            txbuild::RunTxStatus::Finalized(finalized) => {
+                if finalized != txid {
+                    return Err(anyhow!("activation finalized an unexpected transaction"));
+                }
+                self.rest.wait_for_settled_vtxo(&script, outpoint).await?;
+                Ok(txbuild::RunTxStatus::Finalized(txid))
+            }
+            status @ (txbuild::RunTxStatus::Pending(_)
+            | txbuild::RunTxStatus::SubmissionUnknown(_)) => Ok(status),
+        }
     }
 
     /// Swing at one tree: build, sign, emulator-execute, and verify the exact
@@ -466,7 +454,6 @@ impl WoodlandClient {
                 stone_asset: self.world.stone_asset,
                 iron_ore_asset: self.world.iron_ore_asset,
                 dust_sats: self.params.dust_sats,
-                map_width: self.manifest.map_width,
             },
             &PlayerChopState {
                 record: &player.record,
@@ -504,13 +491,18 @@ impl WoodlandClient {
                 for _ in 0..12 {
                     tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
                     let landed = self
-                        .sync_player()
+                        .rest
+                        .find_settled_vtxo(&self.contract.vtxo.script_pubkey(), expected_player)
                         .await?
-                        .is_some_and(|state| state.record.outpoint == expected_player)
+                        .is_some()
                         && self
-                            .tree(tree_id)
-                            .await
-                            .is_ok_and(|tree| tree.record.outpoint == expected_tree);
+                            .rest
+                            .find_settled_vtxo(
+                                &self.world.contract.vtxo.script_pubkey(),
+                                expected_tree,
+                            )
+                            .await?
+                            .is_some();
                     if landed {
                         return Ok(ChopOutcome {
                             tree_id,
@@ -536,9 +528,11 @@ impl WoodlandClient {
             &returned_ark,
             returned_checkpoints,
         )?;
-        self.wait_for_vtxo(&self.contract.vtxo.script_pubkey(), expected_player)
+        self.rest
+            .wait_for_settled_vtxo(&self.contract.vtxo.script_pubkey(), expected_player)
             .await?;
-        self.wait_for_vtxo(&self.world.contract.vtxo.script_pubkey(), expected_tree)
+        self.rest
+            .wait_for_settled_vtxo(&self.world.contract.vtxo.script_pubkey(), expected_tree)
             .await?;
         Ok(ChopOutcome {
             tree_id,
@@ -552,11 +546,15 @@ impl WoodlandClient {
 
     /// Burn the exact next-tier recipe under the recursive player covenant.
     /// XP, PLAYER_ID, roll, luck, sats, and unspent inventory remain in state.
-    pub async fn craft_axe(&mut self) -> Result<CraftOutcome> {
+    /// Bind the displayed recipe to its input so a retry cannot buy another tier.
+    pub async fn craft_axe(&mut self, expected_outpoint: OutPoint) -> Result<CraftOutcome> {
         let player = self
             .sync_player()
             .await?
             .ok_or_else(|| anyhow!("activate the player before crafting an axe"))?;
+        if player.outpoint() != expected_outpoint {
+            return Err(anyhow!("player state changed; refresh before crafting"));
+        }
         let player_asset = self
             .player_asset
             .ok_or_else(|| anyhow!("activate the player before crafting an axe"))?;

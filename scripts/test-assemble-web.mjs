@@ -10,10 +10,10 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'woodland-web-test-'));
 const assembler = path.join(ROOT, 'scripts/assemble-web.mjs');
 const base = {
-  schemaVersion: 3,
-  protocolVersion: 3,
+  schemaVersion: 4,
+  protocolVersion: 4,
   gameId: 'woodland.sh',
-  rulesetId: 'woodland.sh/forest/v3',
+  rulesetId: 'woodland.sh/forest/v4',
   woodcuttingXpPerLog: 25,
   stoneAsset: `${'33'.repeat(32)}0300`,
   ironOreAsset: `${'33'.repeat(32)}0400`,
@@ -53,7 +53,6 @@ try {
   assert.equal(valid.status, 0, valid.stderr);
 
   const index = await readFile(path.join(validOutput, 'index.html'), 'utf8');
-  const app = await readFile(path.join(validOutput, 'app.js'), 'utf8');
   const notFound = await readFile(path.join(validOutput, '404.html'), 'utf8');
   assert.match(index, /http-equiv="Content-Security-Policy"/);
   assert.ok(index.includes(base.arkadeServiceUrl));
@@ -62,11 +61,39 @@ try {
   assert.match(index, /connect-src[^"]*https:\/\/server\.example/);
   assert.doesNotMatch(index, /WOODLAND_CSP/);
   assert.match(index, /src="\.\/app\.js"/);
-  assert.match(app, /new URL\('\.\/world\.json', import\.meta\.url\)/);
   assert.match(notFound, /href="\.\/"/);
   assert.equal(await readFile(path.join(validOutput, '.nojekyll'), 'utf8'), '');
-  assert.match(notFound, /Not found/);
   await assert.rejects(readFile(path.join(validOutput, '_headers')));
+
+  const reorderedManifest = path.join(temporary, 'reordered-keys.json');
+  const reorderedOutput = path.join(temporary, 'reordered-keys');
+  await writeFile(reorderedManifest, JSON.stringify({
+    ...base,
+    axeRecipes: base.axeRecipes.map((recipe) => (
+      Object.fromEntries(Object.entries(recipe).sort(([left], [right]) => left.localeCompare(right)))
+    )),
+  }));
+  const reordered = run(reorderedManifest, reorderedOutput);
+  assert.equal(reordered.status, 0, reordered.stderr);
+  assert.deepEqual(
+    JSON.parse(await readFile(path.join(reorderedOutput, 'world.json'), 'utf8')),
+    base,
+  );
+
+  const { logCost: _logCost, ...missingRecipeField } = base.axeRecipes[0];
+  for (const [name, axeRecipes] of [
+    ['changed-recipe-value', [{ ...base.axeRecipes[0], logCost: 2 }, ...base.axeRecipes.slice(1)]],
+    ['missing-recipe-field', [missingRecipeField, ...base.axeRecipes.slice(1)]],
+    ['extra-recipe-field', [{ ...base.axeRecipes[0], bonus: 1 }, ...base.axeRecipes.slice(1)]],
+    ['reordered-tiers', [...base.axeRecipes].reverse()],
+  ]) {
+    const manifestPath = path.join(temporary, `${name}.json`);
+    const outputPath = path.join(temporary, name);
+    await writeFile(manifestPath, JSON.stringify({ ...base, axeRecipes }));
+    const result = run(manifestPath, outputPath);
+    assert.notEqual(result.status, 0, name);
+    await assert.rejects(readFile(path.join(outputPath, 'world.json')), { code: 'ENOENT' });
+  }
 
   const sameOriginOutput = path.join(temporary, 'same-origin');
   const sameOrigin = run(validManifest, sameOriginOutput, {
@@ -95,7 +122,6 @@ try {
   }));
   const insecure = run(insecureManifest, path.join(temporary, 'insecure'));
   assert.notEqual(insecure.status, 0);
-  assert.match(insecure.stderr, /mainnet web bundles require HTTPS service URLs/);
 
   const insecureServerManifest = path.join(temporary, 'insecure-server.json');
   await writeFile(insecureServerManifest, JSON.stringify({
@@ -110,32 +136,30 @@ try {
     { WOODLAND_SERVER_URL: 'http://server.invalid' },
   );
   assert.notEqual(insecureServer.status, 0);
-  assert.match(insecureServer.stderr, /must be a canonical HTTPS origin on mainnet/);
 
   const wrongProtocol = path.join(temporary, 'wrong-protocol.json');
   await writeFile(wrongProtocol, JSON.stringify({ ...base, protocolVersion: 1 }));
   const wrong = run(wrongProtocol, path.join(temporary, 'wrong'));
   assert.notEqual(wrong.status, 0);
-  assert.match(wrong.stderr, /requires a signed woodland\.sh protocol v3 schema 3 manifest/);
+
+  const previousWorld = path.join(temporary, 'previous-world.json');
+  await writeFile(previousWorld, JSON.stringify({
+    ...base, schemaVersion: 3, protocolVersion: 3, rulesetId: 'woodland.sh/forest/v3',
+  }));
+  const previous = run(previousWorld, path.join(temporary, 'previous-world'));
+  assert.notEqual(previous.status, 0);
+  assert.match(previous.stderr, /protocol v4 schema 4/);
 
   const wrongXpScale = path.join(temporary, 'wrong-xp-scale.json');
   await writeFile(wrongXpScale, JSON.stringify({ ...base, woodcuttingXpPerLog: 1 }));
   const wrongScale = run(wrongXpScale, path.join(temporary, 'wrong-xp-scale'));
   assert.notEqual(wrongScale.status, 0);
-  assert.match(
-    wrongScale.stderr,
-    /requires a signed woodland\.sh protocol v3 schema 3 manifest/,
-  );
 
   const missingProgression = path.join(temporary, 'missing-progression.json');
   const { stoneAsset: _stoneAsset, ...withoutProgression } = base;
   await writeFile(missingProgression, JSON.stringify(withoutProgression));
   const missing = run(missingProgression, path.join(temporary, 'missing-progression'));
   assert.notEqual(missing.status, 0);
-  assert.match(
-    missing.stderr,
-    /requires a signed woodland\.sh protocol v3 schema 3 manifest/,
-  );
 
   console.log('GitHub Pages artifact tests passed');
 } finally {

@@ -950,9 +950,9 @@ async function main() {
     assertMaterialSupply(initial.state, totalStone, totalIronOre, 'initial world');
     assertXpAccounting(initial.state, totalXp, 'initial world');
     assertTreeValue(initial.state, 'initial world');
-    assert.equal(manifest.schemaVersion, 3, 'world manifest must be schema 3');
-    assert.equal(manifest.protocolVersion, 3, 'world manifest must declare protocol v3');
-    assert.equal(manifest.rulesetId, 'woodland.sh/forest/v3');
+    assert.equal(manifest.schemaVersion, 4, 'world manifest must be schema 4');
+    assert.equal(manifest.protocolVersion, 4, 'world manifest must declare protocol v4');
+    assert.equal(manifest.rulesetId, 'woodland.sh/forest/v4');
     assert.match(manifest.deployerSigner, /^[0-9a-f]{64}$/);
     assert.match(manifest.manifestSignature, /^[0-9a-f]{128}$/);
     assert.equal(manifest.playerLevelCurve, 'woodland-xp-v1');

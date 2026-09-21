@@ -133,6 +133,100 @@ fn decode_psbt(encoded: &str) -> Result<Psbt> {
     Psbt::deserialize(&bytes).context("decode PSBT bytes")
 }
 
+/// Persist this prepared activation before submitting it. The same journal is
+/// used by browser profiles and native callers to resume interrupted sends.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreparedActivation {
+    #[serde(deserialize_with = "deserialize_activation_asset")]
+    pub player_asset: AssetId,
+    pub transaction: crate::txbuild::PendingTransaction,
+}
+
+fn deserialize_activation_asset<'de, D>(deserializer: D) -> std::result::Result<AssetId, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = <String as serde::Deserialize>::deserialize(deserializer)?;
+    crate::txbuild::parse_asset_id_pub(&encoded)
+        .ok_or_else(|| serde::de::Error::custom("invalid activation asset ID"))
+}
+
+pub fn prepare_activation(
+    keys: &Keys,
+    params: &crate::arkade::ServerParams,
+    contract: &PlayerContract,
+    funding: &VtxoRecord,
+) -> Result<PreparedActivation> {
+    if !funding.assets.is_empty() || funding.amount_sats != params.dust_sats {
+        return Err(anyhow!(
+            "activation requires one clean exact dust-sized VTXO"
+        ));
+    }
+    funding.ensure_live(
+        crate::arkade::now_unix(),
+        crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+    )?;
+    let wallet = crate::txbuild::player_vtxo(keys, params)?;
+    let inputs = [crate::txbuild::vtxo_input(funding, &wallet)?];
+    let mut activation = build_offchain_transactions(
+        &[SendReceiver::bitcoin(
+            contract.vtxo.to_ark_address(),
+            Amount::from_sat(params.dust_sats),
+        )],
+        &wallet.to_ark_address(),
+        &inputs,
+        &crate::txbuild::server_info(params),
+    )
+    .map_err(|error| anyhow!("build permissionless player activation: {error}"))?;
+    ark_core::asset::packet::add_asset_packet_to_psbt(
+        &mut activation.ark_tx,
+        &Packet {
+            groups: vec![AssetGroup {
+                asset_id: None,
+                control_asset: None,
+                metadata: Some(vec![
+                    ("game".to_owned(), crate::world::GAME_ID.to_owned()),
+                    (
+                        "protocol".to_owned(),
+                        crate::world::PROTOCOL_VERSION.to_string(),
+                    ),
+                    ("asset".to_owned(), "PLAYER_ID".to_owned()),
+                    ("owner".to_owned(), keys.owner_pk().to_string()),
+                ]),
+                inputs: Vec::new(),
+                outputs: vec![AssetOutput {
+                    output_index: crate::protocol::ACTIVATION_STATE_OUTPUT_INDEX,
+                    amount: 1,
+                }],
+            }],
+        },
+    )
+    .map_err(|error| anyhow!("attach PLAYER_ID issuance packet: {error}"))?;
+    player::attach_player_state_packets(
+        &mut activation.ark_tx,
+        PlayerState {
+            luck: player::PlayerLuck::initial(&contract.vtxo.script_pubkey())?,
+            axe: player::AxeTier::None,
+        },
+    )?;
+    if activation.ark_tx.unsigned_tx.output.len() != crate::protocol::ACTIVATION_OUTPUT_COUNT {
+        return Err(anyhow!("activation transaction has an invalid shape"));
+    }
+    let player_asset = AssetId {
+        txid: activation.ark_tx.unsigned_tx.compute_txid(),
+        group_index: crate::protocol::PLAYER_ID_ASSET_GROUP_INDEX as u16,
+    };
+    Ok(PreparedActivation {
+        player_asset,
+        transaction: crate::txbuild::PendingTransaction::new(
+            keys,
+            activation.ark_tx,
+            activation.checkpoint_txs,
+        )?,
+    })
+}
+
 /// One fully constructed and owner-signed LOG withdrawal.
 pub struct PreparedWithdraw {
     pub amount: u64,
@@ -349,6 +443,11 @@ pub fn prepare_craft(
         .ok_or_else(|| anyhow!("the Iron Axe is already the highest tier"))?;
     let xp_balance = record.asset_amount(contract.xp_asset).unwrap_or(0);
     if xp_balance < recipe.required_xp_balance() {
+        if recipe.axe == crate::player::AxeTier::Wooden {
+            return Err(anyhow!(
+                "earn your first LOG and 25 Woodcutting XP before crafting a Wooden Axe"
+            ));
+        }
         return Err(anyhow!(
             "{} requires Woodcutting level {}",
             recipe.axe.display_name(),
@@ -637,7 +736,6 @@ pub struct ChopWorld<'a> {
     pub stone_asset: AssetId,
     pub iron_ore_asset: AssetId,
     pub dust_sats: u64,
-    pub map_width: u16,
 }
 
 /// Live player lineage input for one swing.
@@ -796,45 +894,6 @@ pub fn prepare_chop(
         return Err(anyhow!("chop builder produced an unexpected change output"));
     }
 
-    let mut log_inputs = Vec::new();
-    if player_logs_before > 0 {
-        log_inputs.push((
-            crate::protocol::PLAYER_STATE_INPUT_INDEX as u16,
-            player_logs_before,
-        ));
-    }
-    log_inputs.push((crate::protocol::TREE_INPUT_INDEX as u16, tree_logs_before));
-    let mut log_outputs = Vec::new();
-    if player_logs_after > 0 {
-        log_outputs.push((
-            crate::protocol::PLAYER_STATE_OUTPUT_INDEX,
-            player_logs_after,
-        ));
-    }
-    if tree_logs_after > 0 {
-        log_outputs.push((crate::protocol::TREE_OUTPUT_INDEX, tree_logs_after));
-    }
-    let mut xp_inputs = Vec::new();
-    if player_xp_balance_before > 0 {
-        xp_inputs.push((
-            crate::protocol::PLAYER_STATE_INPUT_INDEX as u16,
-            player_xp_balance_before,
-        ));
-    }
-    xp_inputs.push((
-        crate::protocol::TREE_INPUT_INDEX as u16,
-        tree_xp_balance_before,
-    ));
-    let mut xp_outputs = Vec::new();
-    if player_xp_balance_after > 0 {
-        xp_outputs.push((
-            crate::protocol::PLAYER_STATE_OUTPUT_INDEX,
-            player_xp_balance_after,
-        ));
-    }
-    if tree_xp_balance_after > 0 {
-        xp_outputs.push((crate::protocol::TREE_OUTPUT_INDEX, tree_xp_balance_after));
-    }
     let mut groups = vec![
         transfer_group(
             player_state.player_asset,
@@ -846,8 +905,20 @@ pub fn prepare_chop(
             vec![(crate::protocol::TREE_INPUT_INDEX as u16, 1)],
             vec![(crate::protocol::TREE_OUTPUT_INDEX, 1)],
         ),
-        transfer_group(world.log_asset, log_inputs, log_outputs),
-        transfer_group(world.xp_asset, xp_inputs, xp_outputs),
+        player_tree_transfer_group(
+            world.log_asset,
+            player_logs_before,
+            tree_logs_before,
+            player_logs_after,
+            tree_logs_after,
+        ),
+        player_tree_transfer_group(
+            world.xp_asset,
+            player_xp_balance_before,
+            tree_xp_balance_before,
+            player_xp_balance_after,
+            tree_xp_balance_after,
+        ),
         player_tree_transfer_group(
             world.stone_asset,
             player_stone_before,

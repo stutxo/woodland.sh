@@ -1,18 +1,21 @@
-# woodland.sh Protocol v3 Client Guide
+# woodland.sh Protocol v4 Client Guide
 
-This guide describes interoperability with signed schema 3 worlds. The
+This guide describes interoperability with signed schema 4 worlds. The
 reference browser is executable documentation; its animation and storage
 choices are not protocol requirements.
+
+Version 4 requires a fresh genesis and new TREE/LOG/XP/STONE/IRON ORE AssetIds.
+Never reuse a v3 manifest, assets, or deployment outpoints with v4 clients.
 
 ## Validate the World
 
 Load the canonical manifest and require:
 
 ```text
-schemaVersion = 3
-protocolVersion = 3
+schemaVersion = 4
+protocolVersion = 4
 gameId = woodland.sh
-rulesetId = woodland.sh/forest/v3
+rulesetId = woodland.sh/forest/v4
 dustSats = 330
 mapWidth = 425
 mapHeight = 425
@@ -39,11 +42,16 @@ axeRecipes = [
 ]
 luckWindowBasisPoints = 10000
 initialLuckCredit = 8000
+```
+
+The Wooden recipe also requires an XP asset balance of at least one (25
+Woodcutting XP); `requiredLevel: 1` alone does not authorize it. Stone and Iron
+keep their level-5 and level-15 gates, requiring 16 and 97 XP units respectively.
 
 The manifest pins direct `arkadeServiceUrl` and stock `emulatorUrl` values plus
 the deployer, operator, emulator, and rollover keys. Before using any URL,
 verify the BIP340 `manifestSignature` under `deployerSigner` over
-`SHA256("woodland.sh/world-manifest/v3\0" || canonical_json)`, where
+`SHA256("woodland.sh/world-manifest/v4\0" || canonical_json)`, where
 `canonical_json` sorts every object key and encodes `manifestSignature` as the
 empty string.
 
@@ -62,8 +70,8 @@ Recompute the five asset IDs from the genesis txid:
 4 IRON ORE
 ```
 
-Fetch indexed metadata and require `game=woodland.sh`, `protocol=3`,
-`ruleset=woodland.sh/forest/v3`, the exact asset label, deployer signer, and
+Fetch indexed metadata and require `game=woodland.sh`, `protocol=4`,
+`ruleset=woodland.sh/forest/v4`, the exact asset label, deployer signer, and
 rollover signer; also require no control asset and supply exactly 420 for TREE
 and 21,000,000 for each inventory asset. Recompute the tree contract and compare
 every committed script in the manifest.
@@ -93,14 +101,15 @@ terminal and can only use exact-state maintenance. There is no vault lineage.
 
 ## Activate Without a Woodland Service
 
-Derive an ordinary Arkade address from the player key. Select one clean exact
-330-sat VTXO and build a normal offchain transaction to the owner-specific
-player contract. Add one fresh, uncontrolled issuance group with amount one
-assigned to player output zero and metadata:
+Derive an ordinary Arkade address from the player key. Select exactly one clean,
+live, exact 330-sat VTXO outside the expiry margin and build a normal offchain
+transaction to the owner-specific player contract. A 660-sat or asset-bearing
+VTXO is not eligible; balances are not split or combined. Add one fresh,
+uncontrolled issuance group with amount one assigned to player output zero and metadata:
 
 ```text
 game=woodland.sh
-protocol=3
+protocol=4
 asset=PLAYER_ID
 owner=<owner_xonly>
 ```
@@ -108,10 +117,18 @@ owner=<owner_xonly>
 Attach initial roll
 `SHA256("woodland.sh/player-roll/v2" || p2tr_witness_program)`, luck credit
 8,000, and axe packet type 9 with value `None`. Compute the final unsigned txid,
-define `PLAYER_ID = (txid, 0)`, and persist it before direct submission. On
-synchronization, query the player script but accept only state carrying that
-exact one-unit marker. No PLAYER_TICKET, allocator signature, invitation, or
-protocol registry exists.
+define `PLAYER_ID = (txid, 0)`, then durably persist the key, selected PLAYER_ID,
+and signed `chop::PreparedActivation` journal before the first submission.
+Resume that same journal with `txbuild::resume_tx`: `Pending` and
+`SubmissionUnknown` are not completion, and an error must not discard the
+journal. The original signed Ark and checkpoint PSBTs are enough to recover the
+server's checkpoint signatures through its pending-transaction API and retry
+finalization. Clear the journal only after the expected activation output is
+confirmed. A pending activation needs recovery, not another deposit.
+
+On synchronization, query the player script but accept only state carrying
+that exact one-unit marker. No PLAYER_TICKET, allocator signature, invitation,
+or protocol registry exists.
 
 For that direct issuance-to-state shape, all recursive player leaves detect the
 first spend by comparing the PLAYER_ID AssetId txid with the player input
@@ -123,7 +140,7 @@ PLAYER_ID, player roll, bounded luck-credit, and axe packets, plus optional LOG,
 XP, STONE, and IRON ORE balances. The XP asset balance is the sole level backing;
 clients display `25 × balance` Woodcutting XP and derive level from that value.
 
-Protocol v3 has exactly five gameplay state packet types:
+Protocol v4 has exactly five gameplay state packet types:
 
 ```text
 2  TREE_STATE
@@ -219,6 +236,16 @@ entries. Sign player state and its checkpoint with the owner key. Submit
 directly to the stock emulator, verify byte-identical unsigned transactions and
 the exact signature matrix, then finalize through Arkade.
 
+The tree Arkade entry's witness is exactly `[owner_xonly_32,
+compressed_output_prefix_1]`: the second item is one byte, `0x02` for an even
+player Taproot output key or `0x03` for an odd one. It is not a `0`/`1` parity
+flag. The tree reconstructs the full canonical player template: chop, owner
+renewal, watchtower renewal, LOG withdrawal, axe craft, and NUMS-keyed CSV exit,
+with the NUMS internal key. Extra or replaced leaves and a spendable internal
+key fail authentication. Use `player::attach_player_chop` to construct this
+entry. The player covenant pins the immutable TREE AssetId rather than tree
+P2TR; clients still verify tree records against the manifest's exact contract.
+
 Automation should supply explicit expected tree outpoint, player-state outpoint,
 LOG bit, and material outcome. Reject locally if any changed after refresh.
 
@@ -227,8 +254,8 @@ LOG bit, and material outcome. Reject locally if any changed after refresh.
 Capture the player-state outpoint alongside the displayed recipe. Before
 building, refresh player state and reject the request if that outpoint changed;
 do not silently reinterpret a retry as the next axe tier. Derive the recipe from
-the matching state, require its level and balances locally, and treat the
-covenant as authoritative. Build one input and three outputs:
+the matching state, require its level, minimum XP balance, and ingredients
+locally, and treat the covenant as authoritative. Build one input and three outputs:
 
 ```text
 input/output 0: player state
@@ -255,12 +282,16 @@ reference client does this after a bounded reconcile poll that gives the
 original submission time to land; resubmitting against a still in-flight
 original can trip the service's concurrent-spend protection.
 
-Reconcile only after refreshing both indexed inputs, including the pending
-tree when it lies outside the viewport. A player-only refresh or a tree's
-deployment placeholder is not evidence that the saved input was superseded.
-Keep the journal across reload until the exact result or conflicting spend is
-established. Poll known output outpoints directly, validating their expected
-scripts and rejecting spent, swept, or unrolled records.
+Reconcile against exact historical outputs first, validating their scripts,
+creating transaction, and indexed assets. An already-spent successor still
+proves settlement: another player may have chopped the resulting tree before
+recovery runs. Current heads are for selecting live inputs, not proving a
+previous swing failed. If the expected outputs are absent, require direct
+indexed evidence of a conflicting spend of an original input before clearing
+the journal as conflicted. Absence, a deployment placeholder, or a player-only
+refresh is not that evidence. Retain a single accepted/conflicted/pending
+result independently of clearing the saved journal; a retry must not infer
+success from the disappearance of the journal.
 
 The reference key is `woodland.sh:web:v2:pending:<arkade-url>:<genesis-txid>`.
 
@@ -295,15 +326,37 @@ rollover-authorized maintenance, which preserves health exactly.
 Agents and tooling can drive the same protocol without a browser through
 `woodland::client::WoodlandClient` (native, `woodland-app` feature):
 
+Activation is an explicit prepare/persist/resume flow. Keep the original
+`PreparedActivation` on disk beside the key and selected PLAYER_ID. On restart,
+load it instead of preparing another activation; `prepare_activation` performs
+no transaction submission. The example below assumes an application-specific
+`save_profile` that durably replaces the stored profile before returning:
+
 ```rust
-let manifest = WorldManifest::from_json(&json)?;
-let mut client = WoodlandClient::connect(&manifest, keys, player_asset).await?;
-client.wallet_address()?;            // fund one exact 330-sat VTXO
-let asset = client.activate().await?; // persist with the player key
-let player = client.sync_player().await?;
+let mut client = WoodlandClient::connect(&manifest, keys, profile.player_asset).await?;
+if profile.pending_activation.is_none() && profile.player_asset.is_none() {
+    let prepared = client.prepare_activation().await?; // exact 330-sat funding
+    profile.player_asset = Some(prepared.player_asset);
+    profile.pending_activation = Some(prepared);
+    save_profile(&profile)?; // key + PLAYER_ID + original signed journal, BEFORE send
+}
+if let Some(prepared) = profile.pending_activation.as_ref() {
+    match client.resume_activation(prepared).await {
+        Ok(RunTxStatus::Finalized(_)) => {
+            profile.pending_activation = None;
+            save_profile(&profile)?;
+        }
+        Ok(RunTxStatus::Pending(_) | RunTxStatus::SubmissionUnknown(_)) => {
+            return Ok(()); // keep journal; resume on the next run
+        }
+        Err(error) => return Err(error), // keep journal; resume on the next run
+    }
+}
+let player = client.sync_player().await?.context("player is not indexed")?;
 let trees = client.trees(&[]).await?; // lineage heads and reserves decoded
+let expected_craft_input = player.outpoint(); // capture alongside displayed recipe
+let craft = client.craft_axe(expected_craft_input).await?;
 let outcome = client.chop(tree_id).await?;
-let craft = client.craft_axe().await?; // once the sole next recipe is ready
 client.withdraw_log(500, None).await?; // LOG only; progression is soulbound
 client.regrow(tree_id).await?;         // permissionless one-batch regrowth
 let outpoint = client.renew_player().await?;
@@ -314,9 +367,11 @@ recipient's Arkade VTXO script. This is an offchain LOG transfer, not an onchain
 Bitcoin withdrawal; settlement checks the recipient's exact output.
 
 `connect` authenticates and validates the manifest against the live services
-and pins the batch flow to its forfeit identity. `craft_axe` derives the only
-next recipe, builds and signs its covenant self-send, and verifies the settled
-tier and exact inventory burn. `withdraw_log` moves LOG to any Arkade address
+and pins the batch flow to its forfeit identity. `craft_axe(expected_outpoint)`
+refreshes the player and rejects a changed input before deriving the next recipe,
+so retrying a settled request cannot buy the next tier. It builds and signs the
+covenant self-send and verifies the settled tier and exact inventory burn.
+`withdraw_log` moves LOG to any Arkade address
 (the player's own plain wallet by default), funded by a wallet dust input; the
 covenant rejects anything that touches XP, materials, or axe. `regrow` recreates
 an eligible funded stump with health ten while preserving its exact local
@@ -331,8 +386,13 @@ custom clients. `examples/woodland-agent.rs` is a complete season-playing bot:
 
 ```bash
 cargo run --example woodland-agent --features woodland-app -- \
-  <world-manifest.json> [player-key-hex] [player-asset-id]
+  <world-manifest.json> <player-profile.json> [player-key-hex] [player-asset-id]
 ```
+
+The example creates and flushes its profile before any activation submission
+and retains an unfinished journal across process restarts. Restart using the
+same profile file; optional key/asset arguments import into a new file only.
+The profile contains the private key: keep it private and run one writer per file.
 
 ## Reference WASM API
 
@@ -341,7 +401,7 @@ cargo run --example woodland-agent --features woodland-app -- \
 ```text
 WoodlandApp.init(arkadeUrl, emulatorUrl, manifestJson, secret?, profile?)
 exportKey()
-exportProfile()  # genesisTxid plus exact playerAsset after activation
+exportProfile()  # genesisTxid, selected playerAsset, optional pendingActivation
 exportPendingChop()
 activate()
 refresh()
@@ -353,9 +413,15 @@ withdrawLog(amount)
 craftAxe(expectedPlayerStateOutpoint)
 ```
 
-Backups must use `exportProfile()` for the genesis and selected PLAYER_ID,
-not the last rendered snapshot: activation may have persisted the identity
-before a later refresh failed.
+Backups must retain the complete `exportProfile()`, including an optional opaque
+`pendingActivation`, rather than reconstruct it from the last rendered snapshot.
+Activation saves identity and journal in the existing profile localStorage entry
+before submission. `refresh`, `refreshPlayer`, `refreshWorld`, and activation retry
+resume that journal; reload does not require another deposit. A profile from
+before this journal was added remains readable. Snapshots expose
+`pendingActivationTxid` while recovery is needed, with `fundingRequiredSats = 0`;
+otherwise required activation funding is one exact dust deposit, not the
+difference between the wallet balance and 330 sats.
 
 Snapshots expose `playerStone`, `playerIronOre`, `playerAxe`, `nextAxeRecipe`,
 `craftAxeReady`, both material AssetIds, and each tree's material reserves.
@@ -374,5 +440,8 @@ recipes are their only burn path. LOG is liquid through the owner-authorized
 withdraw leaf and also pays craft recipes. A covenant cannot authenticate
 arbitrary PLAYER_ID ancestry before the marker entered recursive state;
 intermediate-output activation can choose only a bounded starting luck phase.
+It cannot equip an axe without the corresponding earned XP balance. The
+complete player template is authenticated by the tree before rewards can enter
+that state, preserving progression across every spending path.
 The reference browser stores its key and PLAYER_ID profile in localStorage and
 is not production custody.

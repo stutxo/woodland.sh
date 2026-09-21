@@ -4,6 +4,7 @@ import { createWriteStream } from 'node:fs';
 import { mkdir, readFile, rename, statfs, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HOURS = numberSetting('WOODLAND_OVERNIGHT_HOURS', 8, 0.01, 72);
@@ -123,11 +124,11 @@ const RELEASE_PLAN = Object.freeze([
   'regrowth',
 ]);
 const EXPECTED_WORLD = Object.freeze({
-  schemaVersion: 3,
-  protocolVersion: 3,
+  schemaVersion: 4,
+  protocolVersion: 4,
   network: 'regtest',
   gameId: 'woodland.sh',
-  rulesetId: 'woodland.sh/forest/v3',
+  rulesetId: 'woodland.sh/forest/v4',
   playerLevelCurve: 'woodland-xp-v1',
   woodcuttingXpPerLog: 25,
   maxPlayerLevel: 99,
@@ -283,7 +284,7 @@ function releaseManifestErrors(manifest) {
   const errors = [];
   for (const [field, expected] of Object.entries(EXPECTED_WORLD)) {
     const value = field === 'treeCount' ? actual.treeCount : manifest[field];
-    if (JSON.stringify(value) !== JSON.stringify(expected)) {
+    if (!isDeepStrictEqual(value, expected)) {
       errors.push(`${field}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(value)}`);
     }
   }

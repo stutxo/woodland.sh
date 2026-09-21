@@ -1,18 +1,18 @@
 //! Browser/WASM application for direct interaction with woodland.sh covenants.
 
 use crate::arkade::{ArkadeRest, EmulatorParams, EmulatorRest, ServerParams, VtxoRecord};
-use crate::chop::{require_asset_amount, ChopMutation, ExpectedChop, PendingChop};
+use crate::chop::{
+    require_asset_amount, ChopMutation, ExpectedChop, PendingChop, PreparedActivation,
+};
 use crate::keys::Keys;
 use crate::player::{self, PlayerChopTransition, PlayerContract, PlayerState};
 use crate::tree::{self, TreeContract, TreeHealth, TreeState};
 use crate::txbuild;
 use crate::world::{ValidatedTree, ValidatedWorld, WorldManifest};
 use anyhow::{anyhow, Context, Result};
-use ark_core::asset::packet::{AssetGroup, AssetOutput, Packet};
 use ark_core::asset::AssetId;
-use ark_core::send::{build_offchain_transactions, SendReceiver};
 use ark_core::Asset;
-use bitcoin::{Amount, OutPoint, Transaction, Txid};
+use bitcoin::{OutPoint, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -61,7 +61,6 @@ struct World {
     xp_asset: AssetId,
     stone_asset: AssetId,
     iron_ore_asset: AssetId,
-    rollover_signer: bitcoin::XOnlyPublicKey,
     contract: TreeContract,
     genesis_txid: Txid,
     declared_trees: Vec<ValidatedTree>,
@@ -79,16 +78,17 @@ struct LiveTree {
 
 #[derive(Clone)]
 struct LivePlayerState {
-    contract: PlayerContract,
     state: PlayerState,
     record: VtxoRecord,
     previous_tx: Transaction,
 }
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlayerProfile {
     genesis_txid: String,
     player_asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_activation: Option<PreparedActivation>,
 }
 
 #[derive(Serialize)]
@@ -174,6 +174,7 @@ struct AppSnapshot {
     genesis_txid: String,
     covenant_script: String,
     pending_chop_txid: Option<String>,
+    pending_activation_txid: Option<String>,
     last_attempt: Option<AttemptView>,
     trees: Vec<TreeView>,
 }
@@ -186,6 +187,12 @@ struct AttemptView {
     material: player::MaterialDrop,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChopReconciliation {
+    Accepted,
+    Conflicted,
+    Pending,
+}
 #[derive(Clone, Copy)]
 struct TreeViewport {
     min_x: u16,
@@ -257,6 +264,9 @@ pub struct WoodlandApp {
     trees: Vec<LiveTree>,
     tree_viewport: TreeViewport,
     profile: PlayerProfile,
+    player_contract: PlayerContract,
+    wallet_script: bitcoin::ScriptBuf,
+    activation_error: Option<String>,
     player_state: Option<LivePlayerState>,
     wallet_records: Vec<VtxoRecord>,
     pending_storage_key: String,
@@ -349,8 +359,36 @@ impl WoodlandApp {
             None => PlayerProfile {
                 genesis_txid: genesis_txid.to_string(),
                 player_asset: None,
+                pending_activation: None,
             },
         };
+        let player_contract = player::build_player_contract(
+            &keys.secp,
+            keys.owner_pk(),
+            params.signer_pk,
+            emulator_params.signer_pk,
+            rollover_signer,
+            params.unilateral_exit_delay,
+            params.network,
+            tree_asset,
+            log_asset,
+            xp_asset,
+            stone_asset,
+            iron_ore_asset,
+            params.dust_sats,
+            &contract.vtxo.script_pubkey(),
+        )
+        .map_err(js_err)?;
+        if let Some(pending) = &profile.pending_activation {
+            txbuild::validate_activation_journal(&keys, &params, pending, &player_contract)
+                .map_err(js_err)?;
+            if profile.player_asset.as_deref() != Some(pending.player_asset.to_string().as_str()) {
+                return Err(JsValue::from_str(
+                    "activation journal does not match the selected PLAYER_ID",
+                ));
+            }
+        }
+        let wallet_script = player_vtxo(&keys, &params).map_err(js_err)?.script_pubkey();
         let info = txbuild::server_info(&params);
         let tree_viewport = TreeViewport {
             min_x: 0,
@@ -372,7 +410,6 @@ impl WoodlandApp {
                 xp_asset,
                 stone_asset,
                 iron_ore_asset,
-                rollover_signer,
                 contract,
                 genesis_txid,
                 declared_trees,
@@ -380,6 +417,9 @@ impl WoodlandApp {
             trees: Vec::new(),
             tree_viewport,
             profile,
+            player_contract,
+            wallet_script,
+            activation_error: None,
             player_state: None,
             wallet_records: Vec::new(),
             pending_storage_key,
@@ -547,13 +587,30 @@ impl WoodlandApp {
 
     #[wasm_bindgen(js_name = resumePendingChop)]
     pub async fn resume_pending_chop(&mut self) -> Result<JsValue, JsValue> {
-        self.resume_pending_chop_inner().await.map_err(js_err)?;
-        self.refresh().await
+        if self.resume_pending_chop_inner().await.map_err(js_err)? == ChopReconciliation::Conflicted
+        {
+            return Err(JsValue::from_str(
+                "pending chop conflicted; refresh before another swing",
+            ));
+        }
+        self.refresh_world().await
     }
 
     pub async fn activate(&mut self) -> Result<JsValue, JsValue> {
-        self.activate_inner().await.map_err(js_err)?;
-        self.refresh().await
+        if let Err(error) = self.activate_inner().await {
+            if self.profile.pending_activation.is_none() {
+                return Err(js_err(error));
+            }
+            self.activation_error = Some(format!("{error:#}"));
+        }
+        if let Err(error) = self.sync_player().await {
+            if self.profile.pending_activation.is_none() {
+                return Err(js_err(error));
+            }
+            self.activation_error = Some(format!("{error:#}"));
+        }
+        serde_wasm_bindgen::to_value(&self.snapshot())
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
     #[wasm_bindgen(js_name = renewPlayer)]
     pub async fn renew_player(&mut self) -> Result<JsValue, JsValue> {
@@ -586,6 +643,7 @@ impl WoodlandApp {
         self.refresh().await
     }
     pub async fn refresh(&mut self) -> Result<JsValue, JsValue> {
+        self.recover_activation().await;
         self.sync_player().await.map_err(js_err)?;
         serde_wasm_bindgen::to_value(&self.snapshot())
             .map_err(|error| JsValue::from_str(&error.to_string()))
@@ -593,13 +651,23 @@ impl WoodlandApp {
 
     #[wasm_bindgen(js_name = refreshWorld)]
     pub async fn refresh_world(&mut self) -> Result<JsValue, JsValue> {
+        self.recover_activation().await;
         self.sync().await.map_err(js_err)?;
+        if let Some(pending) = self.pending_chop.clone() {
+            let result = self
+                .reconcile_pending_chop(&pending)
+                .await
+                .map_err(js_err)?;
+            self.apply_chop_reconciliation(&pending, result)
+                .map_err(js_err)?;
+        }
         serde_wasm_bindgen::to_value(&self.snapshot())
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     #[wasm_bindgen(js_name = refreshPlayer)]
     pub async fn refresh_player(&mut self) -> Result<JsValue, JsValue> {
+        self.recover_activation().await;
         self.sync_player().await.map_err(js_err)?;
         serde_wasm_bindgen::to_value(&self.snapshot())
             .map_err(|error| JsValue::from_str(&error.to_string()))
@@ -874,12 +942,32 @@ impl WoodlandApp {
             .as_ref()
             .map(|player| player.record.rollover_margin_seconds());
         let activation_sats = self.params.dust_sats;
-        let clean_activation_funding = self
+        let funding_count = self
             .wallet_records
             .iter()
-            .any(|record| record.assets.is_empty() && record.amount_sats == activation_sats);
-        let activation_ready = self.player_state.is_none() && clean_activation_funding;
-        let activation_blocked_reason = None;
+            .filter(|record| self.is_activation_funding(record))
+            .count();
+        let pending_activation = self.profile.pending_activation.is_some();
+        let selected_player_missing =
+            self.profile.player_asset.is_some() && self.player_state.is_none();
+        let activation_ready = pending_activation
+            || (!selected_player_missing && self.player_state.is_none() && funding_count == 1);
+        let activation_blocked_reason = if pending_activation {
+            Some(match &self.activation_error {
+                Some(error) => format!("Activation pending; refresh or retry to recover. Do not deposit again. {error}"),
+                None => "Activation pending; refresh or retry to recover. Do not deposit again.".to_owned(),
+            })
+        } else if selected_player_missing {
+            Some("Selected PLAYER_ID is not indexed; refresh or restore its saved activation journal. Do not deposit again.".to_owned())
+        } else if self.player_state.is_none() && funding_count != 1 {
+            Some(if funding_count == 0 {
+                format!("Deposit one clean, live, exact {activation_sats}-sat VTXO; larger or asset-bearing inputs cannot activate, and balances are not combined.")
+            } else {
+                format!("Multiple eligible deposits found; keep exactly one clean, live, {activation_sats}-sat wallet VTXO for activation.")
+            })
+        } else {
+            None
+        };
         AppSnapshot {
             address: self.address(),
             server: self.rest.base().to_string(),
@@ -887,13 +975,20 @@ impl WoodlandApp {
             emulator_version: self.emulator_params.version.clone(),
             emulator_signer: self.emulator_params.signer_pk.to_string(),
             dust_sats: self.params.dust_sats,
-            funding_required_sats: if self.player_state.is_none() && !clean_activation_funding {
-                activation_sats.saturating_sub(wallet_sats)
+            funding_required_sats: if self.player_state.is_none()
+                && !selected_player_missing
+                && !pending_activation
+                && funding_count == 0
+            {
+                activation_sats
             } else {
                 0
             },
             wallet_sats,
-            funding_ready: self.player_state.is_some() && self.pending_chop.is_none(),
+            funding_ready: !pending_activation
+                && self.pending_chop.is_none()
+                && (self.player_state.is_some()
+                    || (!selected_player_missing && funding_count == 1)),
             activation_ready,
             activation_blocked_reason,
             player_active: self.player_state.is_some(),
@@ -940,6 +1035,11 @@ impl WoodlandApp {
                 .pending_chop
                 .as_ref()
                 .map(|pending| pending.expected_txid.clone()),
+            pending_activation_txid: self
+                .profile
+                .pending_activation
+                .as_ref()
+                .map(|pending| pending.player_asset.txid.to_string()),
             last_attempt: self.last_attempt,
             trees,
         }
@@ -972,7 +1072,7 @@ impl WoodlandApp {
     async fn sync_once(&mut self) -> Result<()> {
         let wallet = player_vtxo(&self.keys, &self.params)?;
         let wallet_script = wallet.script_pubkey().to_hex_string();
-        let player_contract = self.player_contract()?;
+        let player_contract = &self.player_contract;
         let player_asset = self.player_asset()?;
         let initializing_trees = self.trees.is_empty();
         let trees_to_refresh = self
@@ -1009,7 +1109,7 @@ impl WoodlandApp {
                         "spendableOnly",
                     )
                     .await?;
-                select_player_state_record(&records, &player_contract, player_asset)?
+                select_player_state_record(&records, player_contract, player_asset)?
             }
             None => None,
         };
@@ -1172,12 +1272,11 @@ impl WoodlandApp {
                         .ok_or_else(|| anyhow!("current player VTXO has no state packets"))?;
                     player::validate_player_state_record(
                         &record,
-                        &player_contract,
+                        player_contract,
                         player_asset.expect("state selection requires PLAYER_ID"),
                     )?;
 
                     Some(LivePlayerState {
-                        contract: player_contract,
                         state,
                         record,
                         previous_tx,
@@ -1187,12 +1286,6 @@ impl WoodlandApp {
             None => None,
         };
         self.wallet_records = wallet_records;
-        // Deployment placeholders are not indexed state and cannot prove a
-        // pending swing conflicted. The next pass resolves its tree, including
-        // when that tree is outside the current viewport.
-        if !initializing_trees {
-            self.reconcile_pending_chop()?;
-        }
         Ok(())
     }
 
@@ -1260,7 +1353,7 @@ impl WoodlandApp {
             .rest
             .get_vtxos(&wallet.script_pubkey().to_hex_string(), "spendableOnly")
             .await?;
-        let player_contract = self.player_contract()?;
+        let player_contract = &self.player_contract;
         let player_asset = self.player_asset()?;
         let player_state_record = match player_asset {
             Some(player_asset) => {
@@ -1271,7 +1364,7 @@ impl WoodlandApp {
                         "spendableOnly",
                     )
                     .await?;
-                select_player_state_record(&records, &player_contract, player_asset)?
+                select_player_state_record(&records, player_contract, player_asset)?
             }
             None => None,
         };
@@ -1297,11 +1390,10 @@ impl WoodlandApp {
                         .ok_or_else(|| anyhow!("current player VTXO has no state packets"))?;
                     player::validate_player_state_record(
                         &record,
-                        &player_contract,
+                        player_contract,
                         player_asset.expect("state selection requires PLAYER_ID"),
                     )?;
                     Some(LivePlayerState {
-                        contract: player_contract,
                         state,
                         record,
                         previous_tx,
@@ -1315,23 +1407,16 @@ impl WoodlandApp {
         Ok(())
     }
 
-    fn player_contract(&self) -> Result<PlayerContract> {
-        player::build_player_contract(
-            &self.keys.secp,
-            self.keys.owner_pk(),
-            self.params.signer_pk,
-            self.emulator_params.signer_pk,
-            self.world.rollover_signer,
-            self.params.unilateral_exit_delay,
-            self.params.network,
-            self.world.tree_asset,
-            self.world.log_asset,
-            self.world.xp_asset,
-            self.world.stone_asset,
-            self.world.iron_ore_asset,
-            self.params.dust_sats,
-            &self.world.contract.vtxo.script_pubkey(),
-        )
+    fn is_activation_funding(&self, record: &VtxoRecord) -> bool {
+        record.assets.is_empty()
+            && record.amount_sats == self.params.dust_sats
+            && record.script == self.wallet_script
+            && record
+                .ensure_live(
+                    crate::arkade::now_unix(),
+                    crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+                )
+                .is_ok()
     }
 
     fn player_asset(&self) -> Result<Option<AssetId>> {
@@ -1388,10 +1473,7 @@ impl WoodlandApp {
         Ok(())
     }
 
-    fn reconcile_pending_chop(&mut self) -> Result<()> {
-        let Some(pending) = self.pending_chop.clone() else {
-            return Ok(());
-        };
+    async fn reconcile_pending_chop(&self, pending: &PendingChop) -> Result<ChopReconciliation> {
         let txid = pending.txid()?;
         let expected_state = OutPoint {
             txid,
@@ -1401,68 +1483,80 @@ impl WoodlandApp {
             txid,
             vout: u32::from(crate::protocol::TREE_OUTPUT_INDEX),
         };
-        let accepted = self
-            .player_state
-            .as_ref()
-            .is_some_and(|state| state.record.outpoint == expected_state)
-            && self.trees.iter().any(|tree| {
-                tree.state.tree_id == pending.tree_id && tree.record.outpoint == expected_tree
-            });
-        if accepted {
-            self.last_attempt = Some(AttemptView {
-                tree_id: pending.tree_id,
-                success: pending.success,
-                material: pending.material,
-            });
-            self.clear_pending_chop()?;
-            return Ok(());
+        // A successor being spent by another player does not undo this swing.
+        let state = self
+            .rest
+            .find_settled_vtxo(&self.player_contract.vtxo.script_pubkey(), expected_state)
+            .await?;
+        let tree = self
+            .rest
+            .find_settled_vtxo(&self.world.contract.vtxo.script_pubkey(), expected_tree)
+            .await?;
+        if state.is_some() && tree.is_some() {
+            return Ok(ChopReconciliation::Accepted);
         }
-        let selected_state = pending.player_state_input()?;
-        let selected_tree = pending.tree_input()?;
-        let state_conflicted = self.player_state.as_ref().is_some_and(|state| {
-            state.record.outpoint != selected_state && state.record.outpoint != expected_state
-        });
-        let tree_conflicted = self
-            .trees
-            .iter()
-            .find(|tree| tree.state.tree_id == pending.tree_id)
-            .is_some_and(|tree| {
-                tree.record.outpoint != selected_tree && tree.record.outpoint != expected_tree
-            });
-        if state_conflicted || tree_conflicted {
-            self.clear_pending_chop()?;
+        let inputs = [pending.player_state_input()?, pending.tree_input()?];
+        let records = self.rest.get_vtxos_by_outpoints(&inputs).await?;
+        // Require direct indexed evidence of a different spend, not merely a
+        // newer head or an absent output in a lagging index snapshot.
+        if records.iter().any(|record| {
+            inputs.contains(&record.outpoint)
+                && match record.spent_by.or(record.settled_by) {
+                    Some(spender) => record.is_spent && spender != txid,
+                    None => record.is_swept || record.is_unrolled,
+                }
+        }) {
+            return Ok(ChopReconciliation::Conflicted);
+        }
+        Ok(ChopReconciliation::Pending)
+    }
+
+    fn apply_chop_reconciliation(
+        &mut self,
+        pending: &PendingChop,
+        result: ChopReconciliation,
+    ) -> Result<()> {
+        match result {
+            ChopReconciliation::Accepted => {
+                self.clear_pending_chop()?;
+                self.last_attempt = Some(AttemptView {
+                    tree_id: pending.tree_id,
+                    success: pending.success,
+                    material: pending.material,
+                });
+            }
+            ChopReconciliation::Conflicted => self.clear_pending_chop()?,
+            ChopReconciliation::Pending => {}
         }
         Ok(())
     }
 
-    async fn resume_pending_chop_inner(&mut self) -> Result<bool> {
+    async fn resume_pending_chop_inner(&mut self) -> Result<ChopReconciliation> {
+        let Some(pending) = self.pending_chop.clone() else {
+            return Ok(ChopReconciliation::Pending);
+        };
         for attempt in 0..RESUME_RECONCILE_ATTEMPTS {
-            let pending_before_sync = self.pending_chop.clone();
-            self.sync().await?;
-            if self.pending_chop.is_none() {
-                let Some(previously_pending) = pending_before_sync else {
-                    return Ok(false);
-                };
-                let expected_txid = previously_pending.txid()?;
-                let accepted = self
-                    .player_state
-                    .as_ref()
-                    .is_some_and(|state| state.record.outpoint.txid == expected_txid)
-                    && self
-                        .trees
-                        .iter()
-                        .find(|tree| tree.state.tree_id == previously_pending.tree_id)
-                        .is_some_and(|tree| tree.record.outpoint.txid == expected_txid);
-                return Ok(accepted);
+            let result = self.reconcile_pending_chop(&pending).await?;
+            if result != ChopReconciliation::Pending {
+                self.apply_chop_reconciliation(&pending, result)?;
+                return Ok(result);
             }
             if attempt + 1 < RESUME_RECONCILE_ATTEMPTS {
                 txbuild::sleep_ms(RESUME_RECONCILE_DELAY_MS).await;
             }
         }
-        let Some(pending) = self.pending_chop.clone() else {
-            return Ok(false);
-        };
-        let contract = self.player_contract()?;
+        let inputs = [pending.player_state_input()?, pending.tree_input()?];
+        let records = self.rest.get_vtxos_by_outpoints(&inputs).await?;
+        for outpoint in inputs {
+            let record = records.iter().find(|record| record.outpoint == outpoint)
+                .ok_or_else(|| anyhow!("pending chop input {outpoint} is not indexed; keep the journal and refresh"))?;
+            record
+                .ensure_live(
+                    crate::arkade::now_unix(),
+                    crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
+                )
+                .context("pending chop is not ready to resubmit; keep the journal and refresh")?;
+        }
         let (expected_ark, expected_checkpoints) = pending.decode_psbts()?;
         let submission = self
             .emulator
@@ -1471,169 +1565,149 @@ impl WoodlandApp {
             .context("resume pending chop through emulator");
         let (returned_ark, returned_checkpoints) = match submission {
             Ok(response) => response,
-            Err(error) if is_definitive_submission_rejection(&error) => {
-                let expected_txid = pending.txid()?;
-                self.sync()
-                    .await
-                    .context("reconcile pending chop after definitive rejection")?;
-                let accepted = self
-                    .player_state
-                    .as_ref()
-                    .is_some_and(|state| state.record.outpoint.txid == expected_txid)
-                    && self
-                        .trees
-                        .iter()
-                        .find(|tree| tree.state.tree_id == pending.tree_id)
-                        .is_some_and(|tree| tree.record.outpoint.txid == expected_txid);
-                if self.pending_chop.is_some() {
-                    self.clear_pending_chop()?;
+            Err(error) => {
+                let result = self.reconcile_pending_chop(&pending).await?;
+                if result != ChopReconciliation::Pending {
+                    self.apply_chop_reconciliation(&pending, result)?;
+                    return Ok(result);
                 }
-                return Ok(accepted);
+                // A rejection of a retry does not prove the original failed.
+                return Err(error);
             }
-            Err(error) => return Err(error),
         };
         player::verify_player_chop_response(
             &self.keys,
-            &contract,
+            &self.player_contract,
             &self.world.contract,
             &expected_ark,
             &expected_checkpoints,
             &returned_ark,
             returned_checkpoints,
         )?;
-
         let txid = pending.txid()?;
-        wait_for_vtxo(
-            &self.rest,
-            &contract.vtxo.script_pubkey(),
-            OutPoint {
-                txid,
-                vout: u32::from(crate::protocol::PLAYER_STATE_OUTPUT_INDEX),
-            },
-        )
-        .await?;
-        wait_for_vtxo(
-            &self.rest,
-            &self.world.contract.vtxo.script_pubkey(),
-            OutPoint {
-                txid,
-                vout: u32::from(crate::protocol::TREE_OUTPUT_INDEX),
-            },
-        )
-        .await?;
-        self.sync().await?;
-        if self.pending_chop.is_some() {
-            return Err(anyhow!(
-                "pending chop {txid} was submitted but did not reconcile"
-            ));
-        }
-        Ok(true)
+        self.rest
+            .wait_for_settled_vtxo(
+                &self.player_contract.vtxo.script_pubkey(),
+                OutPoint {
+                    txid,
+                    vout: u32::from(crate::protocol::PLAYER_STATE_OUTPUT_INDEX),
+                },
+            )
+            .await?;
+        self.rest
+            .wait_for_settled_vtxo(
+                &self.world.contract.vtxo.script_pubkey(),
+                OutPoint {
+                    txid,
+                    vout: u32::from(crate::protocol::TREE_OUTPUT_INDEX),
+                },
+            )
+            .await?;
+        self.apply_chop_reconciliation(&pending, ChopReconciliation::Accepted)?;
+        Ok(ChopReconciliation::Accepted)
     }
 
     async fn activate_inner(&mut self) -> Result<()> {
+        if self.profile.pending_activation.is_some() {
+            return self.resume_activation_inner().await;
+        }
         self.sync_player().await?;
         if self.player_state.is_some() {
             return Ok(());
         }
-        let funding = self
+        let mut funding = self
             .wallet_records
             .iter()
-            .filter(|record| {
-                record.assets.is_empty() && record.amount_sats == self.params.dust_sats
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let funding = match funding.as_slice() {
-            [record] => record.clone(),
-            [] => return Err(anyhow!("deposit one exact dust-sized VTXO first")),
-            _ => return Err(anyhow!("multiple activation VTXOs are available")),
-        };
-        let wallet = player_vtxo(&self.keys, &self.params)?;
-        let contract = self.player_contract()?;
-        let inputs = [txbuild::vtxo_input(&funding, &wallet)?];
-        let mut activation = build_offchain_transactions(
-            &[SendReceiver::bitcoin(
-                contract.vtxo.to_ark_address(),
-                Amount::from_sat(self.params.dust_sats),
-            )],
-            &wallet.to_ark_address(),
-            &inputs,
-            &self.info,
+            .filter(|record| self.is_activation_funding(record));
+        let record = funding.next().ok_or_else(|| {
+            anyhow!(
+            "deposit one clean, live, exact {}-sat wallet VTXO first; balances are not combined",
+            self.params.dust_sats
         )
-        .map_err(|error| anyhow!("build permissionless player activation: {error}"))?;
-        ark_core::asset::packet::add_asset_packet_to_psbt(
-            &mut activation.ark_tx,
-            &Packet {
-                groups: vec![AssetGroup {
-                    asset_id: None,
-                    control_asset: None,
-                    metadata: Some(vec![
-                        ("game".to_owned(), crate::world::GAME_ID.to_owned()),
-                        (
-                            "protocol".to_owned(),
-                            crate::world::PROTOCOL_VERSION.to_string(),
-                        ),
-                        ("asset".to_owned(), "PLAYER_ID".to_owned()),
-                        ("owner".to_owned(), self.keys.owner_pk().to_string()),
-                    ]),
-                    inputs: Vec::new(),
-                    outputs: vec![AssetOutput {
-                        output_index: crate::protocol::ACTIVATION_STATE_OUTPUT_INDEX,
-                        amount: 1,
-                    }],
-                }],
-            },
-        )
-        .map_err(|error| anyhow!("attach PLAYER_ID issuance packet: {error}"))?;
-        let initial_luck = player::PlayerLuck::initial(&contract.vtxo.script_pubkey())?;
-        player::attach_player_state_packets(
-            &mut activation.ark_tx,
-            PlayerState {
-                luck: initial_luck,
-                axe: player::AxeTier::None,
-            },
-        )?;
-        if activation.ark_tx.unsigned_tx.output.len() != crate::protocol::ACTIVATION_OUTPUT_COUNT {
-            return Err(anyhow!("activation transaction has an invalid shape"));
+        })?;
+        if funding.next().is_some() {
+            return Err(anyhow!(
+                "multiple activation VTXOs are available; keep exactly one"
+            ));
         }
-        let txid = activation.ark_tx.unsigned_tx.compute_txid();
-        let player_asset = AssetId {
-            txid,
-            group_index: crate::protocol::PLAYER_ID_ASSET_GROUP_INDEX as u16,
+        let prepared = crate::chop::prepare_activation(
+            &self.keys,
+            &self.params,
+            &self.player_contract,
+            record,
+        )?;
+        if self
+            .player_asset()?
+            .is_some_and(|asset| asset != prepared.player_asset)
+        {
+            return Err(anyhow!(
+                "restore the activation journal for the selected PLAYER_ID; do not deposit again"
+            ));
+        }
+        self.profile.player_asset = Some(prepared.player_asset.to_string());
+        self.profile.pending_activation = Some(prepared);
+        // Identity and original signed PSBTs share the existing profile write.
+        // No submission is allowed until this write succeeds.
+        self.persist_profile()?;
+        self.resume_activation_inner().await
+    }
+
+    async fn recover_activation(&mut self) {
+        if self.profile.pending_activation.is_some() {
+            self.activation_error = self
+                .resume_activation_inner()
+                .await
+                .err()
+                .map(|error| format!("{error:#}"));
+        }
+    }
+
+    async fn resume_activation_inner(&mut self) -> Result<()> {
+        let Some(prepared) = self.profile.pending_activation.as_ref() else {
+            return Ok(());
         };
-        if let Some(expected) = self.player_asset()? {
-            if expected != player_asset {
-                return Err(anyhow!(
-                    "activation retry does not reproduce the pending PLAYER_ID"
-                ));
+        let txid = txbuild::validate_activation_journal(
+            &self.keys,
+            &self.params,
+            prepared,
+            &self.player_contract,
+        )?;
+        if self.player_asset()? != Some(prepared.player_asset) {
+            return Err(anyhow!(
+                "activation journal does not match the selected PLAYER_ID"
+            ));
+        }
+        // Also retries a failed localStorage write before any network submission.
+        self.persist_profile()?;
+        let script = self.player_contract.vtxo.script_pubkey();
+        let outpoint = OutPoint {
+            txid,
+            vout: u32::from(crate::protocol::ACTIVATION_STATE_OUTPUT_INDEX),
+        };
+        if self
+            .rest
+            .find_settled_vtxo(&script, outpoint)
+            .await?
+            .is_none()
+        {
+            match txbuild::resume_tx(&self.keys, &self.rest, &prepared.transaction).await? {
+                txbuild::RunTxStatus::Finalized(finalized) => {
+                    if finalized != txid {
+                        return Err(anyhow!("activation finalized an unexpected transaction"));
+                    }
+                    self.rest.wait_for_settled_vtxo(&script, outpoint).await?;
+                }
+                txbuild::RunTxStatus::Pending(_) | txbuild::RunTxStatus::SubmissionUnknown(_) => {
+                    return Ok(());
+                }
             }
         }
-        self.profile.player_asset = Some(player_asset.to_string());
-        // Persist the derived PLAYER_ID before submission: the JavaScript
-        // side only writes the profile after the action settles, so a crash
-        // in between would otherwise strand the activated state.
-        self.persist_profile()?;
-        txbuild::run_tx(
-            &self.keys,
-            &self.rest,
-            activation.ark_tx,
-            activation.checkpoint_txs,
-        )
-        .await
-        .context("submit permissionless player activation")?;
-        wait_for_vtxo(
-            &self.rest,
-            &contract.vtxo.script_pubkey(),
-            OutPoint {
-                txid,
-                vout: u32::from(crate::protocol::ACTIVATION_STATE_OUTPUT_INDEX),
-            },
-        )
-        .await?;
-        self.sync_player().await?;
-        if self.player_state.is_none() {
-            return Err(anyhow!("activated player state was not discovered"));
+        let journal = self.profile.pending_activation.take();
+        if let Err(error) = self.persist_profile() {
+            self.profile.pending_activation = journal;
+            return Err(error);
         }
+        self.activation_error = None;
         Ok(())
     }
     async fn withdraw_log_inner(&mut self, amount: u64) -> Result<()> {
@@ -1670,7 +1744,7 @@ impl WoodlandApp {
         let prepared = crate::chop::prepare_withdraw(
             &self.keys,
             &self.info,
-            &state.contract,
+            &self.player_contract,
             player_asset,
             &state.record,
             &state.previous_tx,
@@ -1692,7 +1766,7 @@ impl WoodlandApp {
         }
         wait_for_vtxo(
             &self.rest,
-            &state.contract.vtxo.script_pubkey(),
+            &self.player_contract.vtxo.script_pubkey(),
             OutPoint {
                 txid,
                 vout: u32::from(crate::protocol::WITHDRAW_STATE_OUTPUT_INDEX),
@@ -1722,7 +1796,7 @@ impl WoodlandApp {
         let prepared = crate::chop::prepare_craft(
             &self.keys,
             &self.info,
-            &state.contract,
+            &self.player_contract,
             player_asset,
             &state.record,
             &state.previous_tx,
@@ -1745,7 +1819,7 @@ impl WoodlandApp {
         }
         wait_for_vtxo(
             &self.rest,
-            &state.contract.vtxo.script_pubkey(),
+            &self.player_contract.vtxo.script_pubkey(),
             expected_outpoint,
         )
         .await?;
@@ -1806,7 +1880,7 @@ impl WoodlandApp {
         let prepared = crate::renewal::prepare_player(
             &state.record,
             &state.previous_tx,
-            &state.contract,
+            &self.player_contract,
             player_asset,
             crate::arkade::DEFAULT_EXPIRY_MARGIN_SECS,
         )?;
@@ -1839,7 +1913,7 @@ impl WoodlandApp {
             .await?;
         let renewed = wait_for_vtxo(
             &self.rest,
-            &state.contract.vtxo.script_pubkey(),
+            &self.player_contract.vtxo.script_pubkey(),
             outcome.outpoint,
         )
         .await?;
@@ -1989,6 +2063,7 @@ impl WoodlandApp {
         mutation: ChopMutation,
         expected: Option<ExpectedChop>,
     ) -> Result<(bool, player::MaterialDrop)> {
+        self.sync_player().await?;
         self.sync_tree(tree_id).await?;
         if let Some(pending) = &self.pending_chop {
             return Err(anyhow!(
@@ -2040,12 +2115,11 @@ impl WoodlandApp {
                 stone_asset: self.world.stone_asset,
                 iron_ore_asset: self.world.iron_ore_asset,
                 dust_sats: self.params.dust_sats,
-                map_width: self.world.manifest.map_width,
             },
             &crate::chop::PlayerChopState {
                 record: &state.record,
                 previous_tx: &state.previous_tx,
-                contract: &state.contract,
+                contract: &self.player_contract,
                 state: state.state,
                 player_asset,
             },
@@ -2120,9 +2194,12 @@ impl WoodlandApp {
                     let submission_detail = format!("{submission_error:#}");
                     txbuild::sleep_ms(500).await;
                     return match self.resume_pending_chop_inner().await {
-                        Ok(true) => Ok((success, material)),
-                        Ok(false) => Err(anyhow!(
+                        Ok(ChopReconciliation::Accepted) => Ok((success, material)),
+                        Ok(ChopReconciliation::Conflicted) => Err(anyhow!(
                             "chop conflicted while recovering from submission failure: {submission_detail}"
+                        )),
+                        Ok(ChopReconciliation::Pending) => Err(anyhow!(
+                            "chop is still pending; keep the journal and refresh: {submission_detail}"
                         )),
                         Err(recovery_error) => Err(recovery_error.context(format!(
                             "recover exact pending chop after submission failure: {submission_detail}"
@@ -2134,31 +2211,33 @@ impl WoodlandApp {
         };
         player::verify_player_chop_response(
             &self.keys,
-            &state.contract,
+            &self.player_contract,
             &self.world.contract,
             &expected_ark,
             &expected_checkpoints,
             &returned_ark,
             returned_checkpoints,
         )?;
-        let state_record = wait_for_vtxo(
-            &self.rest,
-            &state.contract.vtxo.script_pubkey(),
-            OutPoint {
-                txid: chop_txid,
-                vout: u32::from(crate::protocol::PLAYER_STATE_OUTPUT_INDEX),
-            },
-        )
-        .await?;
-        let tree_record = wait_for_vtxo(
-            &self.rest,
-            &self.world.contract.vtxo.script_pubkey(),
-            OutPoint {
-                txid: chop_txid,
-                vout: u32::from(crate::protocol::TREE_OUTPUT_INDEX),
-            },
-        )
-        .await?;
+        let state_record = self
+            .rest
+            .wait_for_settled_vtxo(
+                &self.player_contract.vtxo.script_pubkey(),
+                OutPoint {
+                    txid: chop_txid,
+                    vout: u32::from(crate::protocol::PLAYER_STATE_OUTPUT_INDEX),
+                },
+            )
+            .await?;
+        let tree_record = self
+            .rest
+            .wait_for_settled_vtxo(
+                &self.world.contract.vtxo.script_pubkey(),
+                OutPoint {
+                    txid: chop_txid,
+                    vout: u32::from(crate::protocol::TREE_OUTPUT_INDEX),
+                },
+            )
+            .await?;
         let next_state = player::player_state_from_tx(&chop_tx)?
             .ok_or_else(|| anyhow!("chop transaction omitted player state"))?;
         PlayerChopTransition {
@@ -2216,11 +2295,11 @@ impl WoodlandApp {
             last_attempt_txid: Some(chop_txid),
         };
         self.player_state = Some(LivePlayerState {
-            contract: state.contract,
             state: next_state,
             record: state_record,
             previous_tx: chop_tx,
         });
+        self.sync_tree(tree_id).await?;
         if matches!(mutation, ChopMutation::None) {
             self.clear_pending_chop()?;
         }
