@@ -14,6 +14,10 @@
     body { margin: 0; background: #0d120c; }
     main { width: min(980px, calc(100% - 24px)); margin: 20px auto 40px; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .header-actions { display: flex; align-items: center; gap: 14px; }
+    .header-actions a { padding: 8px 0; font-size: .86rem; }
+    a { color: #b9e879; text-underline-offset: 3px; }
+    a:hover, a:focus-visible { color: #dfe9da; }
     h1, h2, p { margin: 0; }
     h1 { color: #b9e879; font-size: 1.25rem; }
     h2 { margin-bottom: 10px; font-size: 1rem; }
@@ -146,7 +150,10 @@
   <main>
     <header>
       <h1>woodland.sh <span class="muted">(alpha)</span></h1>
-      <button id="refresh" type="button">Refresh</button>
+      <div class="header-actions">
+        <a href="https://github.com/stutxo/woodland.sh" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
     </header>
 
     <section id="game">
@@ -171,6 +178,7 @@
         <button id="copy-address" type="button" disabled>Copy address</button>
       </div>
       <p id="funding-instruction" class="funding-instruction">Waiting for wallet...</p>
+      <!-- WOODLAND_FAUCET -->
       <button id="activate" type="button">Create player</button>
       <span id="onboarding-note" class="muted">Checking wallet...</span>
     </section>

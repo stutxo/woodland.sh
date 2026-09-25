@@ -368,6 +368,11 @@ HTTPS health reported ready, and the browser loaded the v4 world, resolved tree
 browser check used an unfunded wallet; player creation and chopping were not
 exercised.
 
+The browser header links to the [GitHub source](https://github.com/stutxo/woodland.sh).
+The funding panel includes the [Mutinynet faucet](https://faucet.mutinynet.com/)
+only for Signet bundles using `https://mutinynet.arkade.sh`; mainnet, regtest,
+and other Signet deployments do not show a test-faucet link.
+
 Configuration and the operational child live under `/etc/woodland`; neither
 root mnemonic nor the deployer child was transferred to EC2. Private local
 deployment/recovery material is under `$HOME/.local/state/woodland-ec2-v4`.

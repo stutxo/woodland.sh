@@ -81,8 +81,9 @@ const contentSecurityPolicy = [
 const htmlAttribute = (value) => value.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
 const cspMarker = '  <!-- WOODLAND_CSP -->';
 const serverMarker = '  <!-- WOODLAND_SERVER -->';
+const faucetMarker = '      <!-- WOODLAND_FAUCET -->';
 const indexTemplate = await readFile(path.join(ROOT, 'web/index.html'), 'utf8');
-if (!indexTemplate.includes(cspMarker) || !indexTemplate.includes(serverMarker)) {
+if (!indexTemplate.includes(cspMarker) || !indexTemplate.includes(serverMarker) || !indexTemplate.includes(faucetMarker)) {
   throw new Error('web/index.html is missing a web configuration marker');
 }
 const index = indexTemplate
@@ -93,6 +94,12 @@ const index = indexTemplate
   .replace(
     serverMarker,
     `  <meta name="woodland-server" content="${htmlAttribute(sameOriginServer ? 'self' : server?.origin || '')}">`,
+  )
+  .replace(
+    faucetMarker,
+    manifest.network === 'signet' && arkade.origin === 'https://mutinynet.arkade.sh'
+      ? '      <p class="muted">Need test sats? <a href="https://faucet.mutinynet.com/" target="_blank" rel="noopener noreferrer">Mutinynet faucet</a>.</p>'
+      : '',
   );
 
 await mkdir(outputPath, { recursive: true });
