@@ -1021,10 +1021,10 @@ async function main() {
     await waitFor(
       'player activation funding',
       inspect,
-      (value) => !value.state?.fundingReady
+      (value) => value.state?.activationReady
+        && !value.state.playerActive
         && value.state.walletSats === initial.state.fundingRequiredSats
         && value.state.fundingRequiredSats === 0
-        && value.state.activationReady
         && !value.activateDisabled,
     );
     await click('activate');

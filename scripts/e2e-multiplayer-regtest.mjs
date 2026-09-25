@@ -59,7 +59,7 @@ async function createPlayer(driverUrl, label, sessions) {
       player: globalThis.__WOODLAND_E2E_PLAYER || null,
       adjacentTree: globalThis.__WOODLAND_E2E_ADJACENT_TREE || null,
       busy: Boolean(document.getElementById('refresh')?.disabled),
-      fundingInstruction: document.getElementById('funding-instruction')?.textContent || '',
+      activateDisabled: Boolean(document.getElementById('activate')?.disabled),
       status: document.getElementById('status')?.textContent || '',
       log: document.getElementById('log')?.textContent || '',
       leaderboard: globalThis.__WOODLAND_E2E_LEADERBOARD || [],
@@ -341,10 +341,7 @@ async function main() {
       assert.equal(view.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
       assert.equal(view.state.playerAsset, null);
       assert.equal(view.state.fundingRequiredSats, 330);
-      assert.equal(
-        view.fundingInstruction,
-        `Deposit ${view.state.fundingRequiredSats} sats to the Arkade address above`,
-      );
+      assert.equal(view.activateDisabled, true);
     }
     assertTreeValue(initialShared, 'initial multiplayer state');
 
@@ -360,9 +357,10 @@ async function main() {
     await refreshPlayers(
       players,
       'player activation funding',
-      (value, index) => !value.state?.fundingReady
-        && !value.state?.playerActive
-        && value.state?.walletSats === activationAmounts[index],
+      (value, index) => value.state?.activationReady
+        && !value.state.playerActive
+        && value.state.walletSats === activationAmounts[index]
+        && !value.activateDisabled,
     );
 
     await Promise.all(players.map((player) => player.click('activate')));
