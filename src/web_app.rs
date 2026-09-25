@@ -659,6 +659,7 @@ impl WoodlandApp {
                 .await
                 .map_err(js_err)?;
             self.apply_chop_reconciliation(&pending, result)
+                .await
                 .map_err(js_err)?;
         }
         serde_wasm_bindgen::to_value(&self.snapshot())
@@ -1511,13 +1512,16 @@ impl WoodlandApp {
         Ok(ChopReconciliation::Pending)
     }
 
-    fn apply_chop_reconciliation(
+    async fn apply_chop_reconciliation(
         &mut self,
         pending: &PendingChop,
         result: ChopReconciliation,
     ) -> Result<()> {
         match result {
             ChopReconciliation::Accepted => {
+                // Recovery bypasses the normal chop's local tree update. Keep the
+                // journal until the recovered tree head is reflected in snapshots.
+                self.sync_tree(pending.tree_id).await?;
                 self.clear_pending_chop()?;
                 self.last_attempt = Some(AttemptView {
                     tree_id: pending.tree_id,
@@ -1538,7 +1542,7 @@ impl WoodlandApp {
         for attempt in 0..RESUME_RECONCILE_ATTEMPTS {
             let result = self.reconcile_pending_chop(&pending).await?;
             if result != ChopReconciliation::Pending {
-                self.apply_chop_reconciliation(&pending, result)?;
+                self.apply_chop_reconciliation(&pending, result).await?;
                 return Ok(result);
             }
             if attempt + 1 < RESUME_RECONCILE_ATTEMPTS {
@@ -1568,7 +1572,7 @@ impl WoodlandApp {
             Err(error) => {
                 let result = self.reconcile_pending_chop(&pending).await?;
                 if result != ChopReconciliation::Pending {
-                    self.apply_chop_reconciliation(&pending, result)?;
+                    self.apply_chop_reconciliation(&pending, result).await?;
                     return Ok(result);
                 }
                 // A rejection of a retry does not prove the original failed.
@@ -1603,7 +1607,8 @@ impl WoodlandApp {
                 },
             )
             .await?;
-        self.apply_chop_reconciliation(&pending, ChopReconciliation::Accepted)?;
+        self.apply_chop_reconciliation(&pending, ChopReconciliation::Accepted)
+            .await?;
         Ok(ChopReconciliation::Accepted)
     }
 
