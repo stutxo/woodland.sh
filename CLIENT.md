@@ -293,6 +293,10 @@ refresh is not that evidence. Retain a single accepted/conflicted/pending
 result independently of clearing the saved journal; a retry must not infer
 success from the disappearance of the journal.
 
+On accepted recovery, synchronize the affected tree's current head before
+clearing the journal or returning a snapshot. A player-only refresh does not
+update cached tree state; if tree synchronization fails, retain the journal.
+
 The reference key is `woodland.sh:web:v2:pending:<arkade-url>:<genesis-txid>`.
 
 ## Direct Owner Renewal

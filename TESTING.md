@@ -134,14 +134,23 @@ The same `dist/` layout can alternatively deploy to GitHub Pages. The artifact
 contains a manifest-specific CSP, `.nojekyll`, and an explicit 404. Gameplay
 still calls Arkade and the stock emulator directly.
 
+Compose validation and the functional harness load `regtest/.env.defaults`
+before local `.env.regtest` overrides. CI reuses the shared emulator signer
+instead of defining a workflow key; that signer must differ from the deployer.
+
 CI allows 120 two-second emulator readiness attempts. A timeout prints the
 container state and the final 200 log lines before teardown, so startup failures
 remain diagnosable.
 
 Pushes and pull requests gate on both smoke and progression. Scheduled runs
 use full plus progression; manual dispatch runs the selected profile plus
-progression, without duplicating a selected progression run. Each matrix leg
-uploads its own report, and Pages waits for every functional leg to pass.
+progression, without duplicating a selected progression run. Scheduled and
+manual full runs also run both fuzz targets on the nightly Rust toolchain.
+Each matrix leg uploads its own report.
+
+The optional Pages deployment waits for every functional leg and requires the
+`WOODLAND_PAGES_MANIFEST` repository variable. This workflow does not deploy
+to EC2.
 
 ## Bootstrap Assertions
 
