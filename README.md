@@ -368,7 +368,8 @@ HTTPS health reported ready, and the browser loaded the v4 world, resolved tree
 browser check used an unfunded wallet; player creation and chopping were not
 exercised.
 
-The browser header links to the [GitHub source](https://github.com/stutxo/woodland.sh).
+The page uses a tree-emoji favicon, and its header links to the
+[GitHub source](https://github.com/stutxo/woodland.sh).
 The funding panel includes the [Mutinynet faucet](https://faucet.mutinynet.com/)
 only for Signet bundles using `https://mutinynet.arkade.sh`; mainnet, regtest,
 and other Signet deployments do not show a test-faucet link.
