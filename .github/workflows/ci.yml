@@ -101,9 +101,7 @@ jobs:
       - run: node scripts/test-assemble-web.mjs
       - run: node scripts/test-browser-recovery.mjs
       - name: Validate regtest Compose files
-        env:
-          EMULATOR_SECRET_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
-        run: docker compose --env-file .env.regtest -f regtest/docker/compose.base.yml -f regtest/docker/compose.ark.yml config --quiet
+        run: docker compose --env-file regtest/.env.defaults --env-file .env.regtest -f regtest/docker/compose.base.yml -f regtest/docker/compose.ark.yml config --quiet
 
   fuzz:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'full')
@@ -132,7 +130,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.profile == 'progression' && 150 || 45 }}
     env:
-      EMULATOR_SECRET_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
       WOODLAND_CI_PROFILE: ${{ matrix.profile }}
       WOODLAND_E2E_ARTIFACT_DIR: regtest/_build/ci-artifacts
       WOODLAND_E2E_JUNIT: regtest/_build/ci-artifacts/e2e-junit.xml
