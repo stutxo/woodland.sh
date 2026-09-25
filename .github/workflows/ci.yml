@@ -102,11 +102,11 @@ jobs:
       - run: node scripts/test-browser-recovery.mjs
       - name: Validate regtest Compose files
         env:
-          EMULATOR_SECRET_KEY: 1111111111111111111111111111111111111111111111111111111111111111
+          EMULATOR_SECRET_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
         run: docker compose --env-file .env.regtest -f regtest/docker/compose.base.yml -f regtest/docker/compose.ark.yml config --quiet
 
   fuzz:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'full')
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -116,7 +116,7 @@ jobs:
       - uses: taiki-e/install-action@v2.86.4
         with:
           tool: cargo-fuzz
-          fallback: none
+          fallback: cargo-install
       - run: cargo fuzz run asset_packet -- -max_total_time=60
         working-directory: fuzz
       - run: cargo fuzz run batch_sse -- -max_total_time=60
@@ -132,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.profile == 'progression' && 150 || 45 }}
     env:
-      EMULATOR_SECRET_KEY: 1111111111111111111111111111111111111111111111111111111111111111
+      EMULATOR_SECRET_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
       WOODLAND_CI_PROFILE: ${{ matrix.profile }}
       WOODLAND_E2E_ARTIFACT_DIR: regtest/_build/ci-artifacts
       WOODLAND_E2E_JUNIT: regtest/_build/ci-artifacts/e2e-junit.xml
