@@ -7,7 +7,7 @@ publish = false
 license = "MIT"
 description = "Recursive Arkade woodcutting protocol"
 homepage = "https://woodland.sh"
-repository = "https://github.com/stutxo/the-dark-forest"
+repository = "https://github.com/stutxo/woodland.sh"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]

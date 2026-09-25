@@ -188,7 +188,7 @@ Build `woodland-operator` for the watcher host and install:
 ```text
 /opt/woodland/woodland-operator
 /etc/woodland/woodland-world.json
-/etc/woodland/mainnet.env
+/etc/woodland/operations.env
 /etc/systemd/system/woodland-renewal.service
 ```
 
@@ -197,10 +197,10 @@ Use:
 ```text
 /opt/woodland/woodland-operator       root:root      0555
 /etc/woodland/woodland-world.json     root:root      0444
-/etc/woodland/mainnet.env             root:woodland  0640
+/etc/woodland/operations.env          root:woodland  0640
 ```
 
-Populate `mainnet.env` from `operations.env.example` and copy in only the
+Populate `operations.env` from `operations.env.example` and copy in only the
 generated rollover child; do not copy either root or the deployer child. The
 tree watcher needs this lower-authority key for exact-state maintenance.
 Funded-stump regrowth remains permissionless under the `{operator, emulator}`
@@ -235,11 +235,11 @@ asset-free VTXOs on the ordinary Arkade contract derived from the rollover
 child and the pinned service parameters. Each renewal consumes one such VTXO,
 pays the maximum applicable fee, and returns exact same-contract change.
 
-With `/etc/woodland/mainnet.env` loaded in a restricted root or `woodland`
+With `/etc/woodland/operations.env` loaded in a restricted root or `woodland`
 shell, derive the exact fee-wallet address:
 
 ```bash
-(set -a; . /etc/woodland/mainnet.env; \
+(set -a; . /etc/woodland/operations.env; \
   exec /opt/woodland/woodland-operator renewal-address \
     /etc/woodland/woodland-world.json)
 ```
@@ -379,3 +379,19 @@ site only after CI and regtest pass.
 
 Configure the public emulator reverse proxy to allow the exact Pages origin
 before publishing; do not enable wildcard CORS.
+
+## Moving an existing host
+
+Use the [Linux/EC2 migration workflow](../README.md#move-an-existing-world-to-linux--ec2)
+to preserve an existing world's manifest, operational key, registry, origin,
+and exact web assets. The exporter requires an explicit compatible source
+commit; the installer builds it rather than copying Nix-linked executables or
+deploying another genesis. It supports matching v3 and v4 bundles, not a
+protocol upgrade. The old NixOS v3 world expired; the current Mutinynet EC2
+deployment is a fresh v4 genesis, separate from the mainnet deployment above.
+
+The renewal service now reads `/etc/woodland/operations.env`, matching the
+example filename. When updating an existing installation that used
+`/etc/woodland/mainnet.env`, move that protected file to `operations.env` before
+installing the new unit and reloading systemd. Do not create a second copy
+containing deployer credentials.

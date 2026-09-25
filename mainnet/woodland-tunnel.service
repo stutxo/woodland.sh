@@ -1,0 +1,32 @@
+[Unit]
+Description=Woodland existing Cloudflare Tunnel connector
+After=network-online.target woodland-server.service
+Wants=network-online.target woodland-server.service
+
+[Service]
+Type=simple
+User=woodland-tunnel
+Group=woodland-tunnel
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:2000 run --token-file /etc/woodland/cloudflared-token
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

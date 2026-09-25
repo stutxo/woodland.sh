@@ -4,7 +4,7 @@
 # permissionless; active and terminal tree maintenance uses the lower-authority
 # rollover child from the protected environment file.
 [Unit]
-Description=woodland.sh mainnet renewal watcher
+Description=woodland.sh renewal watcher
 After=network-online.target
 Wants=network-online.target
 
@@ -13,7 +13,7 @@ Type=simple
 User=woodland
 Group=woodland
 WorkingDirectory=/opt/woodland
-EnvironmentFile=/etc/woodland/mainnet.env
+EnvironmentFile=/etc/woodland/operations.env
 ExecStart=/opt/woodland/woodland-operator watch /etc/woodland/woodland-world.json
 Restart=always
 RestartSec=5

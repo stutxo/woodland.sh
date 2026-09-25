@@ -348,6 +348,167 @@ deliberate tracked deployment path before enabling Pages. The Pages artifact
 contains no secrets; gameplay still talks directly to the manifest-pinned
 Arkade and emulator services.
 
+## Current Mutinynet deployment
+
+On 25 September 2026, a fresh **protocol v4 / schema v4** world was deployed
+to the existing Amazon Linux 2023 ARM64 EC2 host:
+
+- Genesis: `23c05954596363ac1a7976135ffc9d361b8dda7905d0603a732b194a3fb60f74`.
+- Runtime source: `aa864ed66a54e68acbf1ed334b8993773a5ac063`, package `4.0.0`.
+- All 420 trees were verified live. An actual exact-state renewal of tree 417
+  succeeded, and the browser resolved its renewed VTXO.
+- The game listens only on `127.0.0.1:8090`; Sapio retains ports 8000 and 8367.
+- `woodland-server`, `woodland-renewal`, `woodland-tunnel`, and
+  `woodland-backup.timer` are enabled at boot.
+
+The canonical origin, `https://woodland.sh`, is publicly live. Cloudflare activated
+the zone on 25 September 2026 after the registrar nameserver correction. Public
+HTTPS health reported ready, and the browser loaded the v4 world, resolved tree
+417's renewed VTXO, and completed Refresh through the public hostname. This
+browser check used an unfunded wallet; player creation and chopping were not
+exercised.
+
+Configuration and the operational child live under `/etc/woodland`; neither
+root mnemonic nor the deployer child was transferred to EC2. Private local
+deployment/recovery material is under `$HOME/.local/state/woodland-ec2-v4`.
+Daily root-private backups are stored in `/var/backups/woodland`, with the
+latest 30 retained. An initial backup was copied off-instance and its SHA-256
+verified. Keep current backups off-instance: replacing this shared instance
+through Sapio Terraform can discard its root volume and Woodland state.
+
+The old v3 world and progression were not migrated. The previous NixOS hosting
+configuration was not retired as part of this fresh-world deployment.
+
+## Move an existing world to Linux / EC2
+
+A host move is **not a world deployment**. Preserve the signed manifest, exact
+browser bundle, rollover child, player registry, and existing HTTPS origin.
+The web/API server, renewal watcher, tunnel, and backups move; Arkade, the
+emulator, assets, and player wallets remain where they are. Presence and chat
+are intentionally ephemeral. Never put a deployer child or either root mnemonic
+on the replacement host.
+
+This checkout targets protocol v4. The former Mutinynet v3 world used source
+`7de362f9dfe766c07f5b00a04cab4d9a891a4f8d`; its trees expired on
+24 September 2026 and were confirmed swept on 25 September. A host restore
+cannot revive it, even though the old operator's `status` reports `ready`.
+Replacing that world requires an explicitly approved fresh v4 genesis and
+does not carry over v3 progression. The migration tools preserve a **live**
+world, pin compatible source, and reject protocol/schema mismatches.
+
+### Export and retire the NixOS host
+
+From this checkout, create a new private directory **outside Git**:
+
+```bash
+nix-shell -p python3
+bundle="$HOME/woodland-ec2-migration"
+sudo ./scripts/export-host.sh \
+  --revision 7de362f9dfe766c07f5b00a04cab4d9a891a4f8d \
+  --public-url https://woodland.sh \
+  "$bundle"
+python3 ./scripts/host-bundle.py validate "$bundle"
+```
+
+Export briefly pauses the server and backup timer for a consistent registry
+snapshot, then restores their prior running state. It leaves renewal and the
+tunnel running. The private directory contains pinned source, matching web
+assets, operational credentials, state, checksums, and self-contained tools.
+It is owned by the invoking sudo user for secure transfer. Checksums detect
+corruption, not authenticity: only run a bundle you trust.
+
+Prepare the replacement EC2 instance before stopping renewal. An offline world
+does not wait indefinitely: expired/swept tree state cannot be recovered from
+this backup. Check actual spendability and expiry before migration; an active
+service or a successful v3 `status` command does not prove that trees remain
+renewable. Resolve upstream signer/version pin failures before the deadline.
+
+When ready for downtime/cutover:
+
+```bash
+sudo ./scripts/retire-nixos-host.sh "$bundle"
+```
+
+Retirement refuses changed credentials, web assets, or registry rather than
+losing newer state. If needed, stop the old server and backup timer, make a
+fresh export into a new directory, and transfer that snapshot instead. The
+tool backs up the Nix configuration, removes only `./woodland/host.nix` from
+the imports, runs `nixos-rebuild switch`, and verifies that hosting units,
+boot dependencies, and the module's sleep overrides are gone. Failures attempt
+configuration/service recovery. Original protected data is deliberately
+retained until EC2 recovery has been verified; this is not a secure erase.
+
+### Restore on Ubuntu or Amazon Linux
+
+The installer supports Ubuntu 22.04+ and Amazon Linux 2023 with systemd and
+Python 3; Amazon Linux also requires curl or curl-minimal. Allow enough RAM/disk
+for a native Rust release build. Restrict
+inbound SSH to your administration address. Cloudflare Tunnel needs no inbound
+game/HTTP port: keep the game bound to loopback and allow outbound HTTPS and
+Cloudflare Tunnel traffic. Existing unrelated workloads are not restarted.
+
+Transfer with SSH/SCP, preserving private permissions, then run the bundled
+installer. Replace `EC2_HOST` with the instance's SSH address:
+
+```bash
+scp -pr "$bundle" ubuntu@EC2_HOST:~/
+ssh ubuntu@EC2_HOST
+bundle="$HOME/woodland-ec2-migration"
+chmod -R go-rwx "$bundle"
+python3 "$bundle/tools/scripts/host-bundle.py" validate "$bundle"
+sudo bash "$bundle/tools/scripts/restore-host-linux.sh" "$bundle"
+```
+
+On Amazon Linux use `ec2-user` instead of `ubuntu`. On the shared Sapio EC2
+host, port 8000 belongs to the enclave API: pass `--port 8090` and configure a
+separate tunnel to `http://127.0.0.1:8090`. Never reuse an ingress pointing at
+8000 there. The Amazon Linux service units deny access to both instance-metadata
+addresses so the game cannot obtain the instance role's credentials.
+
+The installer builds the pinned source with Rust 1.92.0 as an unprivileged
+build account, installs the exact exported browser files, and restores the
+registry and rollover credentials. It verifies the existing world and signer
+without deploying, then starts the server, renewal watcher, optional existing
+Cloudflare tunnel, and daily private backups. It refuses existing deployment
+paths/accounts/units instead of overwriting a partial or live installation.
+The bundled tunnel token selects its existing remote tunnel configuration;
+ingress must already match the selected loopback port (8000 by default).
+
+For a shorter cutover, install with `--no-start` while the old host remains
+active. This builds, installs, and performs read-only preflight, but starts
+and enables **no** Woodland services. After retiring the old host, apply any
+newer registry snapshot as `woodland-server:woodland-server`, mode `0600`,
+before following the printed start/health-check commands. Do not rerun the
+installer over staged state. Never leave two renewal watchers active.
+
+Keep `https://woodland.sh` unchanged: registrations are signed for that origin
+and genesis, and browser wallet storage is origin-bound. Do not clear player
+browser storage during migration. `--without-tunnel` leaves the service private;
+you must provide HTTPS ingress at the same origin yourself.
+
+Check `/health.json`, recent server/renewal logs, and the unchanged public URL.
+For v3, `ready: true` alone is insufficient: require a recent `lastRefreshAt`,
+`lastError: null`, available delegation, the restored player count, and no
+outstanding watcher errors. Host backups live in `/var/backups/woodland`
+(root-private, latest 30); copy them securely off-instance. They include the
+original bundle plus **current** host configuration/registry. The original
+bundle's registry remains export-time state: use the current archive registry
+when recovering a later backup, staging with `--no-start` before applying it.
+
+For a newer registry, with the replacement server still stopped, install the
+file from the trusted extracted backup (or the final export's `state/players.json`):
+
+```bash
+sudo install -o woodland-server -g woodland-server -m 0600 \
+  /path/to/extracted-backup/var/lib/woodland-server/players.json \
+  /var/lib/woodland-server/players.json
+```
+
+Do not extract the entire backup over a running host. Reconcile any newer
+configuration before starting; operational env files must retain their service
+groups, and the tunnel token must be `root:woodland-tunnel`, mode `0640`.
+
+
 ## Verification
 
 Native protocol tests:
