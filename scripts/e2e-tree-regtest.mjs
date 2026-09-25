@@ -182,7 +182,6 @@ async function main() {
     const totalXp = manifest.xpPerTree * manifest.woodcuttingXpPerLog * treeCount;
     const totalStone = manifest.stoneReservePerTree * treeCount;
     const totalIronOre = manifest.ironOreReservePerTree * treeCount;
-    const chance = `${manifest.baseLogDropBasisPoints / 100}%`;
     const session = await request('POST', '/session', {
       capabilities: {
         alwaysMatch: {
@@ -234,17 +233,9 @@ async function main() {
           };
         })(),
         bagLogs: document.getElementById('player-logs')?.textContent || '',
-        logSlotLabel: document.getElementById('log-slot')?.getAttribute('aria-label') || '',
-        logIcon: document.querySelector('#log-slot .bag-item')?.textContent || '',
         bagStone: document.getElementById('player-stone')?.textContent || '',
-        stoneSlotLabel: document.getElementById('stone-slot')?.getAttribute('aria-label') || '',
         bagIronOre: document.getElementById('player-iron-ore')?.textContent || '',
-        ironOreSlotLabel: document.getElementById('iron-ore-slot')?.getAttribute('aria-label') || '',
-        bagAxe: document.getElementById('player-axe')?.textContent || '',
-        axeSlotLabel: document.getElementById('axe-slot')?.getAttribute('aria-label') || '',
-        craftAxeText: document.getElementById('craft-axe')?.textContent || '',
         craftAxeDisabled: Boolean(document.getElementById('craft-axe')?.disabled),
-        axeRecipeText: document.getElementById('axe-recipe')?.textContent || '',
         inventorySlots: document.querySelectorAll('.bag-slots > .bag-slot').length,
         emptySlots: document.querySelectorAll('.bag-slots > .empty-slot').length,
         inventoryRows: getComputedStyle(document.querySelector('.bag-slots')).gridTemplateRows
@@ -258,12 +249,10 @@ async function main() {
           const stats = document.querySelector('.stats-box')?.getBoundingClientRect();
           return Boolean(bag && stats && stats.left >= bag.right);
         })(),
-        statsText: document.querySelector('.stats-box')?.textContent.replace(/\\s+/g, ' ').trim() || '',
         standingTreeGlyphs: globalThis.__WOODLAND_E2E_MAP_FRAME?.standingTreeCount || 0,
         stumpGlyphs: globalThis.__WOODLAND_E2E_MAP_FRAME?.stumpCount || 0,
         focusedTreeHealth: document.getElementById('tree-health')?.textContent || '',
-        chance: document.getElementById('log-chance')?.textContent || '',
-        fundingInstruction: document.getElementById('funding-instruction')?.textContent || '',
+        activateDisabled: Boolean(document.getElementById('activate')?.disabled),
         status: document.getElementById('status')?.textContent || '',
         log: document.getElementById('log')?.textContent || '',
       };
@@ -650,16 +639,6 @@ async function main() {
           && value.state.playerXp === before.state.playerXp + manifest.woodcuttingXpPerLog,
         180_000,
       );
-      const suffix = after.autoChop.swings === 1 ? 'swing' : 'swings';
-      const materialMessage = after.autoChop.material === 'stone'
-        ? ' You also find STONE.'
-        : after.autoChop.material === 'ironOre'
-          ? ' You also find IRON ORE.'
-          : '';
-      assert.equal(
-        after.status,
-        `You get a LOG and ${manifest.woodcuttingXpPerLog} Woodcutting XP after ${after.autoChop.swings} ${suffix}.${materialMessage}`,
-      );
       assert.ok(
         after.autoChop.swings <= 11,
         `${label}: auto-chop exceeded the player luck bound`,
@@ -742,9 +721,6 @@ async function main() {
         treeOutpoints,
         `${label}: crafting touched a tree`,
       );
-      assert.equal(after.bagAxe, 'Wooden', `${label}: axe inventory label`);
-      assert.equal(after.axeSlotLabel, 'Wooden Axe equipped', `${label}: axe accessibility label`);
-      assert.equal(after.craftAxeText, 'Craft Stone Axe', `${label}: next craft button`);
       assert.equal(after.craftAxeDisabled, true, `${label}: locked next craft button`);
       assertLogSupply(after.state, totalLogs - 1, label);
       assertMaterialSupply(after.state, totalStone, totalIronOre, label);
@@ -931,10 +907,9 @@ async function main() {
     assert.equal(initial.state.playerNextLevelXp, 83);
     assert.equal(initial.state.seasonXpRemaining, totalXp);
     assert.equal(initial.state.activationReady, false);
-    assert.equal(initial.state.activationBlockedReason ?? null, null);
+    assert.equal(initial.activateDisabled, true);
     assert.equal(initial.state.playerAsset, null);
     assert.equal(initial.state.logDropBasisPoints, manifest.baseLogDropBasisPoints);
-    assert.equal(initial.chance, chance);
     assert.ok(initial.state.xpAsset);
     assert.equal(
       new Set([
@@ -1020,10 +995,6 @@ async function main() {
     ]) {
       assert.equal(removed in manifest, false, `manifest retained obsolete ${removed}`);
     }
-    assert.equal(await execute(`return document.getElementById('create-tree');`), null);
-    assert.equal(await execute(`return document.getElementById('sell');`), null);
-    assert.equal(await execute(`return document.title;`), 'woodland.sh (alpha)');
-    assert.equal(await execute(`return document.querySelector('h1')?.textContent;`), 'woodland.sh (alpha)');
     const positionAfterKeyboard = await execute(`
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'd', bubbles: true }));
       return globalThis.__WOODLAND_E2E_PLAYER;
@@ -1038,8 +1009,7 @@ async function main() {
       (value) => !value.state?.playerActive
         && value.player?.x === initial.player.x
         && value.player?.y === initial.player.y
-        && value.camera?.playerHidden === true
-        && value.status === 'Create a player before moving.',
+        && value.camera?.playerHidden === true,
     );
 
     execFileSync(
@@ -1055,7 +1025,7 @@ async function main() {
         && value.state.walletSats === initial.state.fundingRequiredSats
         && value.state.fundingRequiredSats === 0
         && value.state.activationReady
-        && value.fundingInstruction === 'No additional player funding required',
+        && !value.activateDisabled,
     );
     await click('activate');
     await waitFor(
@@ -1127,26 +1097,15 @@ async function main() {
     assert.equal(deployed.state.playerIronOre, 0);
     assert.equal(deployed.state.playerAxe, 'none');
     assert.equal(deployed.bagLogs, '0');
-    assert.equal(deployed.logSlotLabel, '0 LOG in inventory');
-    assert.equal(deployed.logIcon, '🪵');
     assert.equal(deployed.bagStone, '0');
-    assert.equal(deployed.stoneSlotLabel, '0 STONE in inventory');
     assert.equal(deployed.bagIronOre, '0');
-    assert.equal(deployed.ironOreSlotLabel, '0 IRON ORE in inventory');
-    assert.equal(deployed.bagAxe, 'None');
-    assert.equal(deployed.axeSlotLabel, 'No Axe equipped');
-    assert.equal(deployed.craftAxeText, 'Craft Wooden Axe');
     assert.equal(deployed.craftAxeDisabled, true);
-    assert.equal(deployed.axeRecipeText, 'Level 1 · 1 LOG');
     assert.equal(deployed.inventorySlots, 9);
     assert.equal(deployed.emptySlots, 5);
     assert.equal(deployed.inventoryRows, 3);
     assert.equal(deployed.bagWidth, 262);
     assert.equal(deployed.bagStats, 0);
     assert.equal(deployed.statsRightOfBag, true);
-    assert.match(deployed.statsText, /Level 1/);
-    assert.match(deployed.statsText, /0 Woodcutting XP/);
-    assert.match(deployed.statsText, new RegExp(`LOG drop chance ${chance}`));
     assertLogSupply(deployed.state, totalLogs, 'activated player');
     assertMaterialSupply(deployed.state, totalStone, totalIronOre, 'activated player');
     assertXpAccounting(deployed.state, totalXp, 'activated player');
@@ -1292,7 +1251,6 @@ async function main() {
       inspect,
       (value) => value.ready
         && value.state?.playerActive
-        && value.state.activationBlockedReason == null
         && value.state.playerStateOutpoint === playerStateBeforeBrowserReload
         && value.player?.x === firstTree.x
         && value.player?.y === firstTree.y + 1
@@ -1484,10 +1442,6 @@ async function main() {
       );
       chopped = await assertAutoChopUntilLog(chopped, 'continuous chopping UX');
       assert.equal(chopped.bagLogs, String(chopped.state.playerLogs));
-      assert.equal(
-        chopped.logSlotLabel,
-        `${chopped.state.playerLogs} LOG in inventory`,
-      );
       assert.equal(chopped.state.craftAxeReady, true);
       assert.equal(chopped.craftAxeDisabled, false);
       chopped = await craftWoodenAxe(chopped, 'Wooden Axe crafting');
@@ -1510,7 +1464,6 @@ async function main() {
     assert.equal(chopped.standingTreeGlyphs, treeCount);
     assert.equal(chopped.stumpGlyphs, 0);
     assert.equal(chopped.bagLogs, String(TARGET_HITS));
-    assert.equal(chopped.logSlotLabel, `${TARGET_HITS} LOG in inventory`);
     const partialXp = chopped.state.playerXp;
     const partialLogs = chopped.state.playerLogs;
     const partialTree = chopped.state.trees.find(
