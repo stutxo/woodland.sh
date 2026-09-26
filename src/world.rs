@@ -12,6 +12,7 @@ use bitcoin::secp256k1::{Message, Secp256k1, Verification};
 #[cfg(not(target_arch = "wasm32"))]
 use bitcoin::OutPoint;
 use bitcoin::Txid;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -880,13 +881,14 @@ impl ValidatedWorld {
     }
 
     pub async fn verify_indexed_assets(&self, rest: &crate::arkade::ArkadeRest) -> Result<()> {
-        for (asset_id, label, genesis_supply, burnable) in [
+        stream::iter([
             (self.tree_asset, "TREE", self.trees.len() as u64, false),
             (self.log_asset, "LOG", LOG_SUPPLY, true),
             (self.xp_asset, "XP", XP_SUPPLY, false),
             (self.stone_asset, "STONE", STONE_SUPPLY, true),
             (self.iron_ore_asset, "IRON ORE", IRON_ORE_SUPPLY, true),
-        ] {
+        ])
+        .map(|(asset_id, label, genesis_supply, burnable)| async move {
             let details = rest
                 .get_asset_details(asset_id)
                 .await
@@ -900,8 +902,12 @@ impl ValidatedWorld {
                     "indexed {label} asset does not match the fixed-issuance world genesis"
                 ));
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        // Fetch all five assets together, retaining the original error order.
+        .buffered(5)
+        .try_for_each(|()| async { Ok(()) })
+        .await
     }
 }
 

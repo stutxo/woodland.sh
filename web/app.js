@@ -1730,12 +1730,16 @@ async function boot() {
   try {
     await acquireWalletWriter();
     recoverWalletRestore();
-    await init();
-    const worldResponse = await fetch(WORLD, { cache: 'no-store' });
-    if (!worldResponse.ok) {
-      throw new Error(`woodland.sh world unavailable (${worldResponse.status})`);
-    }
-    const world = await worldResponse.text();
+    const [, world] = await Promise.all([
+      init(),
+      (async () => {
+        const response = await fetch(WORLD, { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`woodland.sh world unavailable (${response.status})`);
+        }
+        return response.text();
+      })(),
+    ]);
     const manifest = JSON.parse(world);
     worldManifest = manifest;
     treeLayout = manifest.trees.map(({ state: tree, deploymentTxid }) => ({

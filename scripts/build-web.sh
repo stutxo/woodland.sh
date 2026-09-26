@@ -46,7 +46,6 @@ fi
 
 printf 'using CC_wasm32_unknown_unknown=%s\n' "$CC_wasm32_unknown_unknown"
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
-rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR/pkg"
 wasm-pack build \
   --target web \

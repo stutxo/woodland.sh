@@ -216,6 +216,10 @@ async function fixture({
     clearInterval: (id) => intervals.delete(id),
     fetch: async (url, options) => {
       const path = new URL(url).pathname;
+      if (path === new URL('./world.json', sourceUrl).pathname) {
+        // Boot starts this download alongside the intentionally held WASM init.
+        return { ok: true, text: async () => '{}' };
+      }
       let payload;
       if (path === '/v1/leaderboard') {
         if (leaderboardMode === 'failed') throw new Error('leaderboard unavailable');

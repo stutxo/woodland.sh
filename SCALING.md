@@ -136,11 +136,19 @@ gameplay input.
 Player contracts are owner-specific P2TR scripts. A browser queries its own
 script and selects only a state carrying its profile's exact PLAYER_ID, so
 public lookalikes do not create ambiguous state. It does not scan all players.
-Tree discovery starts from the 420 manifest-pinned deployment outpoints and
-follows each exact indexed successor. Shared-script pagination is not on the
-browser path. Creating transactions are fetched in bounded parallel chunks only
-for changed lineages, while snapshots serialize dynamic state for the current
-viewport and merge it with the static manifest layout.
+The manifest seeds all 420 static tree locations locally. Browser discovery
+follows exact indexed successors for trees in the requested viewport.
+Shared-script pagination is not on the browser path. Creating transactions are
+fetched in bounded parallel chunks only for changed lineages, while snapshots
+serialize dynamic state for the current viewport and merge it with the static
+manifest layout.
+
+Startup overlaps WASM initialization with the fresh manifest download. After
+manifest authentication, Arkade and emulator service-info reads run concurrently,
+as do the five indexed genesis-asset checks. Wallet and selected-player reads
+also overlap tree synchronization. Validation and error precedence are unchanged.
+Successive hops within one tree lineage still depend on the previous response,
+so a long renewal history can still dominate a first viewport load.
 
 The optional game server is deliberately outside this state machine. Its
 registry is capped at 10,000 automatically registered players. Verification is

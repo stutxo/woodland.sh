@@ -325,6 +325,14 @@ trees, and nearby player clusters; the player remains a separate fixed overlay
 while the canvas camera moves underneath. Player details and social UI are
 collapsible, with level, XP, LOG, and online count kept in the map HUD.
 
+`scripts/build-web.sh` emits content-addressed `app.<sha256>.js` and
+`pkg/<sha256>/` runtime assets. Axum serves successful JS/WASM responses and
+their `304` revalidations with `public, max-age=31536000, immutable`; HTML,
+`world.json`, APIs, and error responses remain `no-store`. Rebuilds retain
+previous addressed generations for clients already loading a page. Preserve
+those files during live incremental deployments. Other static hosts must
+configure their own cache headers.
+
 Browser storage uses `woodland.sh:web:v2:*`. When no transaction is pending,
 **New test wallet** clears the local key, profile (including PLAYER_ID), pending
 swing, and position. It does not delete a durable server registration. Player

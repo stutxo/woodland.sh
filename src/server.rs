@@ -1441,11 +1441,48 @@ fn canonical_http_origin(value: &str, name: &str, mainnet: bool) -> Result<Strin
     Ok(url.origin().ascii_serialization())
 }
 
+fn content_addressed_asset(path: &str) -> bool {
+    fn is_digest(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    if let Some(digest) = path
+        .strip_prefix("/app.")
+        .and_then(|name| name.strip_suffix(".js"))
+    {
+        return is_digest(digest);
+    }
+    let Some((digest, filename)) = path
+        .strip_prefix("/pkg/")
+        .and_then(|path| path.split_once('/'))
+    else {
+        return false;
+    };
+    is_digest(digest)
+        && (filename.ends_with(".js") || filename.ends_with(".wasm"))
+        && !filename.contains(['%', '\\'])
+        && filename
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | ".."))
+}
+
 async fn no_store(request: Request, next: Next) -> Response {
+    let immutable = matches!(*request.method(), Method::GET | Method::HEAD)
+        && content_addressed_asset(request.uri().path());
     let mut response = next.run(request).await;
+    let cache_control = if immutable
+        && (response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED)
+    {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
     response
         .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
     response
 }
 
@@ -1630,6 +1667,107 @@ mod tests {
     use bitcoin::secp256k1::{Keypair, SecretKey};
     use bitcoin::Txid;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn only_successful_addressed_runtime_assets_are_cached() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("woodland-web-cache-{unique}"));
+        let digest = "a".repeat(64);
+        let entry = format!("app.{digest}.js");
+        let module = format!("pkg/{digest}/woodland.js");
+        let wasm = format!("pkg/{digest}/woodland_bg.wasm");
+        let snippet = format!("pkg/{digest}/snippets/example/helper.js");
+        for (filename, body) in [
+            ("index.html", "entry page"),
+            ("404.html", "not found"),
+            ("world.json", "fresh manifest"),
+            ("app.js", "unversioned entry"),
+            ("pkg/woodland.js", "unversioned module"),
+            (&entry, "addressed entry"),
+            (&module, "addressed module"),
+            (&wasm, "addressed wasm"),
+            (&snippet, "addressed snippet"),
+        ] {
+            let file = root.join(filename);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        let app = Router::new()
+            .route("/v1/leaderboard", get(|| async { "fresh leaderboard" }))
+            .fallback_service(
+                ServeDir::new(&root)
+                    .append_index_html_on_directories(true)
+                    .not_found_service(ServeFile::new(root.join("404.html"))),
+            )
+            .layer(axum::middleware::from_fn(no_store));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (filename, body) in [
+            (&entry, "addressed entry"),
+            (&module, "addressed module"),
+            (&wasm, "addressed wasm"),
+            (&snippet, "addressed snippet"),
+        ] {
+            let response = client
+                .get(format!("{base}/{filename}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{filename}");
+            assert_eq!(
+                response.headers()[CACHE_CONTROL],
+                "public, max-age=31536000, immutable",
+                "{filename}"
+            );
+            assert_eq!(response.text().await.unwrap(), body, "{filename}");
+        }
+        let missing = format!("pkg/{digest}/missing.js");
+        for (filename, status, body) in [
+            ("", StatusCode::OK, "entry page"),
+            ("world.json", StatusCode::OK, "fresh manifest"),
+            ("v1/leaderboard", StatusCode::OK, "fresh leaderboard"),
+            ("app.js?version=123", StatusCode::OK, "unversioned entry"),
+            ("pkg/woodland.js", StatusCode::OK, "unversioned module"),
+            (missing.as_str(), StatusCode::NOT_FOUND, "not found"),
+        ] {
+            let response = client
+                .get(format!("{base}/{filename}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{filename}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{filename}");
+            assert_eq!(response.text().await.unwrap(), body, "{filename}");
+        }
+        let response = client.head(format!("{base}/{wasm}")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        let modified = response.headers()[axum::http::header::LAST_MODIFIED].clone();
+        let response = client
+            .get(format!("{base}/{wasm}"))
+            .header(axum::http::header::IF_MODIFIED_SINCE, modified)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        let response = client.post(format!("{base}/{entry}")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn player(asset: &str, xp_balance: u64, active: bool, registered_at: i64) -> LeaderboardPlayer {
         let woodcutting_xp = player::woodcutting_xp(xp_balance);

@@ -298,14 +298,15 @@ impl WoodlandApp {
             .parse::<bitcoin::Network>()
             .map_err(|_| JsValue::from_str("world manifest has an invalid network"))?;
         let rest = ArkadeRest::new(server);
-        let params = rest.get_info().await.map_err(js_err)?;
+        let emulator = EmulatorRest::new(emulator);
+        let (params, emulator_params) = futures::join!(rest.get_info(), emulator.get_info());
+        let params = params.map_err(js_err)?;
         if params.network != expected_network {
             return Err(JsValue::from_str(
                 "Arkade service network does not match the world manifest",
             ));
         }
-        let emulator = EmulatorRest::new(emulator);
-        let emulator_params = emulator.get_info().await.map_err(js_err)?;
+        let emulator_params = emulator_params.map_err(js_err)?;
         let keys = match secret_key.filter(|value| !value.trim().is_empty()) {
             Some(secret) => Keys::from_hex(secret.trim()).map_err(js_err)?,
             None => Keys::generate().map_err(js_err)?,
@@ -1071,8 +1072,7 @@ impl WoodlandApp {
     }
 
     async fn sync_once(&mut self) -> Result<()> {
-        let wallet = player_vtxo(&self.keys, &self.params)?;
-        let wallet_script = wallet.script_pubkey().to_hex_string();
+        let wallet_script = self.wallet_script.to_hex_string();
         let player_contract = &self.player_contract;
         let player_asset = self.player_asset()?;
         let initializing_trees = self.trees.is_empty();
@@ -1093,27 +1093,37 @@ impl WoodlandApp {
         } else {
             trees_to_refresh.len()
         };
-        let tree_records = if initializing_trees {
-            load_current_tree_records(&self.rest, &self.world, &[]).await?
-        } else if trees_to_refresh.is_empty() {
-            Vec::new()
-        } else {
-            load_current_tree_records(&self.rest, &self.world, &trees_to_refresh).await?
-        };
-        let wallet_records = self.rest.get_vtxos(&wallet_script, "spendableOnly").await?;
-        let player_state_record = match player_asset {
-            Some(player_asset) => {
-                let records = self
-                    .rest
-                    .get_vtxos(
-                        &player_contract.vtxo.script_pubkey().to_hex_string(),
-                        "spendableOnly",
-                    )
-                    .await?;
-                select_player_state_record(&records, player_contract, player_asset)?
+        let (tree_records, wallet_records, player_state_record) = futures::join!(
+            async {
+                if initializing_trees {
+                    load_current_tree_records(&self.rest, &self.world, &[]).await
+                } else if trees_to_refresh.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    load_current_tree_records(&self.rest, &self.world, &trees_to_refresh).await
+                }
+            },
+            self.rest.get_vtxos(&wallet_script, "spendableOnly"),
+            async {
+                match player_asset {
+                    Some(player_asset) => {
+                        let records = self
+                            .rest
+                            .get_vtxos(
+                                &player_contract.vtxo.script_pubkey().to_hex_string(),
+                                "spendableOnly",
+                            )
+                            .await?;
+                        select_player_state_record(&records, player_contract, player_asset)
+                    }
+                    None => Ok(None),
+                }
             }
-            None => None,
-        };
+        );
+        // Preserve error precedence, including the transient tree retry path.
+        let tree_records = tree_records?;
+        let wallet_records = wallet_records?;
+        let player_state_record = player_state_record?;
 
         let declared_by_state = self
             .world
@@ -1349,26 +1359,30 @@ impl WoodlandApp {
     }
 
     async fn sync_player(&mut self) -> Result<()> {
-        let wallet = player_vtxo(&self.keys, &self.params)?;
-        let wallet_records = self
-            .rest
-            .get_vtxos(&wallet.script_pubkey().to_hex_string(), "spendableOnly")
-            .await?;
+        let wallet_script = self.wallet_script.to_hex_string();
         let player_contract = &self.player_contract;
-        let player_asset = self.player_asset()?;
-        let player_state_record = match player_asset {
-            Some(player_asset) => {
-                let records = self
-                    .rest
-                    .get_vtxos(
-                        &player_contract.vtxo.script_pubkey().to_hex_string(),
-                        "spendableOnly",
-                    )
-                    .await?;
-                select_player_state_record(&records, player_contract, player_asset)?
+        let (wallet_records, player_lookup) = futures::join!(
+            self.rest.get_vtxos(&wallet_script, "spendableOnly"),
+            async {
+                let player_asset = self.player_asset()?;
+                let player_state_record = match player_asset {
+                    Some(player_asset) => {
+                        let records = self
+                            .rest
+                            .get_vtxos(
+                                &player_contract.vtxo.script_pubkey().to_hex_string(),
+                                "spendableOnly",
+                            )
+                            .await?;
+                        select_player_state_record(&records, player_contract, player_asset)?
+                    }
+                    None => None,
+                };
+                Ok::<_, anyhow::Error>((player_asset, player_state_record))
             }
-            None => None,
-        };
+        );
+        let wallet_records = wallet_records?;
+        let (player_asset, player_state_record) = player_lookup?;
         self.player_state = match player_state_record {
             Some(record) => {
                 if let Some(mut cached) = self
