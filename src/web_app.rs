@@ -2494,12 +2494,17 @@ async fn load_current_tree_records(
         .collect::<std::collections::HashSet<_>>();
     let tree_script = world.contract.vtxo.script_pubkey();
     loop {
-        if current
+        // Sweeps can mark already-spent ancestors after a tree has renewed.
+        // Follow their successors; only an unavailable unspent head is fatal.
+        if let Some(record) = current
             .iter()
-            .any(|record| record.is_swept || record.is_unrolled)
+            .find(|record| !record.is_spent && (record.is_swept || record.is_unrolled))
         {
             return Err(anyhow!(
-                "a tree lineage is no longer cooperatively spendable"
+                "tree lineage ends at VTXO {} that is no longer cooperatively spendable (swept: {}, unrolled: {})",
+                record.outpoint,
+                record.is_swept,
+                record.is_unrolled
             ));
         }
         let spent = current

@@ -419,12 +419,15 @@ async function main() {
         socket.send(JSON.stringify({ id, method, params }));
       });
       const blockKey = 'woodland-e2e-block-submit';
+      const treeStatusKey = 'woodland-e2e-tree-status';
       const pendingKey = `woodland.sh:web:v2:pending:${manifest.arkadeServiceUrl.replace(/\/+$/, '')}:${manifest.genesisTxid}`;
-      // Preload runs in the page's own realm before WASM starts. Only transport
-      // fails: the signed journal and all gameplay still come from real WASM.
+      // Keep real WASM, transactions, and successor links. Fault only transport
+      // and indexer lifecycle flags, including spent ancestors swept after renewal.
       const intercept = `() => {
         const original = globalThis.fetch;
         globalThis.__WOODLAND_BLOCKED_SUBMITS = 0;
+        globalThis.__WOODLAND_SWEPT_ANCESTORS = 0;
+        globalThis.__WOODLAND_UNROLLED_HEADS = 0;
         globalThis.fetch = async (...args) => {
           const url = new URL(args[0] instanceof Request ? args[0].url : args[0], location.href);
           if (url.origin === ${JSON.stringify(new URL(manifest.emulatorUrl).origin)}
@@ -433,13 +436,35 @@ async function main() {
             globalThis.__WOODLAND_BLOCKED_SUBMITS += 1;
             throw new TypeError('local test transport unavailable');
           }
-          return original(...args);
+          const response = await original(...args);
+          const treeStatus = sessionStorage.getItem(${JSON.stringify(treeStatusKey)});
+          if (!treeStatus || !response.ok
+            || url.origin !== ${JSON.stringify(new URL(manifest.arkadeServiceUrl).origin)}
+            || url.pathname !== '/v1/indexer/vtxos') return response;
+          const payload = await response.clone().json();
+          let changed = false;
+          for (const record of payload.vtxos || []) {
+            if (!record.assets?.some((asset) => asset.assetId === ${JSON.stringify(manifest.treeAsset)})) continue;
+            if (record.isSpent) {
+              record.isSwept = true;
+              globalThis.__WOODLAND_SWEPT_ANCESTORS += 1;
+              changed = true;
+            } else if (treeStatus === 'unrolled-head') {
+              record.isUnrolled = true;
+              globalThis.__WOODLAND_UNROLLED_HEADS += 1;
+              changed = true;
+            }
+          }
+          return changed
+            ? new Response(JSON.stringify(payload), { status: response.status, headers: response.headers })
+            : response;
         };
       }`;
       let preload;
       try {
         preload = await bidi('script.addPreloadScript', { functionDeclaration: intercept });
         await execute('sessionStorage.setItem(arguments[0], "1");', [blockKey]);
+        await execute('sessionStorage.setItem(arguments[0], "ancestors");', [treeStatusKey]);
         const { contexts } = await bidi('browsingContext.getTree', {});
         const installed = await bidi('script.callFunction', {
           functionDeclaration: intercept,
@@ -493,6 +518,10 @@ async function main() {
           await execute('return globalThis.__WOODLAND_BLOCKED_SUBMITS;') > 0,
           'reload did not retry the pending submission',
         );
+        assert.ok(
+          await execute('return globalThis.__WOODLAND_SWEPT_ANCESTORS;') > 0,
+          'reload must traverse swept, already-spent tree ancestors',
+        );
 
         // Recover with a deliberately disjoint viewport: the pending tree must
         // be refreshed independently of the ordinary visible-world filter.
@@ -530,6 +559,34 @@ async function main() {
           visible.state.trees.find((candidate) => candidate.treeId === tree.treeId).treeOutpoint,
           `${journal.expectedTxid}:1`,
         );
+        const unavailable = await executeAsync(`
+          const done = arguments[arguments.length - 1];
+          const key = arguments[0];
+          sessionStorage.setItem(key, 'unrolled-head');
+          let accepted = false;
+          globalThis.__WOODLAND_E2E_REFRESH_WORLD()
+            .then(() => { accepted = true; })
+            .catch(() => {})
+            .finally(() => {
+              sessionStorage.setItem(key, 'ancestors');
+              done({ accepted, flagged: globalThis.__WOODLAND_UNROLLED_HEADS });
+            });
+        `, [treeStatusKey]);
+        assert.ok(unavailable.flagged > 0, 'unrolled current-head fault was not delivered');
+        assert.equal(unavailable.accepted, false, 'an unrolled current tree must not be accepted');
+        const restored = await executeAsync(`
+          const done = arguments[arguments.length - 1];
+          globalThis.__WOODLAND_E2E_REFRESH_WORLD()
+            .then((state) => done({ state }))
+            .catch((error) => done({ error: String(error) }));
+        `);
+        assert.equal(restored.error, undefined, restored.error);
+        assert.equal(
+          restored.state.trees.find((candidate) => candidate.treeId === tree.treeId).health,
+          visible.state.trees.find((candidate) => candidate.treeId === tree.treeId).health,
+          'rejecting an unavailable head must preserve the tree state',
+        );
+        visible.state = restored.state;
         // This boot error was the deliberately blocked transport, now proved
         // recovered. Do not leak it into later independent E2E diagnostics.
         await bidi('script.evaluate', {
@@ -542,8 +599,9 @@ async function main() {
       } finally {
         await execute(`
           sessionStorage.removeItem(arguments[0]);
+          sessionStorage.removeItem(arguments[1]);
           globalThis.__WOODLAND_E2E_SET_TREE_VIEWPORT?.();
-        `, [blockKey]);
+        `, [blockKey, treeStatusKey]);
         try {
           if (preload) await bidi('script.removePreloadScript', { script: preload.script });
         } finally {

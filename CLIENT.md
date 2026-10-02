@@ -95,6 +95,12 @@ from result order. For each declared tree, require exactly one lineage carrying:
 - fixed 330 sats;
 - canonical immutable-state and health packets.
 
+Do not require spent ancestors to remain cooperatively spendable: sweeping a
+retired batch can mark them as swept after their tree has renewed. Follow their
+recorded successors with the same identity, uniqueness, and cycle checks.
+Reject an unspent head marked `isSwept` or `isUnrolled`; the error identifies its
+outpoint and flags.
+
 Active trees have health one through ten. A health-zero tree with local LOG is
 a funded stump; one regrowth batch resets it to ten. A zero-reserve stump is
 terminal and can only use exact-state maintenance. There is no vault lineage.
