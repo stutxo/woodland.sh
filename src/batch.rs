@@ -1621,17 +1621,15 @@ mod tests {
     #[derive(Clone)]
     struct IntentMockState {
         registrations: Arc<AtomicUsize>,
-        trace: Arc<AtomicUsize>,
+        trace: Arc<std::sync::Mutex<usize>>,
     }
 
     #[cfg(feature = "server")]
     async fn mock_register_intent(State(state): State<IntentMockState>) -> impl IntoResponse {
-        state
-            .trace
-            .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |trace| {
-                Some(trace * 10 + 1)
-            })
-            .unwrap();
+        {
+            let mut trace = state.trace.lock().unwrap();
+            *trace = *trace * 10 + 1;
+        }
         let attempt = state.registrations.fetch_add(1, AtomicOrdering::SeqCst);
         let headers = [(header::CONTENT_TYPE, "application/json")];
         if attempt == 0 {
@@ -1647,12 +1645,10 @@ mod tests {
 
     #[cfg(feature = "server")]
     async fn mock_delete_intent(State(state): State<IntentMockState>) -> impl IntoResponse {
-        state
-            .trace
-            .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |trace| {
-                Some(trace * 10 + 2)
-            })
-            .unwrap();
+        {
+            let mut trace = state.trace.lock().unwrap();
+            *trace = *trace * 10 + 2;
+        }
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
@@ -1789,7 +1785,7 @@ mod tests {
     async fn duplicate_registration_is_deleted_then_retried() {
         let state = IntentMockState {
             registrations: Arc::new(AtomicUsize::new(0)),
-            trace: Arc::new(AtomicUsize::new(0)),
+            trace: Arc::new(std::sync::Mutex::new(0)),
         };
         let app = Router::new()
             .route("/v1/batch/registerIntent", post(mock_register_intent))
@@ -1832,7 +1828,7 @@ mod tests {
 
         assert_eq!(intent_id, "recovered");
         assert_eq!(state.registrations.load(AtomicOrdering::SeqCst), 2);
-        assert_eq!(state.trace.load(AtomicOrdering::SeqCst), 121);
+        assert_eq!(*state.trace.lock().unwrap(), 121);
         server.abort();
         let _ = server.await;
     }
