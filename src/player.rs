@@ -1071,8 +1071,12 @@ pub fn player_renewal_covenant_script(
 /// ```text
 /// vin 0 player state | vin 1 wallet funding
 /// vout 0 player state | vout 1 LOG destination | vout 2 extension | vout 3 anchor
-/// groups PLAYER_ID | LOG | XP | STONE | IRON ORE
+/// groups PLAYER_ID | LOG | [XP] | [STONE] | [IRON ORE]
 /// ```
+///
+/// Bracketed groups appear only when the player state input holds a positive
+/// balance of that asset. PLAYER_ID and LOG are always present, including when
+/// withdrawing the full LOG balance, so withdrawals contain two to five groups.
 pub fn player_withdraw_covenant_script(
     log_asset: AssetId,
     xp_asset: AssetId,

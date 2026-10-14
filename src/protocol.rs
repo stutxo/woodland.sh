@@ -75,7 +75,6 @@ pub const WITHDRAW_EXTENSION_OUTPUT_INDEX: u16 = 2;
 pub const WITHDRAW_ANCHOR_OUTPUT_INDEX: u16 = 3;
 pub const WITHDRAW_INPUT_COUNT: usize = 2;
 pub const WITHDRAW_OUTPUT_COUNT: usize = 4;
-pub const WITHDRAW_ASSET_GROUP_COUNT: usize = 5;
 
 #[cfg(test)]
 mod tests {

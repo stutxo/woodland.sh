@@ -120,8 +120,12 @@ of LOG to any destination:
 inputs:  player state, owner wallet dust input
 outputs: player state minus the withdrawn LOG, LOG destination, extension,
          anchor
-groups:  PLAYER_ID, LOG, XP, STONE, IRON ORE
+groups:  PLAYER_ID, LOG, [XP], [STONE], [IRON ORE]
 ```
+
+Bracketed groups appear only when the player state input holds a positive balance
+of that asset, so withdrawals contain two to five groups. PLAYER_ID and LOG are
+always present, including when withdrawing the full LOG balance.
 
 The covenant preserves the player P2TR, 330 sats, PLAYER_ID, roll, luck credit,
 axe tier, and XP/STONE/IRON ORE balances exactly; the destination output is
