@@ -47,13 +47,25 @@ change a player's next outcome.
 
 ## Swing
 
-A swing spends player state at input zero and tree state at input one:
+A swing spends player state at input zero and tree state at input one. The
+reference builder uses this zero-offchain-fee shape:
 
 ```text
 inputs:  player, tree
 outputs: player, tree, merged extension, anchor
 groups:  PLAYER_ID, TREE, LOG, XP, STONE, IRON ORE
 ```
+
+Both chop covenants also accept a three-input/five-output shape for separate
+wallet-funded offchain fees. Fee input 2 and change output 2 must be asset-free
+and share the same witness-v1 scriptPubKey; the zero-value extension and anchor
+move to outputs 3 and 4. Gameplay inputs/outputs remain at 0 and 1 with the
+same scripts, sat values, and six asset groups. The reference `prepare_chop`
+builder does not construct this variant.
+
+The chop covenants do not compare the fee input's value with its change or
+set a fee rate. The fee payer authorizes the extra input; transaction validity
+and server fee policy still apply.
 
 For input player XP asset balance `X`, the level component of the LOG threshold
 is 2,000 basis points plus 200 at canonical Woodcutting levels 10, 20, 30, 40,
@@ -84,9 +96,9 @@ tree health:         H -> H-G
 both are gated by `G`. STONE is selected at 10%; from level 10, IRON ORE is
 selected at 2% before the STONE range. A miss moves neither.
 
-It also requires the canonical two-input/four-output shape, ordered uncontrolled
-asset groups, one conserved TREE marker, recursive player and tree scripts,
-fixed sat values, preserved tree state, canonical player luck, and exact
+It also requires one of the two exact shapes above, ordered uncontrolled asset
+groups, one conserved TREE marker, recursive player and tree scripts, fixed
+player/tree sat values, preserved tree state, canonical player luck, and exact
 extension and anchor outputs. The player covenant pins the immutable world
 TREE AssetId rather than this tree P2TR, breaking the circular dependency
 between player construction and tree authentication.

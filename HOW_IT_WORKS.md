@@ -48,7 +48,7 @@ rejects a noncanonical initial roll or credit. The browser saves the exact ID
 before submission and ignores public lookalikes. Creation remains unlimited and
 permissionless.
 
-## One Swing, Two Inputs
+## One Swing, Two Gameplay Inputs
 
 ```text
 before:
@@ -61,11 +61,22 @@ after:
 ```
 
 `G`, `K`, and `J` are zero or one; `K+J` is at most one and both material bits
-are zero when `G=0`. The transaction has exactly two inputs and four outputs:
-player, tree, merged extension, and canonical anchor. Its six asset groups are
-ordered PLAYER_ID, TREE, LOG, XP, STONE, IRON ORE. PLAYER_ID group zero must be
-one metadata-free, uncontrolled unit moving from player input zero to output
-zero.
+are zero when `G=0`. The reference builder's zero-offchain-fee transaction has
+two inputs and four outputs: player, tree, merged extension, and canonical
+anchor.
+
+Both covenants also accept three inputs and five outputs: add an asset-free
+fee input at index 2 and asset-free change at output 2 to the same witness-v1
+scriptPubKey, then place the zero-value extension and anchor at outputs 3 and
+4. The player and tree retain their scripts and 330 sats. This shape permits
+separate wallet funding for offchain fees, but the reference `prepare_chop`
+builder does not construct it. The chop covenants do not compare fee input
+and change values or set a fee rate; fee-payer authorization, transaction
+validity, and server fee policy remain separate checks.
+
+Both shapes use six asset groups ordered PLAYER_ID, TREE, LOG, XP, STONE,
+IRON ORE. PLAYER_ID group zero must be one metadata-free, uncontrolled unit
+moving from player input zero to output zero.
 
 ## XP Cannot Be Invented
 

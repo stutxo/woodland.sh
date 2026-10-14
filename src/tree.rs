@@ -505,13 +505,27 @@ pub fn build_tree_contract<C: Verification>(
 /// The tree transfers LOG, soulbound XP, and rare crafting materials into
 /// owner-authorized player state. XP and axe packets determine progression.
 ///
-/// Canonical shape:
+/// Zero-offchain-fee shape constructed by the reference `prepare_chop` builder:
 ///
 /// ```text
 /// vin 0 player | vin 1 tree
 /// vout 0 player | vout 1 tree | vout 2 extension | vout 3 anchor
 /// groups 0..5 PLAYER_ID | TREE | LOG | XP | STONE | IRON ORE
 /// ```
+///
+/// Both chop covenants also accept this fee-compatible shape:
+///
+/// ```text
+/// vin 0 player | vin 1 tree | vin 2 fee payer
+/// vout 0 player | vout 1 tree | vout 2 fee change | vout 3 extension | vout 4 anchor
+/// ```
+///
+/// Fee input 2 and change output 2 must be asset-free and share the same
+/// witness-v1 scriptPubKey. Their values are not compared and no fee rate is
+/// enforced here: fee-payer authorization, transaction validity, and server
+/// fee policy remain separate checks. Player/tree scripts, sat values, and the
+/// six asset groups are unchanged; extension and anchor still have zero value.
+/// The reference builder does not construct this variant.
 ///
 /// This half owns the global game rule: tree identity, player-bound luck
 /// advancement, success probability, health, reward movement, and fixed supply.
