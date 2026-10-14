@@ -83,7 +83,8 @@ transfers XP. Unlimited players do not imply unlimited rewards.
 
 ## Transaction Cost
 
-A swing has two inputs and four outputs:
+The reference `prepare_chop` builder uses a zero-offchain-fee swing with two
+inputs and four outputs:
 
 ```text
 inputs:  player, tree
@@ -91,10 +92,22 @@ outputs: player, tree, extension, anchor
 groups:  PLAYER_ID, TREE, LOG, XP, STONE, IRON ORE
 ```
 
-A miss has the same shape and signature cost as a hit. Player state has exactly
-one marker and at most four inventory holdings, so per-player parsing remains
-bounded. The tree authenticates the same fixed six-leaf player template on
-every swing; its cost does not grow with the number of players.
+Both covenants also accept a fee-compatible shape with three inputs and five
+outputs: player, tree, fee change, extension, anchor. Fee input 2 and change
+output 2 must be asset-free and have the same witness-v1 scriptPubKey. The
+zero-value extension and anchor move to outputs 3 and 4; player/tree scripts,
+sat values, and the six asset groups stay unchanged.
+
+This allows separate wallet funding for offchain fees, but the reference
+builder does not construct it. The chop covenants do not compare fee input
+and change values or set a fee rate. The fee payer authorizes the extra input;
+transaction validity and server fee policy still apply.
+
+Within either shape, a miss has the same shape and signature cost as a hit.
+Player state has exactly one marker and at most four inventory holdings, so
+per-player parsing remains bounded. The tree authenticates the same fixed
+six-leaf player template on every swing; its cost does not grow with the number
+of players.
 
 ## Activation
 

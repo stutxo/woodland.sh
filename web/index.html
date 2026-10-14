@@ -409,14 +409,21 @@ tweaked emulator = emulator + H("ArkScriptHash", covenant)·G</pre>
               <div><dt><code>INSPECTINASSETLOOKUP</code> / <code>OUTASSETLOOKUP</code></dt><dd>Reads asset assignment locations and amounts.</dd></div>
               <div><dt><code>INSPECTASSETGROUPCTRL</code></dt><dd>Requires transfer groups to remain uncontrolled and non-reissuable.</dd></div>
             </dl>
-            <pre class="about-flow" aria-label="Example covenant shape checks">PUSHCURRENTINPUTINDEX  1  EQUALVERIFY
-INSPECTNUMINPUTS       2  EQUALVERIFY
-INSPECTNUMOUTPUTS      4  EQUALVERIFY</pre>
+            <pre class="about-flow" aria-label="Accepted chop transaction shapes">zero-offchain-fee shape:
+  inputs:  player, tree
+  outputs: player, tree, extension, anchor
+
+fee-compatible shape:
+  inputs:  player, tree, fee payer
+  outputs: player, tree, fee change,
+           extension, anchor</pre>
+            <p>Both chop covenants accept these shapes, but the reference <code>prepare_chop</code> builder constructs only the zero-offchain-fee form. In the fee-compatible form, fee input 2 and change output 2 must be asset-free and share the same witness-v1 scriptPubKey. The zero-value extension and anchor move to outputs 3 and 4; player/tree scripts, sat values, and the six asset groups stay unchanged.</p>
+            <p>The chop covenants do not compare the fee input's value with its change or set a fee rate. The fee payer authorizes the extra input; ordinary transaction validity and server fee policy still apply.</p>
 
             <h2>Player covenant programs</h2>
             <section class="covenant-script">
               <h3>1. Player chop — <code>player_chop_covenant_script</code></h3>
-              <p>The player half proves owner-specific state continuity. It requires player input zero, the two-input/four-output swing shape, the same player P2TR and 330 sats, and one genuine world TREE marker with unchanged tree P2TR and value at both tree endpoints.</p>
+              <p>The player half proves owner-specific state continuity. It requires player input zero, either chop shape above, the same player P2TR and 330 sats, and one genuine world TREE marker with unchanged tree P2TR and value at both tree endpoints.</p>
               <pre class="about-flow" aria-label="Player chop covenant checks">preserve: player P2TR, 330 sats, PLAYER_ID, XP asset
 advance:  roll = SHA256(previous roll), canonical luck credit
 derive:   reward threshold from input XP asset balance
@@ -449,7 +456,7 @@ player state value              = 330 sats before and after</pre>
             <h2>Tree covenant programs</h2>
             <section class="covenant-script">
               <h3>4. Tree chop — <code>tree_covenant_script</code></h3>
-              <p>This is the main game-rule program. It requires tree input one, two inputs, four outputs, and the canonical PLAYER_ID, TREE, LOG, XP, STONE, and IRON ORE asset groups when present. It authenticates all six spending leaves and the NUMS internal key of the owner-specific player contract, rejecting alternate escape paths. Player and tree scripts, sat values, immutable tree state, the extension, and the anchor must all be canonical.</p>
+              <p>This is the main game-rule program. It requires tree input one, either chop shape above, and the same six canonical PLAYER_ID, TREE, LOG, XP, STONE, and IRON ORE asset groups in both shapes. It authenticates all six spending leaves and the NUMS internal key of the owner-specific player contract, rejecting alternate escape paths. Player and tree scripts, sat values, immutable tree state, the extension, and the anchor must all be canonical.</p>
               <p>The script hashes the previous player roll, converts the new roll into a bucket modulo 10,000, derives probability from the input XP asset balance, applies bounded luck credit, and leaves one canonical reward bit <code>G</code>.</p>
               <pre class="about-flow" aria-label="Tree chop covenant equations">tree health in         = tree health out + G
 tree LOG in            = tree LOG out + G

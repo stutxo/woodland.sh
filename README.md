@@ -100,7 +100,8 @@ signatures.
 
 ## Atomic Swing
 
-Every swing spends and recreates exactly two gameplay VTXOs:
+Every swing spends and recreates exactly two gameplay VTXOs. The reference
+`prepare_chop` builder uses this zero-offchain-fee shape:
 
 ```text
 inputs:  player state, selected tree
@@ -108,11 +109,30 @@ outputs: player state, selected tree, merged extension, canonical anchor
 groups:  PLAYER_ID, TREE, LOG, XP, STONE, IRON ORE
 ```
 
-Group zero moves the player's exact one-unit PLAYER_ID from player input zero to
-player output zero. Groups one through five are the world's TREE, LOG, XP,
-STONE, and IRON ORE.
-Together, the reciprocal Arkade covenants enforce the two-input/four-output
-shape, scripts, values, packet continuity, group order, empty transfer
+Both covenants also accept a three-input/five-output shape for a fee-aware
+builder that funds offchain fees from a separate wallet VTXO:
+
+```text
+inputs:  player state, selected tree, fee payer
+outputs: player state, selected tree, fee change, merged extension,
+         canonical anchor
+```
+
+The fee input at index 2 and change output at index 2 must be asset-free and
+have the same witness-v1 scriptPubKey. The zero-value extension and anchor move
+to outputs 3 and 4. Player/tree scripts, sat values, and the six asset groups
+remain unchanged.
+
+The chop covenants do not compare the fee input's value with its change or
+calculate a fee rate. The fee payer authorizes that input; ordinary transaction
+validity and server fee policy still apply. The reference `prepare_chop`
+builder does not construct this fee-compatible variant.
+
+In both shapes, group zero moves the player's exact one-unit PLAYER_ID from
+player input zero to player output zero. Groups one through five are the
+world's TREE, LOG, XP, STONE, and IRON ORE.
+Together, the reciprocal Arkade covenants enforce one of these two exact
+shapes, scripts, values, packet continuity, group order, empty transfer
 metadata/control fields, and anchor. Both covenants additionally enforce:
 
 - exactly one TREE marker;

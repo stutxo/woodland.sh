@@ -129,7 +129,7 @@ funded entirely by the wallet dust input, never by player sats.
 
 ## Atomic Chop
 
-A canonical swing has:
+The reference builder's zero-offchain-fee swing has:
 
 ```text
 input 0:  player, PLAYER_ID, XP X, LOG M, STONE S, IRON ORE I, axe A
@@ -143,6 +143,17 @@ output 2: zero-value merged Ark extension
 output 3: canonical zero-value anchor
 ```
 
+Both reciprocal covenants also accept a three-input/five-output fee shape:
+add an asset-free fee input at index 2 and asset-free change at output 2 with
+the same witness-v1 scriptPubKey, then move the zero-value extension and anchor
+to outputs 3 and 4. Player/tree scripts, sat values, and the asset groups
+below stay unchanged. The reference `prepare_chop` builder does not construct
+this variant.
+
+The chop covenants do not compare the fee input's value with its change or
+set a fee rate. The fee payer authorizes the extra input; transaction validity
+and server fee policy still apply.
+
 `G` is the deterministic LOG reward bit; `K` and `J` are the gated STONE and
 IRON ORE material bits. A success adds 25 user-facing Woodcutting XP. The six
 Asset V1 groups are ordered `PLAYER_ID`, `TREE`, `LOG`, `XP`, `STONE`,
@@ -154,7 +165,8 @@ before a swing.
 The player covenant requires:
 
 - the current input is player-state input zero;
-- exactly two inputs and four outputs;
+- either the two-input/four-output shape or the three-input/five-output fee
+  shape above;
 - recursive preservation of player script and `D` sats;
 - the immutable world TREE AssetId and fixed tree value;
 - canonical initial luck on the first recursive spend;
